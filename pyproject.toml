@@ -11,7 +11,7 @@ dependencies = []
 [dependency-groups]
 dev = [{include-group = "lint"}, {include-group = "test"}]
 lint = ["ruff>=0.6", "ty>=0.0.1a5"]
-test = ["pytest>=8", "pytest-cov>=5"]
+test = ["pytest>=8", "pytest-cov>=5", "pytest-asyncio>=0.23"]
 
 [build-system]
 requires = ["uv_build>=0.11.3,<0.12.0"]
@@ -31,19 +31,36 @@ ignore = ["D", "COM812", "ISC001", "ANN401"]
 # back here on the next agent_runtime version. Without these, `make lint` would
 # block on ihd's existing style choices that T-002 explicitly does not refactor.
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "PLR2004", "ANN", "D", "TRY", "EM", "B", "PT017"]
+"tests/**" = ["S101", "PLR2004", "ANN", "D", "TRY", "EM", "B", "PT017", "PT018", "PLC0415", "SLF001", "PT011", "F401"]
 "src/agent_runtime/safety/injection_detector.py" = [
     "RUF012",  # mutable class default (PATTERNS dict; ihd/T-506-batch covers fix)
     "C901",    # too-complex (DETECTION_PATTERNS table lookup)
     "PLR0912", # too-many-branches (detection scan loop)
     "PLR0915", # too-many-statements
+    "ANN204",  # missing return type on __init__ (ihd style)
+    "PLR2004", # magic value comparisons (ihd style — confidence thresholds)
+    "SIM102",  # nested if statements (ihd style)
+    "RUF010",  # str() in f-string (ihd style)
+    "RUF022",  # __all__ sort order (ihd style)
 ]
 "src/agent_runtime/flows/message_router.py" = [
     "TRY003",  # raise vanilla RuntimeError with long message (intentional surface)
     "EM102",   # f-string in raise (paired with TRY003 — ihd style)
+    "TC001",   # import not in TYPE_CHECKING block (ihd style)
+    "ANN204",  # missing return type on __init__ (ihd style)
+    "RUF022",  # __all__ sort order (ihd style)
 ]
 "src/agent_runtime/resilience/circuit_breaker.py" = [
     "G004",    # logging f-string (lifted ihd pattern — matches existing audit calls)
+    "ANN204",  # missing return type on __init__ (ihd style)
+    "ANN001",  # missing type annotation on __aexit__ args (ihd style)
+    "BLE001",  # blind except Exception (ihd style — preserves callback isolation)
+    "SIM102",  # nested if statements (ihd style)
+    "PYI034",  # __aenter__ return type (ihd style)
+    "RUF022",  # __all__ sort order (ihd style)
+]
+"src/agent_runtime/context/execution_context.py" = [
+    "ANN204",  # missing return type on __init__ (ihd style)
 ]
 
 [tool.pytest.ini_options]
@@ -53,6 +70,7 @@ addopts = [
     "--cov-fail-under=0",  # ratchet up as modules become concrete
 ]
 testpaths = ["tests"]
+asyncio_mode = "auto"
 
 [tool.ty.environment]
 python-version = "3.12"
@@ -63,3 +81,4 @@ error-on-warning = false  # flip to true once modules are concrete
 [tool.ty.rules]
 possibly-unresolved-reference = "error"
 unused-ignore-comment = "warn"
+
