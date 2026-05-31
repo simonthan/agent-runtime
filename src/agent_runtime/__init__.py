@@ -7,9 +7,10 @@ Each subpackage owns one slice of the runtime vocabulary:
 - ``flows``      — message routing priority chain
 - ``context``    — plugin execution context
 - ``logging``    — AuditLogger Protocol + NullAuditLogger default
+- ``llm``        — Anthropic API wrapper with two-cache-breakpoint contract (extras: ``[llm]``)
 
 Consumed by teams-bot-platform and ithelpdesk via git-pinned dependency.
 See the three-layer reuse model in teams-bot-platform/ARCHITECTURE.md §2.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
