@@ -1,7 +1,7 @@
 .PHONY: dev lint format test build clean
 
 dev:
-	uv sync --all-groups
+	uv sync --all-groups --all-extras
 
 lint:
 	uv run ruff format --check .
