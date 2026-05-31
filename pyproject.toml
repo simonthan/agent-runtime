@@ -34,7 +34,13 @@ ignore = ["D", "COM812", "ISC001", "ANN401"]
 # back here on the next agent_runtime version. Without these, `make lint` would
 # block on ihd's existing style choices that T-002 explicitly does not refactor.
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "PLR2004", "ANN", "D", "TRY", "EM", "B", "PT017", "PT018", "PLC0415", "SLF001", "PT011", "F401"]
+"tests/**" = ["S101", "PLR2004", "PLR0913", "ANN", "D", "TRY", "EM", "B", "PT017", "PT018", "PLC0415", "SLF001", "PT011", "F401"]
+"src/agent_runtime/llm/client.py" = [
+    "PLR0913", # complete() has 8 keyword-only params by design — opinionated API surface
+    "EM101",   # LLMResponseError("literal msg") — short diagnostic strings, not user-facing
+    "EM102",   # f-string in raise — PII-safe pattern: type+status only, no SDK body
+    "TRY003",  # long message outside exception class — each raise is a distinct diagnostic
+]
 "src/agent_runtime/safety/injection_detector.py" = [
     "RUF012",  # mutable class default (PATTERNS dict; ihd/T-506-batch covers fix)
     "C901",    # too-complex (DETECTION_PATTERNS table lookup)

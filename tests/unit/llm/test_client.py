@@ -8,6 +8,8 @@ error, malformed response — both empty content and non-text first block).
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 from anthropic import APIError, RateLimitError
 
@@ -19,7 +21,9 @@ from agent_runtime.llm import (
     Message,
 )
 
-from .conftest import RecordingAudit
+if TYPE_CHECKING:
+    from .conftest import RecordingAudit
+
 from .fakes import (
     FakeAsyncAnthropic,
     FakeMessage,
@@ -108,9 +112,7 @@ async def test_history_passed_through_verbatim(
         {"role": "user", "content": "earlier-q"},
         {"role": "assistant", "content": "earlier-a"},
     )
-    await client.complete(
-        static_system_prefix="STATIC", history=history, user_message="hi"
-    )
+    await client.complete(static_system_prefix="STATIC", history=history, user_message="hi")
     msgs = fake_sdk.messages.captured_requests[0]["messages"]
     assert msgs[0] == {"role": "user", "content": "earlier-q"}
     assert msgs[1] == {"role": "assistant", "content": "earlier-a"}
@@ -121,9 +123,7 @@ async def test_per_call_model_overrides_default(
     client: AnthropicClient, fake_sdk: FakeAsyncAnthropic
 ) -> None:
     fake_sdk.messages.responses.append(make_ok(model="claude-opus-4-7"))
-    await client.complete(
-        static_system_prefix="STATIC", user_message="hi", model="claude-opus-4-7"
-    )
+    await client.complete(static_system_prefix="STATIC", user_message="hi", model="claude-opus-4-7")
     assert fake_sdk.messages.captured_requests[0]["model"] == "claude-opus-4-7"
 
 
@@ -182,9 +182,7 @@ async def test_cache_not_written_warning_emitted(
     fake_sdk: FakeAsyncAnthropic,
     audit: RecordingAudit,
 ) -> None:
-    fake_sdk.messages.responses.append(
-        make_ok(input_tokens=500, cache_creation=0, cache_read=0)
-    )
+    fake_sdk.messages.responses.append(make_ok(input_tokens=500, cache_creation=0, cache_read=0))
     await client.complete(static_system_prefix="STATIC", user_message="hi")
     warnings = [e for e in audit.events if e[0] == "warning"]
     assert any(name == "llm_cache_not_written" for _, name, _ in warnings)
@@ -199,9 +197,7 @@ async def test_cache_warning_silent_when_input_tokens_zero(
     fake_sdk: FakeAsyncAnthropic,
     audit: RecordingAudit,
 ) -> None:
-    fake_sdk.messages.responses.append(
-        make_ok(input_tokens=0, cache_creation=0, cache_read=0)
-    )
+    fake_sdk.messages.responses.append(make_ok(input_tokens=0, cache_creation=0, cache_read=0))
     await client.complete(static_system_prefix="STATIC", user_message="hi")
     names = [name for _, name, _ in audit.events if name == "llm_cache_not_written"]
     assert names == []
@@ -218,9 +214,7 @@ async def test_rate_limit_error_wrapped(
 
 
 @pytest.mark.asyncio
-async def test_api_error_wrapped(
-    client: AnthropicClient, fake_sdk: FakeAsyncAnthropic
-) -> None:
+async def test_api_error_wrapped(client: AnthropicClient, fake_sdk: FakeAsyncAnthropic) -> None:
     fake_sdk.messages.exceptions.append(_make_api_error())
     with pytest.raises(LLMAPIError) as excinfo:
         await client.complete(static_system_prefix="STATIC", user_message="hi")

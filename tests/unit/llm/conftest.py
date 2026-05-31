@@ -12,9 +12,9 @@ import pytest
 # suite instead of just skipping the optional subpackage.
 pytest.importorskip("anthropic")
 
-from agent_runtime.llm import AnthropicClient  # noqa: E402
+from agent_runtime.llm import AnthropicClient
 
-from .fakes import FakeAsyncAnthropic  # noqa: E402
+from .fakes import FakeAsyncAnthropic
 
 
 class RecordingAudit:

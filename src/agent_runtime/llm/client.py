@@ -130,9 +130,7 @@ class AnthropicClient:
         """
         chosen_model = model or self._default_model
         chosen_max_tokens = max_tokens if max_tokens is not None else self._default_max_tokens
-        chosen_temperature = (
-            temperature if temperature is not None else self._default_temperature
-        )
+        chosen_temperature = temperature if temperature is not None else self._default_temperature
 
         system_blocks: list[dict[str, Any]] = [
             {
@@ -181,15 +179,11 @@ class AnthropicClient:
             )
         except RateLimitError as exc:
             status_code = getattr(exc, "status_code", None)
-            self._audit.warning(
-                "llm_rate_limited", model=chosen_model, status_code=status_code
-            )
+            self._audit.warning("llm_rate_limited", model=chosen_model, status_code=status_code)
             # Use type+status only; SDK exception ``__str__`` can include the
             # response body (potentially echoing prompt fragments) — keep
             # diagnostic chain via ``from exc`` instead.
-            raise LLMRateLimitError(
-                f"{type(exc).__name__}: status={status_code}"
-            ) from exc
+            raise LLMRateLimitError(f"{type(exc).__name__}: status={status_code}") from exc
         except APIError as exc:
             status_code = getattr(exc, "status_code", None)
             error_type = type(exc).__name__
@@ -240,9 +234,7 @@ class AnthropicClient:
         first = content_blocks[0]
         text = getattr(first, "text", None)
         if text is None:
-            raise LLMResponseError(
-                f"first content block is not text (type={type(first).__name__})"
-            )
+            raise LLMResponseError(f"first content block is not text (type={type(first).__name__})")
 
         # Surface (rather than silently truncate) responses with extra blocks
         # we don't currently handle — e.g., extended-thinking ``thinking_block``

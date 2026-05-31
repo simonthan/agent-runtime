@@ -10,16 +10,21 @@ Layer in the three-layer reuse model defined in
 ## Install
 
 ```bash
-uv add 'agent-runtime @ git+https://github.com/simonthan/agent-runtime.git@v0.1.0'
+# Base (no LLM extras)
+uv add 'agent-runtime @ git+https://github.com/simonthan/agent-runtime.git@v0.2.0'
+
+# With agent_runtime.llm (installs the `anthropic` SDK)
+uv add 'agent-runtime[llm] @ git+https://github.com/simonthan/agent-runtime.git@v0.2.0'
 ```
 
-## v0.1.0 modules
+## Modules
 
 - `agent_runtime.safety` — `sanitize_for_llm_prompt`, `InjectionDetector`
 - `agent_runtime.resilience` — `CircuitBreaker` + registry
 - `agent_runtime.flows` — `MessageRouter` priority-chain dispatch
 - `agent_runtime.context` — `PluginExecutionContext`
 - `agent_runtime.logging` — `AuditLogger` Protocol + `NullAuditLogger` default
+- `agent_runtime.llm` — `AnthropicClient` with two-cache-breakpoint contract _(extras: `[llm]`)_
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
