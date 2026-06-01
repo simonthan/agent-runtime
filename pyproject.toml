@@ -1,12 +1,15 @@
 [project]
 name = "agent-runtime"
-version = "0.2.0"
+version = "0.3.0"
 description = "Shared runtime primitives for Microsoft Teams knowledge bots — resilience, safety, session flows, execution context. Consumed by teams-bot-platform and ithelpdesk."
 readme = "README.md"
 license = "MIT"
 authors = [{ name = "simonthan", email = "simon.than@gmail.com" }]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "httpx>=0.27",
+    "tenacity>=8.2",
+]
 
 [project.optional-dependencies]
 llm = ["anthropic>=0.42,<1.0"]
@@ -34,7 +37,7 @@ ignore = ["D", "COM812", "ISC001", "ANN401"]
 # back here on the next agent_runtime version. Without these, `make lint` would
 # block on ihd's existing style choices that T-002 explicitly does not refactor.
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "PLR2004", "PLR0913", "ANN", "D", "TRY", "EM", "B", "PT017", "PT018", "PLC0415", "SLF001", "PT011", "F401"]
+"tests/**" = ["S101", "PLR2004", "PLR0913", "ANN", "D", "TRY", "EM", "B", "PT017", "PT018", "PLC0415", "SLF001", "PT011", "F401", "E501", "ARG002", "C901"]
 "src/agent_runtime/llm/client.py" = [
     "PLR0913", # complete() has 8 keyword-only params by design — opinionated API surface
     "EM101",   # LLMResponseError("literal msg") — short diagnostic strings, not user-facing
@@ -58,6 +61,25 @@ ignore = ["D", "COM812", "ISC001", "ANN401"]
     "TC001",   # import not in TYPE_CHECKING block (ihd style)
     "ANN204",  # missing return type on __init__ (ihd style)
     "RUF022",  # __all__ sort order (ihd style)
+]
+"src/agent_runtime/connectors/base.py" = [
+    "PLR0913",  # _ConnectorThrottle.__init__ + register_rate_limit have config-pair signatures
+    "G004",     # f-strings in logger calls (lifted style — fix on next agent_runtime cleanup)
+    "BLE001",   # broad except in _execute_with_retry — intentional, matches circuit_breaker pattern
+    "SLF001",   # tests reach into _default_audit / _rate_limit_config / _throttle_registry
+    "ANN204",   # missing return type on __init__ (ihd style)
+    "ANN202",   # missing return type on private async generator (ihd style)
+    "ANN205",   # missing return type on staticmethod (ihd style)
+    "ANN001",   # missing type annotation args (ihd style)
+    "ANN002",   # missing type annotation for *args (ihd style)
+    "ANN003",   # missing type annotation for **kwargs (ihd style)
+    "SIM103",   # return condition directly — preserves ihd's explicit branching with comments
+    "PIE790",   # unnecessary pass in abstract methods (ihd style for ABC)
+    "E501",     # line too long in retry log messages (ihd style — log messages are descriptive)
+]
+"src/agent_runtime/protocol.py" = [
+    "PLR0913",  # NodeHandler.handle / NodeExecutor.execute_node have 6+ params by design
+    "E501",     # docstring line too long (verbatim lift — ihd style)
 ]
 "src/agent_runtime/resilience/circuit_breaker.py" = [
     "G004",    # logging f-string (lifted ihd pattern — matches existing audit calls)

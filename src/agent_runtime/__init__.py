@@ -8,9 +8,11 @@ Each subpackage owns one slice of the runtime vocabulary:
 - ``context``    — plugin execution context
 - ``logging``    — AuditLogger Protocol + NullAuditLogger default
 - ``llm``        — Anthropic API wrapper with two-cache-breakpoint contract (extras: ``[llm]``)
+- ``connectors`` — BaseConnector ABC, ConnectorResult, RetryMixin, throttle mechanism
+- ``protocol``   — NodeResult + NodeHandler/TemplateResolver/NodeExecutor Protocols
 
 Consumed by teams-bot-platform and ithelpdesk via git-pinned dependency.
 See the three-layer reuse model in teams-bot-platform/ARCHITECTURE.md §2.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
