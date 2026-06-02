@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agent_runtime.transport.teams.identity import resolve_identity
+from agent_runtime.transport.teams.identity import _extract_tenant_id, resolve_identity
 
 
 def _turn_context(from_id="user-1", from_aad="", from_name="User One"):
@@ -70,8 +70,6 @@ async def test_resolve_identity_fails_closed_when_graph_returns_no_email(mock_ge
 
 def test_extract_tenant_id_prefers_conversation_tenant():
     """Tenant ID resolution: conversation.tenant_id wins when present."""
-    from agent_runtime.transport.teams.identity import _extract_tenant_id
-
     activity = SimpleNamespace(
         conversation=SimpleNamespace(tenant_id="from-conv"),
         channel_data={"tenant": {"id": "from-channel"}},
@@ -80,8 +78,6 @@ def test_extract_tenant_id_prefers_conversation_tenant():
 
 
 def test_extract_tenant_id_falls_back_to_channel_data():
-    from agent_runtime.transport.teams.identity import _extract_tenant_id
-
     activity = SimpleNamespace(
         conversation=SimpleNamespace(tenant_id=""),
         channel_data={"tenant": {"id": "from-channel"}},
@@ -90,8 +86,6 @@ def test_extract_tenant_id_falls_back_to_channel_data():
 
 
 def test_extract_tenant_id_returns_empty_when_channel_data_missing():
-    from agent_runtime.transport.teams.identity import _extract_tenant_id
-
     activity = SimpleNamespace(
         conversation=SimpleNamespace(tenant_id=""),
         channel_data=None,

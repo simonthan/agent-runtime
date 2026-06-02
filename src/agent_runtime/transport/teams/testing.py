@@ -87,5 +87,5 @@ def make_inbound_invoke(
     return InboundInvoke(
         conversation_ref=make_conversation_ref(**ref_overrides),
         name=name,
-        value=value or {},
+        value=value if value is not None else {},
     )
