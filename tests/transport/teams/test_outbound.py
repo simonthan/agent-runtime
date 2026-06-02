@@ -1,4 +1,5 @@
 """OutboundChannel impl tests — assert correct Activity wire format."""
+
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest

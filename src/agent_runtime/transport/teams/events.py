@@ -14,14 +14,14 @@ from typing import Literal
 class ConversationRef:
     """Identifies who sent an event, from where, and where to reply."""
 
-    aad_object_id: str        # Entra Object ID — primary key for ACL + group lookup
-    user_email: str           # human-readable identifier — audit log key
+    aad_object_id: str  # Entra Object ID — primary key for ACL + group lookup
+    user_email: str  # human-readable identifier — audit log key
     user_display_name: str
-    conversation_id: str      # Teams conversation ID — session key
-    channel_id: str           # "msteams" for v1; explicit for future channels
-    tenant_id: str            # Entra tenant ID
-    service_url: str          # Bot Framework Service base URL for outbound routing
-    activity_id: str          # Inbound activity ID — reserved for future reply_to_id
+    conversation_id: str  # Teams conversation ID — session key
+    channel_id: str  # "msteams" for v1; explicit for future channels
+    tenant_id: str  # Entra tenant ID
+    service_url: str  # Bot Framework Service base URL for outbound routing
+    activity_id: str  # Inbound activity ID — reserved for future reply_to_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,8 +29,8 @@ class InboundMessage:
     """User text message or Adaptive Card Action.Submit payload."""
 
     conversation_ref: ConversationRef
-    text: str = ""                       # may be empty when value is set
-    value: dict | None = None            # Adaptive Card Action.Submit data
+    text: str = ""  # may be empty when value is set
+    value: dict | None = None  # Adaptive Card Action.Submit data
     kind: Literal["message"] = "message"
 
 
@@ -56,7 +56,7 @@ class InboundInvoke:
     """Adaptive Card Action.Execute, sign-in verifyState, or messaging-extension invoke."""
 
     conversation_ref: ConversationRef
-    name: str = ""                       # e.g. "adaptiveCard/action"
+    name: str = ""  # e.g. "adaptiveCard/action"
     value: dict | None = None
     kind: Literal["invoke"] = "invoke"
 

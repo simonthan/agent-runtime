@@ -6,12 +6,19 @@ to patch `TurnContext.send_activity`. Without it, `BotFrameworkOutboundChannel.s
 needs `BOT_CONNECTOR_CLIENT_KEY` in `turn_state`, which is only populated by
 `BotFrameworkAdapter.process_activity_with_identity` (which we bypass for unit testing).
 """
+
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from botbuilder.core import TurnContext
-from botbuilder.schema import Activity, ActivityTypes, ChannelAccount, ConversationAccount, InvokeResponse
+from botbuilder.schema import (
+    Activity,
+    ActivityTypes,
+    ChannelAccount,
+    ConversationAccount,
+    InvokeResponse,
+)
 
 from agent_runtime.transport.teams import (
     InboundInvoke,
@@ -64,10 +71,9 @@ async def test_round_trip_message_dispatches_inbound_message(mock_get_member, mo
     )
     handler = _CapturingHandler()
     adapter = TeamsAdapter(TeamsAdapterConfig("aid", "pwd", "tid"), handler)
-
     activity = _make_activity(ActivityTypes.message, text="hi there")
-    tc = TurnContext(adapter._adapter, activity)  # noqa: SLF001 — integration test plumbing
-    await adapter._handler.on_turn(tc)            # noqa: SLF001
+    tc = TurnContext(adapter._adapter, activity)
+    await adapter._handler.on_turn(tc)
 
     assert mock_send_activity.await_count == 1
     assert mock_send_activity.await_args.args[0].text == "hello"
@@ -88,7 +94,6 @@ async def test_members_added_excludes_bot_and_drops_members_without_aad_object_i
     )
     handler = _CapturingHandler()
     adapter = TeamsAdapter(TeamsAdapterConfig("aid", "pwd", "tid"), handler)
-
     members = [
         ChannelAccount(id="28:bot-1", name="Bot"),
         ChannelAccount(id="user-2", aad_object_id="aad-u2", name="User Two"),
@@ -96,8 +101,8 @@ async def test_members_added_excludes_bot_and_drops_members_without_aad_object_i
     ]
     activity = _make_activity(ActivityTypes.conversation_update, members_added=members)
     activity.recipient = ChannelAccount(id="28:bot-1", name="Bot")
-    tc = TurnContext(adapter._adapter, activity)  # noqa: SLF001
-    await adapter._handler.on_turn(tc)            # noqa: SLF001
+    tc = TurnContext(adapter._adapter, activity)
+    await adapter._handler.on_turn(tc)
 
     assert len(handler.events) == 1
     evt = handler.events[0]
@@ -114,12 +119,11 @@ async def test_members_added_bot_compare_is_case_insensitive(mock_get_member):
     )
     handler = _CapturingHandler()
     adapter = TeamsAdapter(TeamsAdapterConfig("aid", "pwd", "tid"), handler)
-
     members = [ChannelAccount(id="28:Bot-Guid", name="Bot")]
     activity = _make_activity(ActivityTypes.conversation_update, members_added=members)
     activity.recipient = ChannelAccount(id="28:bot-guid", name="Bot")  # lowercase
-    tc = TurnContext(adapter._adapter, activity)  # noqa: SLF001
-    await adapter._handler.on_turn(tc)            # noqa: SLF001
+    tc = TurnContext(adapter._adapter, activity)
+    await adapter._handler.on_turn(tc)
 
     evt = handler.events[0]
     assert evt.bot_was_added is True
@@ -132,10 +136,11 @@ async def test_invoke_returns_handler_invoke_response(mock_get_member):
     )
     handler = _CapturingHandler(response=InvokeResponse(status=200, body={"x": 1}))
     adapter = TeamsAdapter(TeamsAdapterConfig("aid", "pwd", "tid"), handler)
-
-    activity = _make_activity(ActivityTypes.invoke, name="adaptiveCard/action", value={"action": "submit"})
-    tc = TurnContext(adapter._adapter, activity)  # noqa: SLF001
-    await adapter._handler.on_turn(tc)            # noqa: SLF001
+    activity = _make_activity(
+        ActivityTypes.invoke, name="adaptiveCard/action", value={"action": "submit"}
+    )
+    tc = TurnContext(adapter._adapter, activity)
+    await adapter._handler.on_turn(tc)
 
     assert len(handler.events) == 1
     assert isinstance(handler.events[0], InboundInvoke)
@@ -152,10 +157,9 @@ async def test_fail_closed_drops_event_when_no_email(mock_get_member):
     mock_get_member.return_value = SimpleNamespace(aad_object_id="aad-1", email="", name=None)
     handler = _CapturingHandler()
     adapter = TeamsAdapter(TeamsAdapterConfig("aid", "pwd", "tid"), handler)
-
     activity = _make_activity(ActivityTypes.message, text="hi")
     activity.from_property = ChannelAccount(id="user-1", aad_object_id="", name="No Email")
-    tc = TurnContext(adapter._adapter, activity)  # noqa: SLF001
-    await adapter._handler.on_turn(tc)            # noqa: SLF001
+    tc = TurnContext(adapter._adapter, activity)
+    await adapter._handler.on_turn(tc)
 
     assert handler.events == []  # handler never called

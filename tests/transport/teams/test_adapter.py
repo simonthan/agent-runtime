@@ -1,9 +1,8 @@
 """TeamsAdapter — construction + invoke return value + on_turn_error wiring."""
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+
+from unittest.mock import AsyncMock
 
 import pytest
-from botbuilder.schema import InvokeResponse
 
 from agent_runtime.transport.teams import TeamsAdapter, TeamsAdapterConfig
 
@@ -14,23 +13,23 @@ class _NoOpHandler:
 
 
 def test_adapter_constructs_settings_from_config():
-    config = TeamsAdapterConfig(app_id="aid", app_password="pwd", tenant_id="tid")
+    config = TeamsAdapterConfig(app_id="aid", app_password="pwd", tenant_id="tid")  # noqa: S106
     adapter = TeamsAdapter(config, _NoOpHandler())
-    settings = adapter._adapter.settings  # noqa: SLF001 — explicit lib internals test
+    settings = adapter._adapter.settings
     assert settings.app_id == "aid"
-    assert settings.app_password == "pwd"
+    assert settings.app_password == "pwd"  # noqa: S105
     assert settings.channel_auth_tenant == "tid"
 
 
 def test_adapter_uses_default_on_turn_error_when_none_provided():
     adapter = TeamsAdapter(TeamsAdapterConfig("a", "p", "t"), _NoOpHandler())
-    assert adapter._adapter.on_turn_error is not None  # noqa: SLF001
+    assert adapter._adapter.on_turn_error is not None
 
 
 def test_adapter_uses_provided_on_turn_error():
     custom = AsyncMock()
     adapter = TeamsAdapter(TeamsAdapterConfig("a", "p", "t", on_turn_error=custom), _NoOpHandler())
-    assert adapter._adapter.on_turn_error is custom  # noqa: SLF001
+    assert adapter._adapter.on_turn_error is custom
 
 
 async def test_process_activity_raises_on_empty_auth_header():

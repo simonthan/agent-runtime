@@ -1,4 +1,5 @@
 """resolve_identity — Graph + fallback + fail-closed logging."""
+
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -70,6 +71,7 @@ async def test_resolve_identity_fails_closed_when_graph_returns_no_email(mock_ge
 def test_extract_tenant_id_prefers_conversation_tenant():
     """Tenant ID resolution: conversation.tenant_id wins when present."""
     from agent_runtime.transport.teams.identity import _extract_tenant_id
+
     activity = SimpleNamespace(
         conversation=SimpleNamespace(tenant_id="from-conv"),
         channel_data={"tenant": {"id": "from-channel"}},
@@ -79,6 +81,7 @@ def test_extract_tenant_id_prefers_conversation_tenant():
 
 def test_extract_tenant_id_falls_back_to_channel_data():
     from agent_runtime.transport.teams.identity import _extract_tenant_id
+
     activity = SimpleNamespace(
         conversation=SimpleNamespace(tenant_id=""),
         channel_data={"tenant": {"id": "from-channel"}},
@@ -88,6 +91,7 @@ def test_extract_tenant_id_falls_back_to_channel_data():
 
 def test_extract_tenant_id_returns_empty_when_channel_data_missing():
     from agent_runtime.transport.teams.identity import _extract_tenant_id
+
     activity = SimpleNamespace(
         conversation=SimpleNamespace(tenant_id=""),
         channel_data=None,

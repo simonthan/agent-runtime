@@ -1,4 +1,5 @@
 """FakeOutboundChannel test double behavior."""
+
 import pytest
 
 from agent_runtime.transport.teams.testing import FakeOutboundChannel

@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.4.0 — 2026-06-02
+
+### Added
+- `agent_runtime.transport.teams` subpackage (optional extra `[teams]`): framework-agnostic
+  Bot Framework SDK wrapper providing `TeamsAdapter`, `TeamsHandler` Protocol,
+  `OutboundChannel` Protocol, `InboundMessage`/`InboundMembersAdded`/`InboundInvoke`
+  event dataclasses, and `ConversationRef`. Public test helpers in
+  `agent_runtime.transport.teams.testing` (`FakeOutboundChannel` + event factories).
+- Optional dependencies: `botbuilder-core>=4.15,<5`, `botbuilder-schema>=4.15,<5`,
+  `aiohttp>=3.9,<4` (required by botbuilder's async connector).
+
+### Notes
+- Fresh-write subpackage — no per-file ruff ignores added. Code passes `select = ["ALL"]`
+  cleanly. Future changes should preserve this property.
+- Identity resolution fails closed: inbound activities from users with no resolvable
+  email are dropped with a WARNING log; handler is not invoked.
+
+## v0.3.0 — 2026-05-31 (backfilled)
+
+### Added
+- `agent_runtime.connectors` — `BaseConnector` ABC, `ConnectorResult`, `RetryMixin`,
+  throttle mechanism (lifted from ithelpdesk `service_registry.py` family; T-490a).
+- `agent_runtime.protocol` — `NodeResult`, `NodeHandler` / `TemplateResolver` /
+  `NodeExecutor` Protocols.
+
+### Notes
+- Pre-existing gap — v0.3.0 was released without a CHANGELOG entry. Backfilled here
+  for completeness; see git commit `016207f` for the canonical commit history.
+
 ## v0.2.0 — 2026-05-30
 
 ### Added

@@ -1,5 +1,7 @@
 """ConversationRef + InboundEvent dataclass tests."""
+
 import pytest
+
 from agent_runtime.transport.teams.events import (
     ConversationRef,
     InboundInvoke,
