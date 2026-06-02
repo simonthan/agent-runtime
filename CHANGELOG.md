@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.5.0 — 2026-06-02
+
+### Added
+- `agent_runtime.session` subpackage (optional extras `[redis]`, `[postgres]`):
+  Redis-backed conversation session store with Postgres durable resume fallback.
+  Lift from ithelpdesk's `app.core.session_*` family with three new surfaces:
+  (1) `(user_id, bot_id)` keying per teams-bot-platform `ARCHITECTURE.md` §4 #4;
+  (2) `get_or_prompt_resume(...) -> ResumeDecision` sealed-union API for T-008f
+  Resume-card UX; (3) `SessionAlreadyActive` typed exception for dispatcher
+  pattern-matching when concurrent panes are attempted in v1.
+- `pydantic >= 2.6` is now a base runtime dep (was only required by `[llm]`).
+
+### Notes
+- ORM-free posture at the library boundary: `ResumeRow` is a Pydantic model;
+  no SQLAlchemy mixin. Consumers own their `sessions` table schema, FKs, and RLS.
+- Redis key prefix is consumer-configurable via `SessionManager(key_prefix=...)`.
+  Resume tokens are scoped by user OID + token, mirroring T-512's SQL-layer fix.
+- Atomic lease extension uses `SET ... EX ttl XX` to prevent TOCTOU resurrection
+  when a key Redis-evicts between read and write.
+- Cold-cache rehydration: a Redis miss + Postgres hit within the idle window
+  silently repopulates the cache and returns `Resumable`. Redis restarts no
+  longer lose session continuity (same `session_id`, same Resume-card UX).
+- **Cold-cache history limitation (v1)**: `ResumeRow` carries metadata only
+  (`id`, `user_id`, `bot_id`, `status`, `last_message_at`, `client_context`).
+  `data` and `conversation_history` live in Redis only. A cold-cache rehydration
+  therefore restores session identity but presents the LLM with an empty turn
+  history — the user resumes the same logical session but the model has no
+  recall of prior turns. Acceptable for v1 because (a) Redis evictions are rare
+  in the 30-min window, (b) the retrieval-snapshot store (teams-bot-platform
+  T-008i) is the durable record for replay/audit. v2 will add durable turn
+  history to `ResumeRow` if telemetry shows evictions are user-visible.
+- IT-specific extension pattern preserved — `session_state_ihd.py` in ithelpdesk
+  continues to subclass `ConversationState`, demonstrating the consumer-extension
+  contract.
+
+### Breaking changes
+- `SessionRepositoryProtocol.upsert_resume_data` and `get_session_for_resume` now
+  require `bot_id: str` kwarg. v0.4.0 consumers (none yet for sessions) must
+  update their concrete repositories before pinning v0.5.0.
+- `SessionManager.update_session` no longer applies an internal model-filter to
+  `data` (the IHD consumer model round-trip is gone). Consumers that depended
+  on the filter must apply it upstream before calling `update_session`.
+
 ## v0.4.0 — 2026-06-02
 
 ### Added
