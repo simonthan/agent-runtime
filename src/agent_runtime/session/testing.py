@@ -7,7 +7,7 @@ Convention matches ``agent_runtime.transport.teams.testing``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -75,11 +75,19 @@ class FakeRedisClient:
 
 @dataclass
 class FakeSessionRepository:
-    """In-memory SessionRepositoryProtocol implementation."""
+    """In-memory SessionRepositoryProtocol implementation.
+
+    Honors the Protocol's freshness contract: ``get_active_session`` filters
+    rows where ``last_message_at > now() - idle_timeout`` (and treats
+    ``status != 'active'`` as a miss). Without this, the fake would silently
+    return stale rows that a correct production impl filters at the SQL
+    layer, hiding consumer bugs that rely on the freshness invariant.
+    """
 
     _by_id: dict[str, ResumeRow] = field(default_factory=dict)
     _by_token: dict[str, str] = field(default_factory=dict)
     _active_by_pair: dict[tuple[str, str], str] = field(default_factory=dict)
+    idle_timeout: timedelta = field(default_factory=lambda: timedelta(minutes=30))
 
     async def upsert_resume_data(
         self,
@@ -126,7 +134,15 @@ class FakeSessionRepository:
         bot_id: str,
     ) -> ResumeRow | None:
         sid = self._active_by_pair.get((user_id, bot_id))
-        return self._by_id.get(sid) if sid else None
+        if sid is None:
+            return None
+        row = self._by_id.get(sid)
+        if row is None or row.status != "active":
+            return None
+        last = row.last_message_at or row.created_at
+        if (datetime.now(UTC) - last) > self.idle_timeout:
+            return None
+        return row
 
 
 def make_session_data(

@@ -2,8 +2,9 @@
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
+from agent_runtime.session.models import ResumeRow
 from agent_runtime.session.testing import FakeRedisClient, FakeSessionRepository
 
 
@@ -129,6 +130,61 @@ async def test_fake_session_repository_satisfies_protocol():
     # get_active_session — miss
     miss = await repo.get_active_session(user_id="u1", bot_id="b99")
     assert miss is None
+
+
+# ---------------------------------------------------------------------------
+# Freshness filter on FakeSessionRepository (honors Protocol contract).
+# ---------------------------------------------------------------------------
+
+
+async def test_fake_repo_get_active_session_filters_non_active_status():
+    repo = FakeSessionRepository()
+    sid = str(uuid4())
+    repo._by_id[sid] = ResumeRow(
+        id=UUID(sid), user_id="u1", bot_id="b1", status="ended",
+        created_at=datetime.now(UTC), last_message_at=datetime.now(UTC),
+    )
+    repo._active_by_pair[("u1", "b1")] = sid
+    assert await repo.get_active_session(user_id="u1", bot_id="b1") is None
+
+
+async def test_fake_repo_get_active_session_filters_hard_expired_rows():
+    repo = FakeSessionRepository(idle_timeout=timedelta(minutes=30))
+    sid = str(uuid4())
+    repo._by_id[sid] = ResumeRow(
+        id=UUID(sid), user_id="u1", bot_id="b1",
+        created_at=datetime.now(UTC) - timedelta(hours=2),
+        last_message_at=datetime.now(UTC) - timedelta(hours=1),
+    )
+    repo._active_by_pair[("u1", "b1")] = sid
+    assert await repo.get_active_session(user_id="u1", bot_id="b1") is None
+
+
+async def test_fake_repo_get_active_session_missing_id_in_by_id():
+    repo = FakeSessionRepository()
+    repo._active_by_pair[("u1", "b1")] = "dangling-sid-not-in-_by_id"
+    assert await repo.get_active_session(user_id="u1", bot_id="b1") is None
+
+
+# ---------------------------------------------------------------------------
+# Tz-coerce boundary — naive ResumeRow datetimes (asyncpg default) survive
+# the manager's cold-cache rehydration without TypeError on age comparison.
+# ---------------------------------------------------------------------------
+
+
+async def test_naive_datetime_in_resume_row_does_not_break_age_compare():
+    """If a consumer's repo returns tz-naive datetimes (asyncpg default), the
+    manager must defensively coerce at the boundary. Otherwise `_utc_now() - dt`
+    would raise TypeError on naive/aware mismatch."""
+    from agent_runtime.session.manager import _ensure_utc
+
+    naive = datetime(2026, 1, 1, 12, 0, 0)  # noqa: DTZ001
+    coerced = _ensure_utc(naive)
+    assert coerced.tzinfo is UTC
+
+    aware = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    passthrough = _ensure_utc(aware)
+    assert passthrough is aware  # no-op on already-aware
 
 
 # ---------------------------------------------------------------------------

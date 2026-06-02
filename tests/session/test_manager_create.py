@@ -1,5 +1,6 @@
 """Tests for SessionManager.create_session and related atomic-claim logic."""
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -190,11 +191,9 @@ async def test_pre_seed_reverse_index_session_resumable_raises():
     first = await mgr.create_session(user_id="u1", bot_id="b1")
 
     # Backdate updated_at to make session appear lapsed (Resumable path)
-    import json
     raw = redis._store[f"session:{first.id}"]
     parsed = json.loads(raw)
-    from datetime import UTC, datetime, timedelta as td
-    old_ts = (datetime.now(UTC) - td(seconds=2)).isoformat()
+    old_ts = (datetime.now(UTC) - timedelta(seconds=2)).isoformat()
     parsed["updated_at"] = old_ts
     redis._store[f"session:{first.id}"] = json.dumps(parsed)
 

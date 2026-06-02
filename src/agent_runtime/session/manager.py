@@ -41,6 +41,13 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _ensure_utc(dt: datetime) -> datetime:
+    # Defensive coercion at the ResumeRow boundary: asyncpg's default driver
+    # returns naive UTC datetimes from TIMESTAMP columns. Naive values would
+    # raise TypeError in any later `_utc_now() - dt` age comparison.
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
 class SessionManager:
     """Manage conversation sessions with Redis backing and DB fallback for resume."""
 
@@ -141,7 +148,7 @@ class SessionManager:
             nx=True,
         )
 
-        if claimed is None or claimed is False:
+        if not claimed:
             # Another session won the race — surface the existing session.
             decision = await self.get_or_prompt_resume(user_id=user_id, bot_id=bot_id)
             match decision:
@@ -321,7 +328,7 @@ class SessionManager:
             ex=self._ttl_seconds,
             xx=True,
         )
-        if extended is None or extended is False:
+        if not extended:
             # Key evicted between get_session and SET; rehydrate from DB
             session = await self._resume_from_db(session_id_or_token, user_id, bot_id)
             if session:
@@ -345,7 +352,7 @@ class SessionManager:
             ex=self._ttl_seconds,
             xx=True,
         )
-        return result is not None and result is not False
+        return bool(result)
 
     async def get_or_prompt_resume(
         self,
@@ -398,14 +405,10 @@ class SessionManager:
                     if ok:
                         return Active(session_id=session_id)
                     # XX-set failed → key evicted between get_session and SET.
-                    # Return Resumable for the SAME session_id — do NOT do a
-                    # fresh DB lookup that could return a different concurrent
-                    # session (Opus review finding).
-                    return Resumable(
-                        session_id=session_id,
-                        last_activity_ts=session.updated_at,
-                    )
-                # Lapsed — surface as Resumable
+                    # Fall through to Resumable — do NOT do a fresh DB lookup
+                    # that could return a different concurrent session
+                    # (Opus review finding).
+                # Lapsed or XX-set failed — surface as Resumable
                 return Resumable(
                     session_id=session_id,
                     last_activity_ts=session.updated_at,
@@ -418,12 +421,12 @@ class SessionManager:
         if row is None:
             return NewSession()
 
-        last = row.last_message_at or row.created_at
+        last = _ensure_utc(row.last_message_at or row.created_at)
         session = SessionData(
             id=str(row.id),
             user_id=row.user_id,
             bot_id=row.bot_id,
-            created_at=row.created_at,
+            created_at=_ensure_utc(row.created_at),
             updated_at=last,
             status="active",
             client_context=row.client_context,
@@ -496,8 +499,8 @@ class SessionManager:
                 id=str(row.id),
                 user_id=row.user_id,
                 bot_id=row.bot_id,
-                created_at=row.created_at,
-                updated_at=row.last_message_at or row.created_at,
+                created_at=_ensure_utc(row.created_at),
+                updated_at=_ensure_utc(row.last_message_at or row.created_at),
                 data={},
                 status=row.status,
                 conversation_history=[],

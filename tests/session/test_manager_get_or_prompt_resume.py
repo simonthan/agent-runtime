@@ -1,12 +1,12 @@
 """Tests for SessionManager.get_or_prompt_resume and update_session."""
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from agent_runtime.session.events import Active, NewSession, Resumable
 from agent_runtime.session.manager import SessionManager
-from agent_runtime.session.models import ResumeRow
 from agent_runtime.session.testing import FakeRedisClient, FakeSessionRepository
 
 
@@ -66,7 +66,6 @@ async def test_get_or_prompt_resume_lapsed_returns_resumable():
     session = await mgr.create_session(user_id="u1", bot_id="b1")
 
     # Backdate updated_at to force lapsed state
-    import json
     raw = redis._store[f"session:{session.id}"]
     parsed = json.loads(raw)
     old_ts = (datetime.now(UTC) - timedelta(seconds=2)).isoformat()

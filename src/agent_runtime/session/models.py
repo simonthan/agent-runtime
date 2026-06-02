@@ -50,6 +50,13 @@ class ResumeRow(BaseModel):
     ``last_message_at`` may be ``None`` for sessions that have not yet
     exchanged a message — caller falls back to ``created_at`` for TTL
     window comparison.
+
+    Datetime invariant: ``created_at`` and ``last_message_at`` SHOULD be
+    timezone-aware (UTC). SessionManager defensively coerces naive values at
+    the ingestion boundary to protect against asyncpg's default driver which
+    returns naive UTC datetimes from TIMESTAMP columns; concrete repositories
+    should still emit tz-aware values to make the contract explicit at the
+    SQL layer (cast with ``AT TIME ZONE 'UTC'`` or use ``TIMESTAMPTZ``).
     """
 
     id: UUID

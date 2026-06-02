@@ -1,12 +1,9 @@
 """Tests for SessionManager.resume_session."""
 
+import json
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
-
-import pytest
 
 from agent_runtime.session.manager import SessionManager
-from agent_runtime.session.models import ResumeRow
 from agent_runtime.session.testing import FakeRedisClient, FakeSessionRepository
 
 
@@ -131,7 +128,6 @@ async def test_resume_session_hard_expired_returns_none():
     session = await mgr.create_session(user_id="u1", bot_id="b1")
 
     # Manually backdate updated_at to simulate expiry
-    import json
     raw = await redis.get(f"session:{session.id}")
     assert raw is not None
     parsed = json.loads(raw)
