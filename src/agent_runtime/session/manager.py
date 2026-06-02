@@ -10,7 +10,7 @@ Lifted from ithelpdesk ``app.core.session_manager`` with these changes:
 - ``touch_session`` atomic heartbeat
 - ``_active_index_key`` reverse-index for (user, bot) → session_id
 - ``save_feedback`` dropped (future ``FeedbackService`` per ARCH §2)
-- ``ITSessionState`` filter dropped from ``update_session``
+- consumer model filter dropped from ``update_session`` (raw dict pass-through)
 - ``AuditLogger`` injected (``NullAuditLogger`` default)
 """
 
@@ -207,7 +207,7 @@ class SessionManager:
     ) -> SessionData | None:
         """Update session data or add a message to history.
 
-        ``data`` is stored as-is (raw dict).  The ITSessionState model filter
+        ``data`` is stored as-is (raw dict).  The consumer model filter
         has been dropped; consumers that need validation should apply it
         upstream before calling this method.
         """
