@@ -109,6 +109,11 @@ ignore = ["D", "COM812", "ISC001", "ANN401"]
 "src/agent_runtime/session/manager.py" = [
     "PLR0913",  # _persist_resume_to_db forwards all create_session args to repo (session_id, user_id, bot_id, resume_token, resume_expires_at, client_context, channel) — lift-required signature; cannot reduce without losing the v0.5.0 bot_id key contract
 ]
+"src/agent_runtime/session/testing.py" = [
+    "FBT001",   # FakeRedisClient.set — nx/xx mirror RedisClientProtocol boolean flags; must match to structurally satisfy the Protocol
+    "FBT002",   # same as FBT001 — boolean defaults match redis-py/Protocol signature exactly
+    "PLR0913",  # FakeRedisClient.set and FakeSessionRepository.upsert_resume_data mirror their Protocol counterparts' arg counts
+]
 
 [tool.pytest.ini_options]
 addopts = [
