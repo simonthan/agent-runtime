@@ -33,7 +33,7 @@ class SessionData:
 
 class ConversationState(BaseModel):
     """Pydantic baseline conversation state. Consumers subclass to add
-    domain sub-states (e.g. ITSessionState in ithelpdesk).
+    domain sub-states (e.g. a ticket-draft state in a helpdesk consumer).
 
     Slimmed from ithelpdesk SessionState — IHD-named sub-states drop out;
     consumers extend per ``session_state_ihd.py`` precedent.
