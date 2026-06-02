@@ -101,6 +101,11 @@ ignore = ["D", "COM812", "ISC001", "ANN401"]
 "src/agent_runtime/context/execution_context.py" = [
     "ANN204",  # missing return type on __init__ (ihd style)
 ]
+"src/agent_runtime/session/protocol.py" = [
+    "FBT001",   # RedisClientProtocol.set — nx/xx are boolean positional args mirroring redis-py's API contract; changing to keyword-only would break structural conformance
+    "FBT002",   # same as FBT001 — boolean default matches redis-py signature exactly
+    "PLR0913",  # RedisClientProtocol.set (6 args) and SessionRepositoryProtocol.upsert_resume_data (7 args) — opinionated multi-param APIs matching their concrete counterparts
+]
 
 [tool.pytest.ini_options]
 addopts = [
