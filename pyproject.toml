@@ -13,6 +13,11 @@ dependencies = [
 
 [project.optional-dependencies]
 llm = ["anthropic>=0.42,<1.0"]
+teams = [
+    "botbuilder-core>=4.15,<5",
+    "botbuilder-schema>=4.15,<5",
+    "aiohttp>=3.9,<4",
+]
 
 [dependency-groups]
 dev = [{include-group = "lint"}, {include-group = "test"}]
