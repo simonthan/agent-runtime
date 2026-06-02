@@ -84,8 +84,11 @@ def make_inbound_invoke(
     value: dict | None = None,
     **ref_overrides: str,
 ) -> InboundInvoke:
+    # Propagate value as-is — including None. The adapter sets value=None when
+    # activity.value is not a dict (e.g. typed MessagingExtensionQuery, missing),
+    # so test factories must be able to reproduce that branch.
     return InboundInvoke(
         conversation_ref=make_conversation_ref(**ref_overrides),
         name=name,
-        value=value if value is not None else {},
+        value=value,
     )
