@@ -106,6 +106,9 @@ ignore = ["D", "COM812", "ISC001", "ANN401"]
     "FBT002",   # same as FBT001 — boolean default matches redis-py signature exactly
     "PLR0913",  # RedisClientProtocol.set (6 args) and SessionRepositoryProtocol.upsert_resume_data (7 args) — opinionated multi-param APIs matching their concrete counterparts
 ]
+"src/agent_runtime/session/manager.py" = [
+    "PLR0913",  # _persist_resume_to_db forwards all create_session args to repo (session_id, user_id, bot_id, resume_token, resume_expires_at, client_context, channel) — lift-required signature; cannot reduce without losing the v0.5.0 bot_id key contract
+]
 
 [tool.pytest.ini_options]
 addopts = [
