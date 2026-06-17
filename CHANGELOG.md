@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.6.0 — 2026-06-17
+
+### Added
+- `ToolUseLoop` — generic, policy-free fenced model-driven tool-use loop. Drives
+  Anthropic tool-use over a caller-supplied tool set + executor bounded by a
+  caller-supplied round cap. Returns `ToolLoopResult` with final text, aggregate
+  token usage, per-round trace (`ToolLoopStep`/`ToolCall`), and `cap_exhausted` flag.
+- `complete_messages(*, system_blocks, messages, tools=None)` low-level method on
+  `AnthropicClient` — caller-assembled message list entry point used by `ToolUseLoop`
+  for multi-round calls; `complete()` wraps it.
+- `tools=` parameter on `AnthropicClient.complete()` — passed verbatim to the SDK.
+  `tools=None` (default) omits the param entirely (D5 — byte-identical to v0.5.0).
+- `ClaudeResponse.tool_use: tuple[ToolUseBlock, ...]` field (defaults to `()`);
+  `ToolUseBlock(id, name, input)` frozen dataclass.
+- New public types in `agent_runtime.llm`: `ToolResult`, `ToolCall`, `ToolLoopStep`,
+  `ToolLoopResult`, `ToolExecutor`, `ToolUseBlock`.
+
+### Notes
+- Policy-free: `ToolUseLoop` owns no cap value, no PATH dispatch, no MCP knowledge.
+  Consumer (teams-bot-platform T-011d-c) supplies the cap, tools, and executor and
+  classifies `ToolLoopResult` into PATH A/B.
+- Two-breakpoint cache contract preserved: `static_system_prefix` (breakpoint 1) and
+  `retrieval_block` (breakpoint 2) still carry `cache_control: {type: ephemeral}` in
+  both `complete()` and `ToolUseLoop.run()`.
+- `complete(tools=None)` is byte-identical to v0.5.0 behavior — single-shot callers
+  are unaffected.
+- `ToolResult` field names are the cross-plan duck-type contract with T-011d-b's local
+  `ToolResult`: `content: str`, `is_error: bool`. The loop reads by attribute access
+  only (`.content`, `.is_error`) — no `isinstance` check, no import cycle.
+- `cap_exhausted=True` CONTRACT: the consumer MUST route to PATH B regardless of
+  `final_text` (which may be empty when the model wanted a tool it can't call).
+- `max_rounds=N` issues up to N+1 SDK calls (N tool rounds + 1 final no-tools call).
+- `llm_request_start` debug event kwargs changed: `has_retrieval_block`/`history_len`
+  → `has_tools`/`n_messages`. Event is now emitted in `complete_messages` (not
+  `complete`) so every loop round gets a paired start/response event without
+  double-logging single-shot calls.
+- `llm_unexpected_extra_blocks` warning `count` kwarg semantics changed: was "total
+  extra blocks" (v0.5.0), now "count of unknown-typed blocks" (blocks of type other
+  than `text` or `tool_use`). Downstream alerting keyed on `count` should note this
+  shift.
+
 ## v0.5.0 — 2026-06-02
 
 ### Added
