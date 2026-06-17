@@ -28,8 +28,11 @@ from .fakes import (
     FakeAsyncAnthropic,
     FakeMessage,
     FakeNonTextBlock,
+    FakeTextBlock,
+    FakeToolUseBlock,
     FakeUsage,
     make_ok,
+    make_tool_use,
 )
 
 
@@ -274,3 +277,97 @@ async def test_unknown_model_warning_uses_default_hint(
     _, _, kwargs = next(e for e in audit.events if e[1] == "llm_cache_not_written")
     assert kwargs["threshold_hint"] == 1024
     assert kwargs["model_unknown"] is True
+
+
+# --- §6c additions: tools= param, tool_use parsing, unknown-block warning ---
+
+
+@pytest.mark.asyncio
+async def test_tools_param_puts_tools_in_sdk_request(
+    client: AnthropicClient, fake_sdk: FakeAsyncAnthropic
+) -> None:
+    """complete(tools=[...]) passes tools in the SDK create call."""
+    tools = [{"name": "search", "description": "s", "input_schema": {}}]
+    fake_sdk.messages.responses.append(make_ok())
+    await client.complete(static_system_prefix="STATIC", user_message="hi", tools=tools)
+    assert "tools" in fake_sdk.messages.captured_requests[0]
+    assert fake_sdk.messages.captured_requests[0]["tools"] == tools
+
+
+@pytest.mark.asyncio
+async def test_no_tools_omits_tools_key(
+    client: AnthropicClient, fake_sdk: FakeAsyncAnthropic
+) -> None:
+    """complete(tools=None) must NOT include a 'tools' key in the SDK call (D5)."""
+    fake_sdk.messages.responses.append(make_ok())
+    await client.complete(static_system_prefix="STATIC", user_message="hi")
+    assert "tools" not in fake_sdk.messages.captured_requests[0]
+
+
+@pytest.mark.asyncio
+async def test_tool_use_block_parsed_into_claude_response(
+    client: AnthropicClient, fake_sdk: FakeAsyncAnthropic
+) -> None:
+    """A tool_use response block is parsed into ClaudeResponse.tool_use."""
+    fake_sdk.messages.responses.append(
+        make_tool_use(tool_id="tu_1", name="search", tool_input={"q": "hello"})
+    )
+    resp = await client.complete(static_system_prefix="STATIC", user_message="hi")
+    assert len(resp.tool_use) == 1
+    tu = resp.tool_use[0]
+    assert tu.id == "tu_1"
+    assert tu.name == "search"
+    assert tu.input == {"q": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_text_and_tool_use_response_concatenates_text(
+    client: AnthropicClient, fake_sdk: FakeAsyncAnthropic
+) -> None:
+    """A text block + tool_use block: text goes to .content, tool_use to .tool_use."""
+    fake_sdk.messages.responses.append(
+        FakeMessage(
+            content=[
+                FakeTextBlock(text="thinking..."),
+                FakeToolUseBlock(id="tu_2", name="lookup", input={"id": 99}),
+            ],
+            model="claude-sonnet-4-6",
+            stop_reason="tool_use",
+            usage=FakeUsage(input_tokens=100, output_tokens=20),
+        )
+    )
+    resp = await client.complete(static_system_prefix="STATIC", user_message="hi")
+    assert resp.content == "thinking..."
+    assert len(resp.tool_use) == 1
+    assert resp.tool_use[0].id == "tu_2"
+
+
+@pytest.mark.asyncio
+async def test_unknown_block_type_fires_warning_with_count(
+    client: AnthropicClient, fake_sdk: FakeAsyncAnthropic, audit: RecordingAudit
+) -> None:
+    """A text block + unknown-type block ('thinking') → text parsed + warning count=1.
+
+    This covers the new unknown-block branch in _parse_response introduced in v0.6.0.
+    No existing test asserted this warning (Sonnet F1 / Opus H2).
+    """
+
+    class FakeThinkingBlock:
+        type = "thinking"
+
+    fake_sdk.messages.responses.append(
+        FakeMessage(
+            content=[FakeTextBlock(text="answer"), FakeThinkingBlock()],
+            model="claude-sonnet-4-6",
+            stop_reason="end_turn",
+            usage=FakeUsage(input_tokens=100, output_tokens=20),
+        )
+    )
+    resp = await client.complete(static_system_prefix="STATIC", user_message="hi")
+    assert resp.content == "answer"
+    warnings = [
+        e for e in audit.events if e[0] == "warning" and e[1] == "llm_unexpected_extra_blocks"
+    ]
+    assert len(warnings) == 1
+    _, _, kwargs = warnings[0]
+    assert kwargs["count"] == 1

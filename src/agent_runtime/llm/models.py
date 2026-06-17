@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, TypedDict
+from typing import Any, Literal, TypedDict
 
 
 class Message(TypedDict):
@@ -20,6 +20,15 @@ class Message(TypedDict):
 
 History = tuple[Message, ...]
 """Immutable conversation history. Callers slice or extend explicitly via tuple ops."""
+
+
+@dataclass(frozen=True, slots=True)
+class ToolUseBlock:
+    """One tool call the model requested in a `tool_use` content block."""
+
+    id: str
+    name: str
+    input: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,3 +45,7 @@ class ClaudeResponse:
     output_tokens: int
     cache_creation_input_tokens: int
     cache_read_input_tokens: int
+    # MUST be the LAST field — all 7 preceding fields are non-defaulted;
+    # a defaulted field can only follow them (slots=True + defaulted field
+    # is valid — defaults live on the class, not the instance dict).
+    tool_use: tuple[ToolUseBlock, ...] = ()

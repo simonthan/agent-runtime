@@ -28,6 +28,14 @@ class FakeNonTextBlock:
 
 
 @dataclass(frozen=True)
+class FakeToolUseBlock:
+    id: str
+    name: str
+    input: dict
+    type: str = "tool_use"
+
+
+@dataclass(frozen=True)
 class FakeMessage:
     content: list[Any]
     model: str
@@ -78,4 +86,27 @@ def make_ok(
             cache_creation_input_tokens=cache_creation,
             cache_read_input_tokens=cache_read,
         ),
+    )
+
+
+def make_tool_use(
+    *,
+    tool_id: str = "tu_1",
+    name: str = "search",
+    tool_input: dict | None = None,
+    text: str = "",
+    model: str = "claude-sonnet-4-6",
+    input_tokens: int = 100,
+    output_tokens: int = 20,
+) -> FakeMessage:
+    """Build a fake Message with stop_reason='tool_use' and a FakeToolUseBlock."""
+    content: list = []
+    if text:
+        content.append(FakeTextBlock(text=text))
+    content.append(FakeToolUseBlock(id=tool_id, name=name, input=tool_input or {}))
+    return FakeMessage(
+        content=content,
+        model=model,
+        stop_reason="tool_use",
+        usage=FakeUsage(input_tokens=input_tokens, output_tokens=output_tokens),
     )

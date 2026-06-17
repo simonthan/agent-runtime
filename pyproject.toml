@@ -1,6 +1,6 @@
 [project]
 name = "agent-runtime"
-version = "0.5.0"
+version = "0.6.0"
 description = "Shared runtime primitives for Microsoft Teams knowledge bots — resilience, safety, session flows, execution context. Consumed by teams-bot-platform and ithelpdesk."
 readme = "README.md"
 license = "MIT"
@@ -51,6 +51,11 @@ ignore = ["D", "COM812", "ISC001", "ANN401"]
     "EM101",   # LLMResponseError("literal msg") — short diagnostic strings, not user-facing
     "EM102",   # f-string in raise — PII-safe pattern: type+status only, no SDK body
     "TRY003",  # long message outside exception class — each raise is a distinct diagnostic
+]
+"src/agent_runtime/llm/tool_loop.py" = [
+    "PLR0913", # ToolUseLoop.run has 11 keyword-only params by design — same exemption as client.py
+    "TC001",   # AnthropicClient used at runtime (constructor param type) — not annotation-only
+    "TC003",   # Callable/Awaitable from collections.abc used at runtime in ToolExecutor alias
 ]
 "src/agent_runtime/safety/injection_detector.py" = [
     "RUF012",  # mutable class default (PATTERNS dict; ihd/T-506-batch covers fix)

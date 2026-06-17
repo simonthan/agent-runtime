@@ -37,7 +37,7 @@ from agent_runtime.llm.errors import (
     LLMRateLimitError,
     LLMResponseError,
 )
-from agent_runtime.llm.models import ClaudeResponse, History
+from agent_runtime.llm.models import ClaudeResponse, History, ToolUseBlock
 from agent_runtime.logging import AuditLogger, NullAuditLogger
 
 __all__ = ["AnthropicClient"]
@@ -109,97 +109,60 @@ class AnthropicClient:
         self._default_temperature = default_temperature
         self._audit: AuditLogger = audit_logger or NullAuditLogger()
 
-    async def complete(
+    async def complete_messages(
         self,
         *,
-        static_system_prefix: str,
-        user_message: str,
-        dynamic_system_suffix: str | None = None,
-        history: History = (),
-        retrieval_block: str | None = None,
+        system_blocks: list[dict[str, Any]],
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
         model: str | None = None,
     ) -> ClaudeResponse:
-        """Send a completion request with two ``cache_control`` ephemeral breakpoints.
+        """Low-level single SDK round over a caller-assembled message list.
 
-        Breakpoint #1: ``static_system_prefix`` (always cached).
-        Breakpoint #2: ``retrieval_block`` (cached when present; prepended to user_message).
-
-        ``dynamic_system_suffix`` and ``history`` are passed through uncached.
+        `system_blocks` already carry their own cache_control. `messages` is the
+        full list (history + tool rounds) with raw content blocks. `tools`, when
+        present, is passed verbatim to the SDK. Does error-mapping + parse +
+        cache-not-written hint. `ToolUseLoop` drives this; `complete()` wraps it.
         """
         chosen_model = model or self._default_model
         chosen_max_tokens = max_tokens if max_tokens is not None else self._default_max_tokens
         chosen_temperature = temperature if temperature is not None else self._default_temperature
 
-        system_blocks: list[dict[str, Any]] = [
-            {
-                "type": "text",
-                "text": static_system_prefix,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ]
-        if dynamic_system_suffix:
-            # Truthy check (not ``is not None``) so empty string is skipped —
-            # Anthropic API rejects ``{"type":"text","text":""}`` with 400.
-            system_blocks.append({"type": "text", "text": dynamic_system_suffix})
+        create_kwargs: dict[str, Any] = {
+            "model": chosen_model,
+            "max_tokens": chosen_max_tokens,
+            "temperature": chosen_temperature,
+            "system": system_blocks,
+            "messages": messages,
+        }
+        if tools:
+            create_kwargs["tools"] = tools
 
-        user_content: list[dict[str, Any]] = []
-        if retrieval_block:
-            # Truthy check — see ``dynamic_system_suffix`` comment above.
-            user_content.append(
-                {
-                    "type": "text",
-                    "text": retrieval_block,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            )
-        user_content.append({"type": "text", "text": user_message})
-
-        messages: list[dict[str, Any]] = [
-            {"role": m["role"], "content": m["content"]} for m in history
-        ]
-        messages.append({"role": "user", "content": user_content})
-
+        # Request-start audit lives HERE (not in complete()) so every loop round
+        # emits a paired start/response event — complete() must NOT also log it,
+        # or single-shot calls double-log (Sonnet F4).
         self._audit.debug(
-            "llm_request_start",
-            model=chosen_model,
-            has_retrieval_block=retrieval_block is not None,
-            history_len=len(history),
+            "llm_request_start", model=chosen_model, has_tools=bool(tools), n_messages=len(messages)
         )
-
         start = time.monotonic()
         try:
-            raw = await self._client.messages.create(
-                model=chosen_model,
-                max_tokens=chosen_max_tokens,
-                temperature=chosen_temperature,
-                system=system_blocks,
-                messages=messages,
-            )
+            raw = await self._client.messages.create(**create_kwargs)
         except RateLimitError as exc:
             status_code = getattr(exc, "status_code", None)
             self._audit.warning("llm_rate_limited", model=chosen_model, status_code=status_code)
-            # Use type+status only; SDK exception ``__str__`` can include the
-            # response body (potentially echoing prompt fragments) — keep
-            # diagnostic chain via ``from exc`` instead.
             raise LLMRateLimitError(f"{type(exc).__name__}: status={status_code}") from exc
         except APIError as exc:
             status_code = getattr(exc, "status_code", None)
             error_type = type(exc).__name__
             self._audit.error(
-                "llm_api_error",
-                model=chosen_model,
-                error_type=error_type,
-                status_code=status_code,
+                "llm_api_error", model=chosen_model, error_type=error_type, status_code=status_code
             )
-            # PII discipline: do NOT include ``str(exc)`` in the wrapped
-            # message — see RateLimitError branch above.
             raise LLMAPIError(f"{error_type}: status={status_code}") from exc
 
         duration_ms = int((time.monotonic() - start) * 1000)
-        response = self._parse_response(raw)  # may emit llm_unexpected_extra_blocks
-
+        response = self._parse_response(raw)
         self._audit.info(
             "llm_response_success",
             model=response.model,
@@ -210,7 +173,6 @@ class AnthropicClient:
             stop_reason=response.stop_reason,
             duration_ms=duration_ms,
         )
-
         if (
             response.cache_creation_input_tokens == 0
             and response.cache_read_input_tokens == 0
@@ -224,36 +186,113 @@ class AnthropicClient:
                 threshold_hint=threshold_hint,
                 model_unknown=model_unknown,
             )
-
         return response
+
+    async def complete(
+        self,
+        *,
+        static_system_prefix: str,
+        user_message: str,
+        dynamic_system_suffix: str | None = None,
+        history: History = (),
+        retrieval_block: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        model: str | None = None,
+    ) -> ClaudeResponse:
+        """Send a completion request with two ``cache_control`` ephemeral breakpoints.
+
+        Breakpoint #1: ``static_system_prefix`` (always cached).
+        Breakpoint #2: ``retrieval_block`` (cached when present; prepended to user_message).
+
+        ``dynamic_system_suffix`` and ``history`` are passed through uncached.
+
+        Delegates to ``complete_messages`` after assembling blocks. ``tools`` is
+        passed verbatim; ``None`` omits the param entirely (D5 — byte-identical
+        to v0.5.0 behavior when no tools supplied).
+
+        NOTE: llm_request_start is emitted inside complete_messages (Sonnet F4) —
+        do NOT re-add it here or single-shot calls double-log.
+        """
+        system_blocks: list[dict[str, Any]] = [
+            {"type": "text", "text": static_system_prefix, "cache_control": {"type": "ephemeral"}}
+        ]
+        if dynamic_system_suffix:
+            # Truthy check (not ``is not None``) so empty string is skipped —
+            # Anthropic API rejects ``{"type":"text","text":""}`` with 400.
+            system_blocks.append({"type": "text", "text": dynamic_system_suffix})
+
+        user_content: list[dict[str, Any]] = []
+        if retrieval_block:
+            # Truthy check — see ``dynamic_system_suffix`` comment above.
+            user_content.append(
+                {"type": "text", "text": retrieval_block, "cache_control": {"type": "ephemeral"}}
+            )
+        user_content.append({"type": "text", "text": user_message})
+
+        messages: list[dict[str, Any]] = [
+            {"role": m["role"], "content": m["content"]} for m in history
+        ]
+        messages.append({"role": "user", "content": user_content})
+
+        return await self.complete_messages(
+            system_blocks=system_blocks,
+            messages=messages,
+            tools=tools,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            model=model,
+        )
 
     def _parse_response(self, raw: Any) -> ClaudeResponse:
         content_blocks = getattr(raw, "content", None)
         if not content_blocks:
             raise LLMResponseError("response has no content blocks")
-        first = content_blocks[0]
-        text = getattr(first, "text", None)
-        if text is None:
-            raise LLMResponseError(f"first content block is not text (type={type(first).__name__})")
 
-        # Surface (rather than silently truncate) responses with extra blocks
-        # we don't currently handle — e.g., extended-thinking ``thinking_block``
-        # at index 0+ or future ``tool_use_block`` at index 1+. v0.2.0 only
-        # extracts the first text block; ops should know when this drops data.
-        if len(content_blocks) > 1:
-            self._audit.warning(
-                "llm_unexpected_extra_blocks",
-                model=raw.model,
-                count=len(content_blocks),
-            )
+        text_parts: list[str] = []
+        tool_use: list[ToolUseBlock] = []
+        unknown = 0
+        for block in content_blocks:
+            btype = getattr(block, "type", None)
+            if btype == "text":
+                text_parts.append(getattr(block, "text", "") or "")
+            elif btype == "tool_use":
+                tool_id = getattr(block, "id", None)
+                if not tool_id:
+                    # Empty/missing id would later submit tool_use_id:"" → Anthropic
+                    # 400 far from the cause (Gemini R2 F2). Drop + count as unknown.
+                    unknown += 1
+                    continue
+                tool_use.append(
+                    ToolUseBlock(
+                        id=tool_id,
+                        name=getattr(block, "name", ""),
+                        input=getattr(block, "input", {}) or {},
+                    )
+                )
+            else:
+                unknown += 1
+
+        if not text_parts and not tool_use:
+            # An image/thinking-only first block with no usable content — same
+            # failure class as before (previously: "first block is not text").
+            first_type = getattr(content_blocks[0], "type", type(content_blocks[0]).__name__)
+            raise LLMResponseError(f"response has no text or tool_use blocks (first={first_type})")
+        if unknown:
+            # `count` = number of unknown-typed blocks (changed from v0.5.0 where
+            # count was total extra blocks regardless of type). Downstream alerting
+            # keyed on `count` should note this semantic shift (Sonnet F2).
+            self._audit.warning("llm_unexpected_extra_blocks", model=raw.model, count=unknown)
 
         usage = raw.usage
         return ClaudeResponse(
-            content=text,
+            content="".join(text_parts),
             model=raw.model,
             stop_reason=raw.stop_reason,
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             cache_creation_input_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
             cache_read_input_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+            tool_use=tuple(tool_use),
         )
