@@ -365,7 +365,9 @@ async def test_unknown_block_type_fires_warning_with_count(
     )
     resp = await client.complete(static_system_prefix="STATIC", user_message="hi")
     assert resp.content == "answer"
-    warnings = [e for e in audit.events if e[0] == "warning" and e[1] == "llm_unexpected_extra_blocks"]
+    warnings = [
+        e for e in audit.events if e[0] == "warning" and e[1] == "llm_unexpected_extra_blocks"
+    ]
     assert len(warnings) == 1
     _, _, kwargs = warnings[0]
     assert kwargs["count"] == 1

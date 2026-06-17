@@ -103,17 +103,13 @@ async def test_fake_session_repository_satisfies_protocol():
     )
 
     # get_session_for_resume — hit
-    row = await repo.get_session_for_resume(
-        resume_token="tok1", user_id="u1", bot_id="b1"
-    )
+    row = await repo.get_session_for_resume(resume_token="tok1", user_id="u1", bot_id="b1")
     assert row is not None
     assert str(row.id) == sid
     assert row.bot_id == "b1"
 
     # get_session_for_resume — wrong bot_id
-    row_wrong = await repo.get_session_for_resume(
-        resume_token="tok1", user_id="u1", bot_id="wrong"
-    )
+    row_wrong = await repo.get_session_for_resume(resume_token="tok1", user_id="u1", bot_id="wrong")
     assert row_wrong is None
 
     # get_session_for_resume — wrong token
@@ -141,8 +137,12 @@ async def test_fake_repo_get_active_session_filters_non_active_status():
     repo = FakeSessionRepository()
     sid = str(uuid4())
     repo._by_id[sid] = ResumeRow(
-        id=UUID(sid), user_id="u1", bot_id="b1", status="ended",
-        created_at=datetime.now(UTC), last_message_at=datetime.now(UTC),
+        id=UUID(sid),
+        user_id="u1",
+        bot_id="b1",
+        status="ended",
+        created_at=datetime.now(UTC),
+        last_message_at=datetime.now(UTC),
     )
     repo._active_by_pair[("u1", "b1")] = sid
     assert await repo.get_active_session(user_id="u1", bot_id="b1") is None
@@ -152,7 +152,9 @@ async def test_fake_repo_get_active_session_filters_hard_expired_rows():
     repo = FakeSessionRepository(idle_timeout=timedelta(minutes=30))
     sid = str(uuid4())
     repo._by_id[sid] = ResumeRow(
-        id=UUID(sid), user_id="u1", bot_id="b1",
+        id=UUID(sid),
+        user_id="u1",
+        bot_id="b1",
         created_at=datetime.now(UTC) - timedelta(hours=2),
         last_message_at=datetime.now(UTC) - timedelta(hours=1),
     )
@@ -196,11 +198,7 @@ def test_no_consumer_imports_in_manager():
     """manager.py must contain no references to ithelpdesk app module paths
     or concrete RedisClient construction (T-494 invariant)."""
     manager_path = (
-        Path(__file__).parent.parent.parent
-        / "src"
-        / "agent_runtime"
-        / "session"
-        / "manager.py"
+        Path(__file__).parent.parent.parent / "src" / "agent_runtime" / "session" / "manager.py"
     )
     source = manager_path.read_text()
 

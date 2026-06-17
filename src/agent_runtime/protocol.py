@@ -33,8 +33,7 @@ class NodeResult:
 class TemplateResolver(Protocol):
     """Resolves template strings against an execution context."""
 
-    def resolve(self, template: str, context: Any) -> str:
-        ...
+    def resolve(self, template: str, context: Any) -> str: ...
 
     def resolve_user_facing(self, s: str, ctx: Any) -> str:
         """Resolve template variables and apply user-facing hygiene (separator collapse + render-guard)."""
@@ -53,8 +52,7 @@ class NodeExecutor(Protocol):
         user_message: str,
         context: Any,
         plugin: dict,
-    ) -> dict:
-        ...
+    ) -> dict: ...
 
 
 @runtime_checkable
@@ -69,5 +67,4 @@ class NodeHandler(Protocol):
         user_message: str,
         context: Any,
         plugin: dict,
-    ) -> NodeResult:
-        ...
+    ) -> NodeResult: ...

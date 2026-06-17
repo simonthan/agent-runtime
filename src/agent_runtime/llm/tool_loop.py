@@ -63,7 +63,7 @@ class ToolLoopResult:
     """Result of a fenced loop. The caller classifies this into PATH A/B."""
 
     final_text: str
-    stop_reason: str          # the model's last stop_reason, or "cap_exhausted"
+    stop_reason: str  # the model's last stop_reason, or "cap_exhausted"
     cap_exhausted: bool
     steps: tuple[ToolLoopStep, ...]
     input_tokens: int
@@ -162,8 +162,13 @@ class ToolUseLoop:
                 )
                 outcome = await executor(tu.name, tu.input)
                 calls.append(
-                    ToolCall(id=tu.id, name=tu.name, input=tu.input,
-                             result=outcome.content, is_error=outcome.is_error)
+                    ToolCall(
+                        id=tu.id,
+                        name=tu.name,
+                        input=tu.input,
+                        result=outcome.content,
+                        is_error=outcome.is_error,
+                    )
                 )
                 tool_result_blocks.append(
                     {
@@ -184,8 +189,12 @@ class ToolUseLoop:
         # cap_exhausted=True regardless of whether final.content is non-empty.
         self._audit.warning("tool_loop_cap_exhausted", rounds=rounds, max_rounds=max_rounds)
         final = await self._client.complete_messages(
-            system_blocks=system_blocks, messages=messages, tools=None,
-            model=model, max_tokens=max_tokens, temperature=temperature,
+            system_blocks=system_blocks,
+            messages=messages,
+            tools=None,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
         )
         agg["in"] += final.input_tokens
         agg["out"] += final.output_tokens
@@ -196,8 +205,14 @@ class ToolUseLoop:
         )
 
     @staticmethod
-    def _result(text: str, stop_reason: str, *, cap_exhausted: bool,
-                steps: list[ToolLoopStep], agg: dict[str, int]) -> ToolLoopResult:
+    def _result(
+        text: str,
+        stop_reason: str,
+        *,
+        cap_exhausted: bool,
+        steps: list[ToolLoopStep],
+        agg: dict[str, int],
+    ) -> ToolLoopResult:
         return ToolLoopResult(
             final_text=text,
             stop_reason=stop_reason,

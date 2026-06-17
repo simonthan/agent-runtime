@@ -13,7 +13,14 @@ pytest.importorskip("anthropic")
 from agent_runtime.llm import AnthropicClient, ToolUseLoop
 from agent_runtime.llm.tool_loop import ToolResult
 
-from .fakes import FakeAsyncAnthropic, FakeMessage, FakeToolUseBlock, FakeUsage, make_ok, make_tool_use
+from .fakes import (
+    FakeAsyncAnthropic,
+    FakeMessage,
+    FakeToolUseBlock,
+    FakeUsage,
+    make_ok,
+    make_tool_use,
+)
 
 
 def _make_client(fake_sdk: FakeAsyncAnthropic) -> AnthropicClient:
@@ -26,13 +33,13 @@ def _make_loop(fake_sdk: FakeAsyncAnthropic) -> tuple[ToolUseLoop, FakeAsyncAnth
     return loop, fake_sdk
 
 
-async def _never_called(name: str, inp: dict) -> ToolResult:
+async def _never_called(name: str, _inp: dict) -> ToolResult:
     """Executor that must not be called — fails the test if it is."""
     msg = f"executor must not be called, got name={name!r}"
     raise AssertionError(msg)
 
 
-async def _ok_executor(name: str, inp: dict) -> ToolResult:
+async def _ok_executor(_name: str, _inp: dict) -> ToolResult:
     return ToolResult(content="hit")
 
 
@@ -88,8 +95,7 @@ async def test_single_round_then_answer() -> None:
     assert user_turn["role"] == "user"
     tool_result_blocks = user_turn["content"]
     assert any(
-        b.get("type") == "tool_result" and b.get("tool_use_id") == tc.id
-        for b in tool_result_blocks
+        b.get("type") == "tool_result" and b.get("tool_use_id") == tc.id for b in tool_result_blocks
     )
 
 
@@ -114,7 +120,7 @@ async def test_multiple_tool_use_blocks_in_one_round() -> None:
 
     call_log: list[str] = []
 
-    async def tracking_executor(name: str, inp: dict) -> ToolResult:
+    async def tracking_executor(name: str, _inp: dict) -> ToolResult:
         call_log.append(name)
         return ToolResult(content=f"result_{name}")
 
@@ -169,7 +175,7 @@ async def test_executor_error_fed_back() -> None:
     sdk.messages.responses.append(make_tool_use(tool_id="tu_err", name="search"))
     sdk.messages.responses.append(make_ok(text="recovered"))
 
-    async def error_executor(name: str, inp: dict) -> ToolResult:
+    async def error_executor(_name: str, _inp: dict) -> ToolResult:
         return ToolResult(content="boom", is_error=True)
 
     result = await loop.run(
@@ -197,12 +203,8 @@ async def test_token_aggregation() -> None:
     """Tokens from all model calls are summed in ToolLoopResult."""
     fake_sdk = FakeAsyncAnthropic()
     loop, sdk = _make_loop(fake_sdk)
-    sdk.messages.responses.append(
-        make_tool_use(input_tokens=100, output_tokens=20)
-    )
-    sdk.messages.responses.append(
-        make_ok(text="done", input_tokens=150, output_tokens=30)
-    )
+    sdk.messages.responses.append(make_tool_use(input_tokens=100, output_tokens=20))
+    sdk.messages.responses.append(make_ok(text="done", input_tokens=150, output_tokens=30))
 
     result = await loop.run(
         static_system_prefix="SYS",

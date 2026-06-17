@@ -145,8 +145,7 @@ async def test_create_session_atomic_set_nx_pre_seeded_raises():
 
     # Keys before the second attempt
     session_data_keys_before = [
-        k for k in redis._store
-        if k.startswith("sess:") and k.count(":") == 1
+        k for k in redis._store if k.startswith("sess:") and k.count(":") == 1
     ]
 
     with pytest.raises(SessionAlreadyActive) as exc_info:
@@ -154,8 +153,7 @@ async def test_create_session_atomic_set_nx_pre_seeded_raises():
 
     # No new session-data keys
     session_data_keys_after = [
-        k for k in redis._store
-        if k.startswith("sess:") and k.count(":") == 1
+        k for k in redis._store if k.startswith("sess:") and k.count(":") == 1
     ]
     assert session_data_keys_before == session_data_keys_after
 

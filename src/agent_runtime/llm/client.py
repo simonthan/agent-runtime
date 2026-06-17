@@ -283,9 +283,7 @@ class AnthropicClient:
             # `count` = number of unknown-typed blocks (changed from v0.5.0 where
             # count was total extra blocks regardless of type). Downstream alerting
             # keyed on `count` should note this semantic shift (Sonnet F2).
-            self._audit.warning(
-                "llm_unexpected_extra_blocks", model=raw.model, count=unknown
-            )
+            self._audit.warning("llm_unexpected_extra_blocks", model=raw.model, count=unknown)
 
         usage = raw.usage
         return ClaudeResponse(

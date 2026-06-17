@@ -105,6 +105,8 @@ def make_tool_use(
         content.append(FakeTextBlock(text=text))
     content.append(FakeToolUseBlock(id=tool_id, name=name, input=tool_input or {}))
     return FakeMessage(
-        content=content, model=model, stop_reason="tool_use",
+        content=content,
+        model=model,
+        stop_reason="tool_use",
         usage=FakeUsage(input_tokens=input_tokens, output_tokens=output_tokens),
     )
