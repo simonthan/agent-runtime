@@ -234,15 +234,11 @@ class RetryMixin:
                 last_error = e
 
                 if not is_retryable_error(e):
-                    _default_audit.debug(
-                        f"{operation_name}: non-retryable error on attempt {attempt}: {e}"
-                    )
+                    _default_audit.debug(f"{operation_name}: non-retryable error on attempt {attempt}: {e}")
                     raise
 
                 if attempt == max_attempts:
-                    _default_audit.error(
-                        f"{operation_name}: failed after {max_attempts} attempts: {e}"
-                    )
+                    _default_audit.error(f"{operation_name}: failed after {max_attempts} attempts: {e}")
                     raise
 
                 # Check for Retry-After header on 429 responses

@@ -13,7 +13,7 @@ class _NoOpHandler:
 
 
 def test_adapter_constructs_settings_from_config():
-    config = TeamsAdapterConfig(app_id="aid", app_password="pwd", tenant_id="tid")
+    config = TeamsAdapterConfig(app_id="aid", app_password="pwd", tenant_id="tid")  # noqa: S106
     adapter = TeamsAdapter(config, _NoOpHandler())
     settings = adapter._adapter.settings
     assert settings.app_id == "aid"

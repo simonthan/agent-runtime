@@ -31,7 +31,6 @@ def _reset_module_state():
     is restored unconditionally.
     """
     import agent_runtime.connectors.base as base_mod
-
     base_mod._rate_limit_config.clear()
     base_mod._throttle_registry.clear()
     base_mod._default_audit = NullAuditLogger()
@@ -108,44 +107,25 @@ class TestBaseConnectorABC:
         # BaseConnector has 3 @abstractmethod methods: initialize, health_check, close.
         # All three must be overridden for the subclass to be instantiable.
         class _Stub(BaseConnector):
-            async def initialize(self) -> bool:
-                return True
-
-            async def health_check(self) -> ConnectorResult:
-                return ConnectorResult(success=True, message="ok")
-
-            async def close(self) -> None:
-                pass
-
+            async def initialize(self) -> bool: return True
+            async def health_check(self) -> ConnectorResult: return ConnectorResult(success=True, message="ok")
+            async def close(self) -> None: pass
         _Stub()  # no exception
 
     def test_is_initialized_starts_false(self):
         class _Stub(BaseConnector):
-            async def initialize(self) -> bool:
-                return True
-
-            async def health_check(self) -> ConnectorResult:
-                return ConnectorResult(success=True, message="ok")
-
-            async def close(self) -> None:
-                pass
-
+            async def initialize(self) -> bool: return True
+            async def health_check(self) -> ConnectorResult: return ConnectorResult(success=True, message="ok")
+            async def close(self) -> None: pass
         stub = _Stub()
         assert stub.is_initialized is False
 
     def test_handle_error_returns_structured_connector_result(self):
         """Covers the concrete inherited _handle_error path that all subclasses use."""
-
         class _Stub(BaseConnector):
-            async def initialize(self) -> bool:
-                return True
-
-            async def health_check(self) -> ConnectorResult:
-                return ConnectorResult(success=True, message="ok")
-
-            async def close(self) -> None:
-                pass
-
+            async def initialize(self) -> bool: return True
+            async def health_check(self) -> ConnectorResult: return ConnectorResult(success=True, message="ok")
+            async def close(self) -> None: pass
         stub = _Stub()
         # ihd source signature is `_handle_error(self, error: Exception, operation: str)` —
         # error FIRST, operation SECOND. Do NOT reverse these positional args (lift verbatim).
@@ -157,15 +137,9 @@ class TestBaseConnectorABC:
 
     def test_handle_error_captures_http_status(self):
         class _Stub(BaseConnector):
-            async def initialize(self) -> bool:
-                return True
-
-            async def health_check(self) -> ConnectorResult:
-                return ConnectorResult(success=True, message="ok")
-
-            async def close(self) -> None:
-                pass
-
+            async def initialize(self) -> bool: return True
+            async def health_check(self) -> ConnectorResult: return ConnectorResult(success=True, message="ok")
+            async def close(self) -> None: pass
         stub = _Stub()
         err = _http_error(503)
         result = stub._handle_error(err, "http_op")
@@ -284,26 +258,13 @@ class TestRetryMixinBehavior:
         import agent_runtime.connectors.base as base_mod
 
         class _Spy:
-            def __init__(self):
-                self.calls = []
-
-            def debug(self, m, **kw):
-                self.calls.append(("debug", m))
-
-            def info(self, m, **kw):
-                self.calls.append(("info", m))
-
-            def warning(self, m, **kw):
-                self.calls.append(("warning", m))
-
-            def error(self, m, **kw):
-                self.calls.append(("error", m))
-
-            def security(self, m, **kw):
-                self.calls.append(("security", m))
-
-            def action(self, a, r, **kw):
-                self.calls.append(("action", a))
+            def __init__(self): self.calls = []
+            def debug(self, m, **kw): self.calls.append(("debug", m))
+            def info(self, m, **kw): self.calls.append(("info", m))
+            def warning(self, m, **kw): self.calls.append(("warning", m))
+            def error(self, m, **kw): self.calls.append(("error", m))
+            def security(self, m, **kw): self.calls.append(("security", m))
+            def action(self, a, r, **kw): self.calls.append(("action", a))
 
         spy = _Spy()
         set_audit_logger(spy)
@@ -421,70 +382,36 @@ class TestSetAuditLogger:
 
     def test_set_audit_logger_replaces_module_default(self):
         class _Spy:
-            def __init__(self):
-                self.calls = []
-
-            def debug(self, m, **kw):
-                self.calls.append(("debug", m, kw))
-
-            def info(self, m, **kw):
-                self.calls.append(("info", m, kw))
-
-            def warning(self, m, **kw):
-                self.calls.append(("warning", m, kw))
-
-            def error(self, m, **kw):
-                self.calls.append(("error", m, kw))
-
-            def security(self, m, **kw):
-                self.calls.append(("security", m, kw))
-
-            def action(self, action, result, **kw):
-                self.calls.append(("action", action, result, kw))
-
+            def __init__(self): self.calls = []
+            def debug(self, m, **kw): self.calls.append(("debug", m, kw))
+            def info(self, m, **kw): self.calls.append(("info", m, kw))
+            def warning(self, m, **kw): self.calls.append(("warning", m, kw))
+            def error(self, m, **kw): self.calls.append(("error", m, kw))
+            def security(self, m, **kw): self.calls.append(("security", m, kw))
+            def action(self, action, result, **kw): self.calls.append(("action", action, result, kw))
         spy = _Spy()
         set_audit_logger(spy)
         import agent_runtime.connectors.base as base_mod
-
         assert base_mod._default_audit is spy
 
     def test_audit_logger_receives_error_calls(self):
         """_handle_error routes through _default_audit.error()."""
-
         class _Spy:
-            def __init__(self):
-                self.calls = []
-
-            def debug(self, m, **kw):
-                self.calls.append(("debug", m, kw))
-
-            def info(self, m, **kw):
-                self.calls.append(("info", m, kw))
-
-            def warning(self, m, **kw):
-                self.calls.append(("warning", m, kw))
-
-            def error(self, m, **kw):
-                self.calls.append(("error", m, kw))
-
-            def security(self, m, **kw):
-                self.calls.append(("security", m, kw))
-
-            def action(self, action, result, **kw):
-                self.calls.append(("action", action, result, kw))
+            def __init__(self): self.calls = []
+            def debug(self, m, **kw): self.calls.append(("debug", m, kw))
+            def info(self, m, **kw): self.calls.append(("info", m, kw))
+            def warning(self, m, **kw): self.calls.append(("warning", m, kw))
+            def error(self, m, **kw): self.calls.append(("error", m, kw))
+            def security(self, m, **kw): self.calls.append(("security", m, kw))
+            def action(self, action, result, **kw): self.calls.append(("action", action, result, kw))
 
         spy = _Spy()
         set_audit_logger(spy)
 
         class _Stub(BaseConnector):
-            async def initialize(self) -> bool:
-                return True
-
-            async def health_check(self) -> ConnectorResult:
-                return ConnectorResult(success=True, message="ok")
-
-            async def close(self) -> None:
-                pass
+            async def initialize(self) -> bool: return True
+            async def health_check(self) -> ConnectorResult: return ConnectorResult(success=True, message="ok")
+            async def close(self) -> None: pass
 
         _Stub()._handle_error(ValueError("boom"), "op")
         error_calls = [c for c in spy.calls if c[0] == "error"]

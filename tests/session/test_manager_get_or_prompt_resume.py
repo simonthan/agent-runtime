@@ -177,7 +177,9 @@ async def test_update_session_raw_dict_pass_through():
 async def test_update_session_replace_data():
     """replace_data=True replaces entire data dict."""
     mgr, _, _ = _make_manager()
-    session = await mgr.create_session(user_id="u1", bot_id="b1", initial_context={"old": "data"})
+    session = await mgr.create_session(
+        user_id="u1", bot_id="b1", initial_context={"old": "data"}
+    )
 
     updated = await mgr.update_session(
         session.id,

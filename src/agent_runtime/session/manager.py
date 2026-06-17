@@ -155,12 +155,18 @@ class SessionManager:
                 case Active(session_id=existing_sid):
                     existing = await self.get_session(existing_sid)
                     last_ts = existing.updated_at if existing else _utc_now()
-                    raise SessionAlreadyActive(session_id=existing_sid, last_activity_ts=last_ts)
+                    raise SessionAlreadyActive(
+                        session_id=existing_sid, last_activity_ts=last_ts
+                    )
                 case Resumable(session_id=existing_sid, last_activity_ts=last_ts):
-                    raise SessionAlreadyActive(session_id=existing_sid, last_activity_ts=last_ts)
+                    raise SessionAlreadyActive(
+                        session_id=existing_sid, last_activity_ts=last_ts
+                    )
                 case NewSession():
                     # Shouldn't happen here, but treat defensively as a race loss
-                    raise SessionAlreadyActive(session_id=session_id, last_activity_ts=_utc_now())
+                    raise SessionAlreadyActive(
+                        session_id=session_id, last_activity_ts=_utc_now()
+                    )
 
         await self._save_session(session)
 
@@ -245,7 +251,9 @@ class SessionManager:
         await self._save_session(session)
 
         # Clear the reverse index so create_session may claim it again
-        await self.redis.delete(self._active_index_key(session.user_id, session.bot_id))
+        await self.redis.delete(
+            self._active_index_key(session.user_id, session.bot_id)
+        )
 
         # Decrement per-user active session counter
         count_key = self._count_key(session.user_id)
@@ -275,7 +283,9 @@ class SessionManager:
             bot_id: Owning bot (for ownership validation — new dimension).
         """
         # Check if this is a resume token (OID-scoped per T-512)
-        mapped_session_id = await self.redis.get(self._resume_key(user_id, session_id_or_token))
+        mapped_session_id = await self.redis.get(
+            self._resume_key(user_id, session_id_or_token)
+        )
         actual_session_id = mapped_session_id or session_id_or_token
 
         session = await self.get_session(actual_session_id)

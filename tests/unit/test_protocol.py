@@ -29,22 +29,16 @@ class TestProtocolRuntimeChecks:
         class _Stub:
             async def handle(self, node_name, node, nodes, user_message, context, plugin):
                 return NodeResult(responses=[])
-
         assert isinstance(_Stub(), NodeHandler)
 
     def test_template_resolver_protocol_accepts_compatible_stub(self):
         class _Stub:
-            def resolve(self, template, context):
-                return template
-
-            def resolve_user_facing(self, s, ctx):
-                return s
-
+            def resolve(self, template, context): return template
+            def resolve_user_facing(self, s, ctx): return s
         assert isinstance(_Stub(), TemplateResolver)
 
     def test_node_executor_protocol_accepts_compatible_stub(self):
         class _Stub:
             async def execute_node(self, node_name, node, nodes, user_message, context, plugin):
                 return {}
-
         assert isinstance(_Stub(), NodeExecutor)
