@@ -22,6 +22,7 @@ class FakeOutboundChannel:
 
     sent_texts: list[str] = field(default_factory=list)
     sent_cards: list[dict] = field(default_factory=list)
+    sent_oauth_cards: list[dict] = field(default_factory=list)
     sent_typing_count: int = 0
 
     async def send_text(self, text: str) -> None:
@@ -30,12 +31,16 @@ class FakeOutboundChannel:
     async def send_card(self, card: dict) -> None:
         self.sent_cards.append(card)
 
+    async def send_oauth_card(self, card: dict) -> None:
+        self.sent_oauth_cards.append(card)
+
     async def send_typing(self) -> None:
         self.sent_typing_count += 1
 
     def clear(self) -> None:
         self.sent_texts.clear()
         self.sent_cards.clear()
+        self.sent_oauth_cards.clear()
         self.sent_typing_count = 0
 
 
