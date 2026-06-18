@@ -10,13 +10,15 @@ if TYPE_CHECKING:
     from botbuilder.core import TurnContext
 
 _ADAPTIVE_CARD_CONTENT_TYPE = "application/vnd.microsoft.card.adaptive"
+_OAUTH_CARD_CONTENT_TYPE = "application/vnd.microsoft.card.oauth"
 
 
 class OutboundChannel(Protocol):
-    """Minimal outbound surface — text, Adaptive Card, typing indicator."""
+    """Minimal outbound surface — text, Adaptive Card, OAuth Card, typing indicator."""
 
     async def send_text(self, text: str) -> None: ...
     async def send_card(self, card: dict) -> None: ...
+    async def send_oauth_card(self, card: dict) -> None: ...
     async def send_typing(self) -> None: ...
 
 
@@ -31,6 +33,12 @@ class BotFrameworkOutboundChannel:
 
     async def send_card(self, card: dict) -> None:
         attachment = Attachment(content_type=_ADAPTIVE_CARD_CONTENT_TYPE, content=card)
+        await self._turn_context.send_activity(
+            Activity(type=ActivityTypes.message, attachments=[attachment])
+        )
+
+    async def send_oauth_card(self, card: dict) -> None:
+        attachment = Attachment(content_type=_OAUTH_CARD_CONTENT_TYPE, content=card)
         await self._turn_context.send_activity(
             Activity(type=ActivityTypes.message, attachments=[attachment])
         )

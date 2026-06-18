@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.1 — 2026-06-17
+
+### Added
+- `OutboundChannel.send_oauth_card(card: dict)` + `BotFrameworkOutboundChannel`
+  impl — sends a Bot Framework OAuthCard (`application/vnd.microsoft.card.oauth`)
+  to trigger Teams SSO token exchange. `FakeOutboundChannel` records sends in
+  `sent_oauth_cards`. Additive; no behavior change to existing methods.
+
 ## v0.6.0 — 2026-06-17
 
 ### Added

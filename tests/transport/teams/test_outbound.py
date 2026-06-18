@@ -39,3 +39,13 @@ async def test_send_typing_sends_typing_activity(turn_context):
     await channel.send_typing()
     activity = turn_context.send_activity.await_args.args[0]
     assert activity.type == ActivityTypes.typing
+
+
+async def test_send_oauth_card_wraps_in_oauth_attachment(turn_context):
+    channel = BotFrameworkOutboundChannel(turn_context)
+    card = {"text": "Sign in", "tokenExchangeResource": {"id": "x", "uri": "api://abc"}}
+    await channel.send_oauth_card(card)
+    activity = turn_context.send_activity.await_args.args[0]
+    assert len(activity.attachments) == 1
+    assert activity.attachments[0].content_type == "application/vnd.microsoft.card.oauth"
+    assert activity.attachments[0].content == card

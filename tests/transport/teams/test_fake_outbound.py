@@ -30,7 +30,15 @@ async def test_fake_clear_resets_state():
     await fake.send_text("x")
     await fake.send_card({})
     await fake.send_typing()
+    await fake.send_oauth_card({})
     fake.clear()
     assert fake.sent_texts == []
     assert fake.sent_cards == []
     assert fake.sent_typing_count == 0
+    assert fake.sent_oauth_cards == []
+
+
+async def test_fake_records_oauth_cards():
+    fake = FakeOutboundChannel()
+    await fake.send_oauth_card({"tokenExchangeResource": {"uri": "api://x"}})
+    assert len(fake.sent_oauth_cards) == 1
