@@ -24,6 +24,12 @@ _INJECTION_SENTINELS = (
 )
 
 
+def _strip_control_chars(s: str) -> str:
+    for ch in _CONTROL_CHARS:
+        s = s.replace(ch, " ")
+    return s
+
+
 def sanitize_for_llm_prompt(text: str | None, max_len: int = 2000) -> str:
     """Return text safe to interpolate into an LLM prompt.
 
@@ -35,9 +41,7 @@ def sanitize_for_llm_prompt(text: str | None, max_len: int = 2000) -> str:
     """
     if text is None:
         return ""
-    s = str(text)
-    for ch in _CONTROL_CHARS:
-        s = s.replace(ch, " ")
+    s = _strip_control_chars(str(text))
     for sentinel in _INJECTION_SENTINELS:
         s = s.replace(sentinel, " ")
     s = " ".join(s.split())  # collapse whitespace
@@ -87,9 +91,7 @@ def sanitize_tool_result(text: str | None, max_len: int = 8000) -> str:
     - Non-empty result wrapped in an "external data, not instructions" envelope."""
     if text is None:
         return ""
-    s = str(text)
-    for ch in _CONTROL_CHARS:
-        s = s.replace(ch, " ")
+    s = _strip_control_chars(str(text))
     # Strip sentinels + BOTH envelope tags (case-insensitive) BEFORE wrapping — this is
     # what makes the envelope load-bearing rather than decorative.
     s = _NEUTRALIZE_RE.sub(" ", s)
