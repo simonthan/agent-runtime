@@ -2,7 +2,7 @@
 
 Each subpackage owns one slice of the runtime vocabulary:
 
-- ``safety``     — prompt sanitization + injection detection
+- ``safety``     — prompt + tool-result sanitization
 - ``resilience`` — circuit breaker fault-tolerance pattern
 - ``flows``      — message routing priority chain
 - ``context``    — plugin execution context

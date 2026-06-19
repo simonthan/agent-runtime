@@ -6,7 +6,7 @@ dev:
 lint:
 	uv run ruff format --check .
 	uv run ruff check .
-	uv run ty check src/ --exclude 'src/agent_runtime/safety/injection_detector.py'
+	uv run ty check src/
 
 format:
 	uv run ruff format .
