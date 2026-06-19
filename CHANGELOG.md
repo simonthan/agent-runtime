@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.6.3 — 2026-06-18
+
+### Removed
+- `agent_runtime.safety.InjectionDetector` / `DetectionResult` / `PatternMatch` — log-only
+  injection detector that was never wired into any consumer's live path (its only effect was an
+  `AuditLogger.security` event, and no concrete `AuditLogger` sink exists). Removed to eliminate
+  false-coverage in `safety/`. `safety/` now exposes only the on-path primitives
+  `sanitize_for_llm_prompt` + `sanitize_tool_result`. No consumer affected (ithelpdesk uses a
+  local copy; teams-bot-platform never imported it). See teams-bot-platform task T-012b.
+
 ## v0.6.1 — 2026-06-17
 
 ### Added

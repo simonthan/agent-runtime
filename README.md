@@ -19,7 +19,7 @@ uv add 'agent-runtime[llm] @ git+https://github.com/simonthan/agent-runtime.git@
 
 ## Modules
 
-- `agent_runtime.safety` — `sanitize_for_llm_prompt`, `InjectionDetector`
+- `agent_runtime.safety` — `sanitize_for_llm_prompt`, `sanitize_tool_result`
 - `agent_runtime.resilience` — `CircuitBreaker` + registry
 - `agent_runtime.flows` — `MessageRouter` priority-chain dispatch
 - `agent_runtime.context` — `PluginExecutionContext`

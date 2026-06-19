@@ -21,8 +21,8 @@ expected, not a bug.
 
 Callers are responsible for sanitizing ``user_message`` and ``retrieval_block``
 against prompt injection. Use ``agent_runtime.safety.sanitize_for_llm_prompt``
-and/or ``agent_runtime.safety.InjectionDetector`` at the call site; the wrapper
-intentionally does NOT sanitize so the layer of defense is auditable.
+at the call site; the wrapper intentionally does NOT sanitize so the layer of
+defense is auditable.
 """
 
 from __future__ import annotations
