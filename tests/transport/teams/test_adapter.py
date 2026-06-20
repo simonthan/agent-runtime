@@ -17,7 +17,7 @@ def test_adapter_constructs_settings_from_config():
     adapter = TeamsAdapter(config, _NoOpHandler())
     settings = adapter._adapter.settings
     assert settings.app_id == "aid"
-    assert settings.app_password == "pwd"  # noqa: S105
+    assert settings.app_password == "pwd"
     assert settings.channel_auth_tenant == "tid"
 
 
