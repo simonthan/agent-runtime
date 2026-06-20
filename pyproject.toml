@@ -36,6 +36,26 @@ line-length = 100
 target-version = "py312"
 src = ["src", "tests"]
 
+# Format-side complement to the verbatim-lift contract below. `per-file-ignores`
+# only silences the *linter* (`ruff check`); the *formatter* (`ruff format`) is a
+# separate pass with no per-file override, so these lifted files would otherwise
+# fail `ruff format --check`. Reformatting them here would break byte-identity with
+# the ithelpdesk source — the very thing the lift contract preserves. Excluding
+# them declares "ihd owns this file's formatting"; style fixes still propagate back
+# on the next agent_runtime version. Keep this list in sync with the lifted entries
+# in [tool.ruff.lint.per-file-ignores]; freshly-written modules stay format-checked.
+[tool.ruff.format]
+exclude = [
+    "src/agent_runtime/connectors/base.py",
+    "src/agent_runtime/protocol.py",
+    "src/agent_runtime/session/manager.py",
+    "tests/session/test_manager_create.py",
+    "tests/session/test_manager_get_or_prompt_resume.py",
+    "tests/session/test_protocol_conformance.py",
+    "tests/unit/connectors/test_base.py",
+    "tests/unit/test_protocol.py",
+]
+
 [tool.ruff.lint]
 select = ["ALL"]
 ignore = ["D", "COM812", "ISC001", "ANN401"]
@@ -127,4 +147,17 @@ error-on-warning = false  # flip to true once modules are concrete
 [tool.ty.rules]
 possibly-unresolved-reference = "error"
 unused-ignore-comment = "warn"
+
+# Lift-contract carve-out for ty, mirroring the ruff per-file-ignores above.
+# connectors/base.py (verbatim ihd lift) ends _execute_with_retry with a
+# `raise last_error` safety net; `last_error` is typed `Exception | None`, so ty
+# flags invalid-raise even though the retry loop always returns or raises before
+# reaching it (the line is the documented unreachable net). Suppress at config so
+# the lifted file stays byte-identical to ihd; the fix propagates back on the next
+# agent_runtime version, same as the lint carve-outs.
+[[tool.ty.overrides]]
+include = ["src/agent_runtime/connectors/base.py"]
+
+[tool.ty.overrides.rules]
+invalid-raise = "ignore"
 
