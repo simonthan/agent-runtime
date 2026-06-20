@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.6.4 — 2026-06-20
+
+### Added
+- `agent_runtime.safety.mask_string` / `mask_dict` — generic PII/secret masking
+  (ssn, credit_card, email, phone, otp, api_key, password regex patterns; key-name
+  redaction + recursive dict/list traversal for `mask_dict`). Lifted from ithelpdesk's
+  `DataMasker` and reshaped to the `safety/` free-function convention. A masking
+  *primitive* applied before a consumer's own audit sink — consistent with the
+  "agent_runtime does not own the sink" stance. Additive; no consumer wired until
+  teams-bot-platform task T-015a-b.
+
 ## v0.6.3 — 2026-06-18
 
 ### Removed
