@@ -129,7 +129,6 @@ def mask_telemetry(text: str) -> str:
     return mask_string(text)
 
 
-# Cap on recursion into nested dicts/lists. A logging path must not raise
 def mask_dict(
     data: dict[Any, Any],
     sensitive_keys: Sequence[str] | None = None,
