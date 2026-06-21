@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.6.5 — 2026-06-21
+
+### Added
+- `agent_runtime.safety.mask_telemetry` — masks free-text exception/telemetry bodies with the default
+  secret/PII patterns PLUS Entra OID/GUID + AAD tenant-URL redaction. Kept separate from the default
+  `PATTERNS` so `mask_string`/`mask_dict` default behaviour is unchanged. Wired into the library's
+  connector, circuit-breaker, identity, and session telemetry so an OID-bearing Graph URL / tenant
+  token-endpoint URL never reaches an audit sink raw (TBP T-021a; consumer wiring T-021a-b).
+
+### Changed
+- **Prompt sanitizers (SEC-1, SEC-7) now alter outputs they previously passed through.**
+  `sanitize_for_llm_prompt` strips role sentinels case-INsensitively (was case-sensitive); both
+  sanitizers NFKC-normalize and strip zero-width/format chars. Consumers (ithelpdesk) will see more
+  aggressive neutralization of confusable/lowercase/full-width injection markers — behavioural, not
+  purely additive.
+
+### Security (SEC-1..7, 2026-06-20 audit)
+- SEC-1 case-insensitive role-sentinel strip; SEC-2 mask exception text in connector/breaker logs;
+  SEC-3 mask `ConnectorResult.data._internal_error`; SEC-4 `mask_dict` non-str-key + depth-cap
+  hardening; SEC-5 whitespace-only auth-header bypass guard; SEC-6 optional `max_history` cap
+  (default `None` = prior unbounded behaviour); SEC-7 NFKC + zero-width normalization in sanitizers.
+
 ## v0.6.4 — 2026-06-20
 
 ### Added
