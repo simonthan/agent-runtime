@@ -12,6 +12,7 @@ import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from agent_runtime.logging import AuditLogger, NullAuditLogger
+from agent_runtime.safety import mask_telemetry
 
 _default_audit: AuditLogger = NullAuditLogger()
 
@@ -172,8 +173,16 @@ class BaseConnector(ABC):
 
         Returns a generic user-facing message — never exposes internal detail.
         Internal error info is preserved in data._internal_error for logging.
+
+        SEC-2/SEC-3: driver/httpx exception text routinely embeds connection
+        strings, bearer tokens, or PII. Both the audit line AND the
+        ``_internal_error`` field are routed through ``mask_telemetry`` so neither the
+        consumer's audit sink nor a consumer that serializes ``.data`` to the
+        channel leaks secrets — the "user sees .message, logs see .data" split is
+        contract-only and unenforced, so we mask the value rather than rely on it.
         """
-        _default_audit.error(f"Connector error during {operation}: {error}")
+        masked_error = mask_telemetry(str(error))
+        _default_audit.error(f"Connector error during {operation}: {masked_error}")
         http_status = None
         if isinstance(error, httpx.HTTPStatusError):
             http_status = error.response.status_code
@@ -182,7 +191,7 @@ class BaseConnector(ABC):
             message="This service is temporarily unavailable. A support ticket will be created.",
             error_code=type(error).__name__,
             http_status=http_status,
-            data={"_internal_error": f"Operation failed: {operation}: {error}"},
+            data={"_internal_error": f"Operation failed: {operation}: {masked_error}"},
         )
 
 
@@ -234,11 +243,13 @@ class RetryMixin:
                 last_error = e
 
                 if not is_retryable_error(e):
-                    _default_audit.debug(f"{operation_name}: non-retryable error on attempt {attempt}: {e}")
+                    # SEC-2: mask secrets/PII embedded in exception text before logging.
+                    _default_audit.debug(f"{operation_name}: non-retryable error on attempt {attempt}: {mask_telemetry(str(e))}")
                     raise
 
                 if attempt == max_attempts:
-                    _default_audit.error(f"{operation_name}: failed after {max_attempts} attempts: {e}")
+                    # SEC-2: mask secrets/PII embedded in exception text before logging.
+                    _default_audit.error(f"{operation_name}: failed after {max_attempts} attempts: {mask_telemetry(str(e))}")
                     raise
 
                 # Check for Retry-After header on 429 responses

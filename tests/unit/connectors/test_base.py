@@ -417,3 +417,79 @@ class TestSetAuditLogger:
         error_calls = [c for c in spy.calls if c[0] == "error"]
         assert len(error_calls) == 1
         assert "op" in error_calls[0][1]
+
+
+class TestErrorMasking:
+    """SEC-2/SEC-3: secrets/PII in exception text must be masked on every path."""
+
+    class _Spy:
+        def __init__(self): self.calls = []
+        def debug(self, m, **kw): self.calls.append(("debug", m))
+        def info(self, m, **kw): self.calls.append(("info", m))
+        def warning(self, m, **kw): self.calls.append(("warning", m))
+        def error(self, m, **kw): self.calls.append(("error", m))
+        def security(self, m, **kw): self.calls.append(("security", m))
+        def action(self, a, r, **kw): self.calls.append(("action", a))
+
+    class _Stub(BaseConnector):
+        async def initialize(self) -> bool: return True
+        async def health_check(self) -> ConnectorResult: return ConnectorResult(success=True, message="ok")
+        async def close(self) -> None: pass
+
+    def test_internal_error_field_is_masked(self):
+        # SEC-3: _internal_error is returned in .data alongside .message; a consumer
+        # that serializes .data to the channel must not leak the embedded secret.
+        result = self._Stub()._handle_error(ValueError("db failed password=hunter2"), "query")
+        internal = result.data["_internal_error"]
+        assert "hunter2" not in internal
+        assert "********" in internal
+        assert "query" in internal  # operation context preserved for logs
+
+    def test_handle_error_audit_line_is_masked(self):
+        # SEC-2: the audit.error() line must also be masked.
+        spy = self._Spy()
+        set_audit_logger(spy)
+        self._Stub()._handle_error(ValueError("token=sk-abcdefghij0123456789xyz"), "op")
+        error_msg = next(m for kind, m in spy.calls if kind == "error")
+        assert "sk-abcdefghij0123456789xyz" not in error_msg
+
+    async def test_retry_failure_log_is_masked(self):
+        # SEC-2: the "failed after N attempts" log on the retry path is masked.
+        spy = self._Spy()
+        set_audit_logger(spy)
+
+        async def always_fail():
+            raise ConnectionError("connect to host failed password=hunter2")
+
+        class _RStub(RetryMixin):
+            pass
+
+        with pytest.raises(ConnectionError):
+            await _RStub()._execute_with_retry(
+                always_fail, max_attempts=2, min_wait=0.01, max_wait=0.05
+            )
+        error_msgs = [m for kind, m in spy.calls if kind == "error"]
+        assert error_msgs and all("hunter2" not in m for m in error_msgs)
+
+    async def test_retry_log_masks_oid_bearing_graph_url(self):
+        # T-021a: an OID-bearing Graph URL in the exception is redacted on the retry log.
+        spy = self._Spy()
+        set_audit_logger(spy)
+        oid = "00000000-1111-2222-3333-444444444444"
+
+        async def always_fail():
+            raise ConnectionError(
+                f"GET https://graph.microsoft.com/v1.0/users/{oid}/transitiveMemberOf failed"
+            )
+
+        class _RStub(RetryMixin):
+            pass
+
+        with pytest.raises(ConnectionError):
+            await _RStub()._execute_with_retry(
+                always_fail, max_attempts=2, min_wait=0.01, max_wait=0.05
+            )
+        error_msgs = [m for kind, m in spy.calls if kind == "error"]
+        assert error_msgs
+        assert all(oid not in m for m in error_msgs)
+        assert any("[GUID_REDACTED]" in m for m in error_msgs)

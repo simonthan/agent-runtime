@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from agent_runtime.logging import AuditLogger, NullAuditLogger
+from agent_runtime.safety import mask_telemetry
 from agent_runtime.session.events import (
     Active,
     NewSession,
@@ -58,6 +59,7 @@ class SessionManager:
         redis_client: RedisClientProtocol,
         idle_timeout: timedelta = timedelta(minutes=30),
         key_prefix: str = "session",
+        max_history: int | None = None,
         logger: AuditLogger | None = None,
     ) -> None:
         """Initialise SessionManager with injected dependencies.
@@ -69,6 +71,10 @@ class SessionManager:
             idle_timeout: How long a session remains active without a message.
                 Defaults to 30 minutes.
             key_prefix: Redis key namespace.  Defaults to ``"session"``.
+            max_history: Optional cap on ``conversation_history`` length. ``None``
+                (default) is unbounded — preserves prior behaviour. When set, the
+                oldest entries are dropped on append so a single session's serialized
+                JSON in Redis cannot grow without bound (SEC-6).
             logger: Optional AuditLogger.  Defaults to ``NullAuditLogger()``.
         """
         self._session_repo = session_repo
@@ -76,6 +82,7 @@ class SessionManager:
         self._idle_timeout = idle_timeout
         self._ttl_seconds = int(idle_timeout.total_seconds())
         self._prefix = key_prefix
+        self._max_history = max_history
         self._log: AuditLogger = logger or NullAuditLogger()
 
     # ------------------------------------------------------------------
@@ -235,6 +242,16 @@ class SessionManager:
                     "timestamp": _utc_now().isoformat(),
                 }
             )
+            # SEC-6: bound history growth — drop oldest beyond the cap so a single
+            # session's serialized JSON in Redis (rewritten whole each update) cannot
+            # be bloated by message-spamming within the idle window. None => unbounded.
+            if (
+                self._max_history is not None
+                and len(session.conversation_history) > self._max_history
+            ):
+                session.conversation_history = session.conversation_history[
+                    -self._max_history :
+                ]
 
         session.updated_at = _utc_now()
         await self._save_session(session)
@@ -471,7 +488,9 @@ class SessionManager:
                 channel=channel,
             )
         except Exception as e:  # noqa: BLE001
-            self._log.warning("Failed to persist resume token via repo", error=str(e))
+            self._log.warning(
+                "Failed to persist resume token via repo", error=mask_telemetry(str(e))
+            )
 
     async def _resume_from_db(
         self,
@@ -507,7 +526,7 @@ class SessionManager:
                 client_context=row.client_context,
             )
         except Exception as e:  # noqa: BLE001
-            self._log.warning("Failed to resume from DB", error=str(e))
+            self._log.warning("Failed to resume from DB", error=mask_telemetry(str(e)))
             return None
 
     async def _save_session(self, session: SessionData) -> None:

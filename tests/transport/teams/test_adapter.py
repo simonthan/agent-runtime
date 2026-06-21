@@ -37,3 +37,11 @@ async def test_process_activity_raises_on_empty_auth_header():
     adapter = TeamsAdapter(TeamsAdapterConfig("a", "p", "t"), _NoOpHandler())
     with pytest.raises(ValueError, match="auth_header is required"):
         await adapter.process_activity({"type": "message"}, auth_header="")
+
+
+@pytest.mark.parametrize("header", ["   ", "\t", "\n", " \t\n "])
+async def test_process_activity_raises_on_whitespace_auth_header(header):
+    """SEC-5: a whitespace-only header is truthy but effectively empty downstream."""
+    adapter = TeamsAdapter(TeamsAdapterConfig("a", "p", "t"), _NoOpHandler())
+    with pytest.raises(ValueError, match="auth_header is required"):
+        await adapter.process_activity({"type": "message"}, auth_header=header)

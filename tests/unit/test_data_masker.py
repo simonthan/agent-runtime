@@ -1,4 +1,4 @@
-from agent_runtime.safety import mask_dict, mask_string
+from agent_runtime.safety import mask_dict, mask_string, mask_telemetry
 
 
 class TestMaskString:
@@ -92,3 +92,56 @@ class TestMaskDict:
         data = {"count": 42, "ok": True, "ratio": 1.5}
         result = mask_dict(data)
         assert result == {"count": 42, "ok": True, "ratio": 1.5}
+
+    def test_non_string_keys_do_not_raise(self):
+        # SEC-4: int/float/None keys must not raise AttributeError on key.lower().
+        result = mask_dict({1: "x", 2.0: "y", None: "z"})
+        assert result == {1: "x", 2.0: "y", None: "z"}
+
+    def test_non_string_key_still_matches_sensitive_substring(self):
+        # A non-str key is coerced via str() before substring matching; this one
+        # does not look sensitive, so its string value is still scanned.
+        result = mask_dict({1: "Contact a@b.com"})
+        assert "a@b.com" not in result[1]
+
+    def test_deeply_nested_does_not_recurse_unbounded(self):
+        # SEC-4: pathologically deep nesting returns without RecursionError.
+        data: dict = {"leaf": "ok"}
+        for _ in range(500):
+            data = {"nested": data}
+        result = mask_dict(data)  # must not raise
+        assert isinstance(result, dict)
+
+
+class TestMaskTelemetry:
+    def test_redacts_bare_guid_oid(self):
+        oid = "00000000-1111-2222-3333-444444444444"
+        out = mask_telemetry(f"user {oid} failed")
+        assert oid not in out and "[GUID_REDACTED]" in out
+
+    def test_redacts_graph_oid_url(self):
+        url = "https://graph.microsoft.com/v1.0/users/00000000-1111-2222-3333-444444444444/transitiveMemberOf"
+        out = mask_telemetry(f"GraphError GET {url}")
+        assert "00000000-1111-2222-3333-444444444444" not in out and "[GUID_REDACTED]" in out
+
+    def test_redacts_tenant_token_url_non_guid(self):
+        url = "https://login.microsoftonline.com/contoso.onmicrosoft.com/oauth2/v2.0/token"
+        out = mask_telemetry(f"connect failed {url}")
+        assert "contoso.onmicrosoft.com" not in out and "[TENANT_REDACTED]" in out
+
+    def test_still_applies_default_secret_patterns(self):
+        assert "hunter2" not in mask_telemetry("db password=hunter2")
+
+    def test_default_mask_string_and_dict_do_not_produce_guid_redacted(self):
+        # Retention guarantee: the telemetry-only GUID pattern is NOT in the default
+        # PATTERNS set, so mask_string/mask_dict never emit "[GUID_REDACTED]".
+        # (The credit_card regex may partially mangle hex sequences — that is pre-existing
+        # behaviour, not the concern here. T-021a's contract is that GUID-specific
+        # telemetry redaction is NOT applied by default paths. TBP's own retained-OID
+        # key decision is T-021a-b's call.)
+        oid = "00000000-1111-2222-3333-444444444444"
+        assert "[GUID_REDACTED]" not in mask_string(oid)
+        assert "[GUID_REDACTED]" not in str(mask_dict({"user_id": oid}))
+
+    def test_empty_string(self):
+        assert mask_telemetry("") == ""

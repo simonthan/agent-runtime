@@ -266,3 +266,37 @@ class TestRetryAfterSeconds:
         # but the retry window has passed — value clamps to 0.0.
         assert breaker.state == CircuitState.OPEN
         assert breaker.retry_after_seconds() == 0.0
+
+
+class TestRecordFailureMasking:
+    """SEC-2: secrets/PII in a recorded failure's exception text must be masked."""
+
+    class _Spy:
+        def __init__(self):
+            self.calls = []
+
+        def debug(self, m, **kw):
+            self.calls.append(("debug", m))
+
+        def info(self, m, **kw):
+            self.calls.append(("info", m))
+
+        def warning(self, m, **kw):
+            self.calls.append(("warning", m))
+
+        def error(self, m, **kw):
+            self.calls.append(("error", m))
+
+        def security(self, m, **kw):
+            self.calls.append(("security", m))
+
+        def action(self, a, r, **kw):
+            self.calls.append(("action", a))
+
+    async def test_record_failure_masks_exception_text(self):
+        spy = self._Spy()
+        breaker = CircuitBreaker("svc", audit=spy)
+        await breaker.record_failure(ConnectionError("auth failed password=hunter2"))
+        warnings = [m for kind, m in spy.calls if kind == "warning"]
+        assert warnings and all("hunter2" not in m for m in warnings)
+        assert any("********" in m for m in warnings)
