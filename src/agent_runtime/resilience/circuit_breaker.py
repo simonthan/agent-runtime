@@ -20,6 +20,7 @@ from enum import Enum
 from typing import Any
 
 from agent_runtime.logging import AuditLogger, NullAuditLogger
+from agent_runtime.safety import mask_string
 
 _default_audit: AuditLogger = NullAuditLogger()
 
@@ -206,8 +207,10 @@ class CircuitBreaker:
             self._last_failure_time = time.monotonic()
 
             if error:
+                # SEC-2: mask secrets/PII embedded in exception text before logging.
+                detail = mask_string(str(error))
                 self._audit.warning(
-                    f"Circuit '{self.name}' recorded failure: {type(error).__name__}: {error}"
+                    f"Circuit '{self.name}' recorded failure: {type(error).__name__}: {detail}"
                 )
 
             if self._state == CircuitState.HALF_OPEN:

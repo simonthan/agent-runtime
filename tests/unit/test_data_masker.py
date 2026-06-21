@@ -92,3 +92,22 @@ class TestMaskDict:
         data = {"count": 42, "ok": True, "ratio": 1.5}
         result = mask_dict(data)
         assert result == {"count": 42, "ok": True, "ratio": 1.5}
+
+    def test_non_string_keys_do_not_raise(self):
+        # SEC-4: int/float/None keys must not raise AttributeError on key.lower().
+        result = mask_dict({1: "x", 2.0: "y", None: "z"})
+        assert result == {1: "x", 2.0: "y", None: "z"}
+
+    def test_non_string_key_still_matches_sensitive_substring(self):
+        # A non-str key is coerced via str() before substring matching; this one
+        # does not look sensitive, so its string value is still scanned.
+        result = mask_dict({1: "Contact a@b.com"})
+        assert "a@b.com" not in result[1]
+
+    def test_deeply_nested_does_not_recurse_unbounded(self):
+        # SEC-4: pathologically deep nesting returns without RecursionError.
+        data: dict = {"leaf": "ok"}
+        for _ in range(500):
+            data = {"nested": data}
+        result = mask_dict(data)  # must not raise
+        assert isinstance(result, dict)

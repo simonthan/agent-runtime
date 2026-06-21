@@ -82,26 +82,42 @@ def mask_string(text: str, patterns: list[str] | None = None) -> str:
     return text
 
 
-def mask_dict(data: dict[str, Any], sensitive_keys: Sequence[str] | None = None) -> dict[str, Any]:
+# Cap on recursion into nested dicts/lists. A logging path must not raise
+# RecursionError on a pathologically deep (or cyclically shaped) payload — past the
+# cap the substructure passes through unmasked rather than crashing the request
+# (SEC-4). 64 is far deeper than any realistic audit payload.
+_MAX_MASK_DEPTH = 64
+
+
+def mask_dict(
+    data: dict[Any, Any],
+    sensitive_keys: Sequence[str] | None = None,
+    *,
+    _depth: int = 0,
+) -> dict[Any, Any]:
     """Redact a dict: fully mask values whose key looks sensitive, else scan strings.
 
     Recurses into nested dicts and lists. ``sensitive_keys``: substrings matched
     case-insensitively against each key; falsy falls through to ``_DEFAULT_SENSITIVE_KEYS``.
-    Non-str / non-dict / non-list values pass through unchanged.
+    Non-str / non-dict / non-list values pass through unchanged. Non-str keys are
+    coerced via ``str()`` before matching (SEC-4) so an ``int``/``float``/``None`` key
+    can never raise ``AttributeError`` on a logging path.
     """
     keys = sensitive_keys or _DEFAULT_SENSITIVE_KEYS
-    result: dict[str, Any] = {}
+    if _depth >= _MAX_MASK_DEPTH:
+        return data
+    result: dict[Any, Any] = {}
     for key, value in data.items():
-        key_lower = key.lower()
+        key_lower = str(key).lower()
         if any(sensitive in key_lower for sensitive in keys):
             result[key] = "********"
         elif isinstance(value, str):
             result[key] = mask_string(value)
         elif isinstance(value, dict):
-            result[key] = mask_dict(value, keys)
+            result[key] = mask_dict(value, keys, _depth=_depth + 1)
         elif isinstance(value, list):
             result[key] = [
-                mask_dict(item, keys)
+                mask_dict(item, keys, _depth=_depth + 1)
                 if isinstance(item, dict)
                 else mask_string(item)
                 if isinstance(item, str)

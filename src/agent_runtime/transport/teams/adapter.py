@@ -125,12 +125,13 @@ class TeamsAdapter:
         Returns ``(status_code, response_body_or_None)`` — translate to the
         consumer's HTTP framework's response object.
 
-        Raises ``ValueError`` if ``auth_header`` is empty. Some botbuilder
-        versions silently skip JWT validation when given an empty header;
-        we fail loudly to catch consumer HTTP routes that forget to forward
-        the inbound ``Authorization`` header.
+        Raises ``ValueError`` if ``auth_header`` is empty or whitespace-only.
+        Some botbuilder versions silently skip JWT validation when given an empty
+        header; a whitespace-only header (`" "`) is truthy but effectively empty
+        downstream, so we strip-check too (SEC-5). We fail loudly to catch consumer
+        HTTP routes that forget to forward the inbound ``Authorization`` header.
         """
-        if not auth_header:
+        if not auth_header or not auth_header.strip():
             msg = (
                 "auth_header is required; pass the inbound Authorization header verbatim "
                 "(including the 'Bearer ' prefix). An empty header would bypass JWT validation."

@@ -4,6 +4,14 @@
 **Scope:** Full codebase (`src/agent_runtime/`, ~3,400 LOC).
 **Outcome:** No critical/high-severity vulnerabilities. 3 MEDIUM, 4 LOW defense-in-depth / robustness findings.
 
+> **Remediation status (2026-06-20):** all of SEC-1…SEC-7 fixed in this branch.
+> SEC-3 was resolved via **option (a)** — `_internal_error` is masked with
+> `mask_string` (contract preserved, secret/PII redacted). SEC-2/SEC-6 touch
+> lift-contract modules; changes here are **security-behavioral, not style** (masking
+> + an opt-in `max_history` cap, default `None` = prior behaviour), so they don't
+> expand the lift surface — still flag them when syncing with `ithelpdesk`.
+> Verified with `make lint && make test` (283 passing).
+
 ## Method & clean results
 
 Swept for the classic landmines — none present: no dynamic code execution, no unsafe
