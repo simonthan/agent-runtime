@@ -470,3 +470,26 @@ class TestErrorMasking:
             )
         error_msgs = [m for kind, m in spy.calls if kind == "error"]
         assert error_msgs and all("hunter2" not in m for m in error_msgs)
+
+    async def test_retry_log_masks_oid_bearing_graph_url(self):
+        # T-021a: an OID-bearing Graph URL in the exception is redacted on the retry log.
+        spy = self._Spy()
+        set_audit_logger(spy)
+        oid = "00000000-1111-2222-3333-444444444444"
+
+        async def always_fail():
+            raise ConnectionError(
+                f"GET https://graph.microsoft.com/v1.0/users/{oid}/transitiveMemberOf failed"
+            )
+
+        class _RStub(RetryMixin):
+            pass
+
+        with pytest.raises(ConnectionError):
+            await _RStub()._execute_with_retry(
+                always_fail, max_attempts=2, min_wait=0.01, max_wait=0.05
+            )
+        error_msgs = [m for kind, m in spy.calls if kind == "error"]
+        assert error_msgs
+        assert all(oid not in m for m in error_msgs)
+        assert any("[GUID_REDACTED]" in m for m in error_msgs)

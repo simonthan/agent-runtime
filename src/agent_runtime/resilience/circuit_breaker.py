@@ -20,7 +20,7 @@ from enum import Enum
 from typing import Any
 
 from agent_runtime.logging import AuditLogger, NullAuditLogger
-from agent_runtime.safety import mask_string
+from agent_runtime.safety import mask_telemetry
 
 _default_audit: AuditLogger = NullAuditLogger()
 
@@ -164,7 +164,9 @@ class CircuitBreaker:
                 if asyncio.iscoroutine(result):
                     await result
             except Exception as e:
-                self._audit.error(f"Circuit '{self.name}' state change callback failed: {e}")
+                self._audit.error(
+                    f"Circuit '{self.name}' state change callback failed: {mask_telemetry(str(e))}"
+                )
 
     async def can_execute(self) -> bool:
         """Check if execution is allowed based on circuit state."""
@@ -208,7 +210,7 @@ class CircuitBreaker:
 
             if error:
                 # SEC-2: mask secrets/PII embedded in exception text before logging.
-                detail = mask_string(str(error))
+                detail = mask_telemetry(str(error))
                 self._audit.warning(
                     f"Circuit '{self.name}' recorded failure: {type(error).__name__}: {detail}"
                 )

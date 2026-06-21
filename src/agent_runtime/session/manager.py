@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from agent_runtime.logging import AuditLogger, NullAuditLogger
+from agent_runtime.safety import mask_telemetry
 from agent_runtime.session.events import (
     Active,
     NewSession,
@@ -487,7 +488,9 @@ class SessionManager:
                 channel=channel,
             )
         except Exception as e:  # noqa: BLE001
-            self._log.warning("Failed to persist resume token via repo", error=str(e))
+            self._log.warning(
+                "Failed to persist resume token via repo", error=mask_telemetry(str(e))
+            )
 
     async def _resume_from_db(
         self,
@@ -523,7 +526,7 @@ class SessionManager:
                 client_context=row.client_context,
             )
         except Exception as e:  # noqa: BLE001
-            self._log.warning("Failed to resume from DB", error=str(e))
+            self._log.warning("Failed to resume from DB", error=mask_telemetry(str(e)))
             return None
 
     async def _save_session(self, session: SessionData) -> None:

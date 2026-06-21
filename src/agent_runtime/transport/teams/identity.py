@@ -34,6 +34,7 @@ from botbuilder.core.teams import TeamsInfo
 if TYPE_CHECKING:
     from botbuilder.core import TurnContext
 
+from agent_runtime.safety import mask_telemetry
 from agent_runtime.transport.teams.events import ConversationRef
 
 logger = logging.getLogger(__name__)
@@ -75,7 +76,7 @@ async def resolve_identity(turn_context: TurnContext) -> ConversationRef | None:
             "TeamsInfo.get_member failed for %s; falling back to from_property "
             "(email is NOT available in fallback — ChannelAccount has no email field): %s",
             from_info.id,
-            exc,
+            mask_telemetry(str(exc)),
         )
         # Only aad_object_id can come from from_property; email cannot.
         aad_object_id = getattr(from_info, "aad_object_id", "") or ""

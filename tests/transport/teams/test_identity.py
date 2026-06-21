@@ -85,6 +85,24 @@ def test_extract_tenant_id_falls_back_to_channel_data():
     assert _extract_tenant_id(activity) == "from-channel"
 
 
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_resolve_identity_graph_exception_oid_is_masked_in_warning(mock_get_member, caplog):
+    """T-021a: an OID-bearing Graph URL in the exception str is redacted before logging.
+
+    The warning at identity.py:74 must not emit a raw Entra OID (the T-017b leak).
+    """
+    oid = "00000000-1111-2222-3333-444444444444"
+    mock_get_member.side_effect = RuntimeError(
+        f"GET https://graph.microsoft.com/v1.0/users/{oid}/transitiveMemberOf failed"
+    )
+    caplog.set_level(logging.WARNING)
+    ref = await resolve_identity(_turn_context(from_aad="aad-fb"))
+    assert ref is None
+    all_text = " ".join(r.getMessage() for r in caplog.records)
+    assert oid not in all_text, "raw OID must not appear in any warning"
+    assert "[GUID_REDACTED]" in all_text, "masked placeholder must appear"
+
+
 def test_extract_tenant_id_returns_empty_when_channel_data_missing():
     activity = SimpleNamespace(
         conversation=SimpleNamespace(tenant_id=""),

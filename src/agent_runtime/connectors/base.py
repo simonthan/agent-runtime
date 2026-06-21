@@ -12,7 +12,7 @@ import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from agent_runtime.logging import AuditLogger, NullAuditLogger
-from agent_runtime.safety import mask_string
+from agent_runtime.safety import mask_telemetry
 
 _default_audit: AuditLogger = NullAuditLogger()
 
@@ -176,12 +176,12 @@ class BaseConnector(ABC):
 
         SEC-2/SEC-3: driver/httpx exception text routinely embeds connection
         strings, bearer tokens, or PII. Both the audit line AND the
-        ``_internal_error`` field are routed through ``mask_string`` so neither the
+        ``_internal_error`` field are routed through ``mask_telemetry`` so neither the
         consumer's audit sink nor a consumer that serializes ``.data`` to the
         channel leaks secrets — the "user sees .message, logs see .data" split is
         contract-only and unenforced, so we mask the value rather than rely on it.
         """
-        masked_error = mask_string(str(error))
+        masked_error = mask_telemetry(str(error))
         _default_audit.error(f"Connector error during {operation}: {masked_error}")
         http_status = None
         if isinstance(error, httpx.HTTPStatusError):
@@ -244,12 +244,12 @@ class RetryMixin:
 
                 if not is_retryable_error(e):
                     # SEC-2: mask secrets/PII embedded in exception text before logging.
-                    _default_audit.debug(f"{operation_name}: non-retryable error on attempt {attempt}: {mask_string(str(e))}")
+                    _default_audit.debug(f"{operation_name}: non-retryable error on attempt {attempt}: {mask_telemetry(str(e))}")
                     raise
 
                 if attempt == max_attempts:
                     # SEC-2: mask secrets/PII embedded in exception text before logging.
-                    _default_audit.error(f"{operation_name}: failed after {max_attempts} attempts: {mask_string(str(e))}")
+                    _default_audit.error(f"{operation_name}: failed after {max_attempts} attempts: {mask_telemetry(str(e))}")
                     raise
 
                 # Check for Retry-After header on 429 responses

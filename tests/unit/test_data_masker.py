@@ -132,7 +132,7 @@ class TestMaskTelemetry:
     def test_still_applies_default_secret_patterns(self):
         assert "hunter2" not in mask_telemetry("db password=hunter2")
 
-    def test_default_mask_string_and_dict_do_NOT_produce_GUID_REDACTED(self):
+    def test_default_mask_string_and_dict_do_not_produce_guid_redacted(self):
         # Retention guarantee: the telemetry-only GUID pattern is NOT in the default
         # PATTERNS set, so mask_string/mask_dict never emit "[GUID_REDACTED]".
         # (The credit_card regex may partially mangle hex sequences — that is pre-existing
