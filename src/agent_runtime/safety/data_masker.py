@@ -89,6 +89,47 @@ def mask_string(text: str, patterns: list[str] | None = None) -> str:
 _MAX_MASK_DEPTH = 64
 
 
+# Telemetry-only patterns (Entra OID/GUID + AAD tenant URL). Deliberately NOT in the
+# default PATTERNS set: applying these via mask_dict would shred a consumer's
+# intentionally-retained id fields (e.g. a forensic user_id=<oid> audit key). They apply
+# ONLY to free-text exception/telemetry bodies, via mask_telemetry() (T-021a).
+_TELEMETRY_PATTERNS: tuple[tuple[str, Callable[[re.Match[str]], str]], ...] = (
+    (
+        # RFC 4122 8-4-4-4-12 hex — Entra OIDs / tenant GUIDs, incl. inside URLs
+        # (Graph .../users/<oid>/..., login.microsoftonline.com/<tenant-guid>/...).
+        r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+        lambda _m: "[GUID_REDACTED]",
+    ),
+    (
+        # Non-GUID tenant segment the GUID pattern misses (e.g. contoso.onmicrosoft.com).
+        # Redact only the tenant path segment; keep the host.
+        r"login\.microsoftonline\.com/[^/\s]+",
+        lambda _m: "login.microsoftonline.com/[TENANT_REDACTED]",
+    ),
+)
+
+
+def mask_telemetry(text: str) -> str:
+    """Mask free-text telemetry / exception bodies before logging.
+
+    Applies the default secret/PII patterns (via ``mask_string``) AND telemetry-only
+    GUID/OID + AAD-tenant-URL patterns. Use this — NOT ``mask_string`` — on library-
+    internal exception text so an OID-bearing Graph URL or tenant token-endpoint URL is
+    redacted. Kept separate from the default ``PATTERNS`` so ``mask_string`` / ``mask_dict``
+    default behaviour is unchanged: masking GUIDs by default would shred a consumer's
+    intentionally-retained id fields (T-021a). Falsy ``text`` returned unchanged.
+    """
+    if not text:
+        return text
+    # Apply telemetry-only patterns FIRST (Entra OID/GUID + AAD tenant URL) so the GUID
+    # regex runs on raw text before mask_string's credit_card pattern can partially mangle
+    # hex sequences, which would prevent the GUID pattern from matching.
+    for pattern, replacer in _TELEMETRY_PATTERNS:
+        text = re.sub(pattern, replacer, text)
+    return mask_string(text)
+
+
+# Cap on recursion into nested dicts/lists. A logging path must not raise
 def mask_dict(
     data: dict[Any, Any],
     sensitive_keys: Sequence[str] | None = None,
