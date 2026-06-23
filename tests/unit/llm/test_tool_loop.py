@@ -224,6 +224,7 @@ _CONFIRM_WRITES = lambda name, _inp: name == "send_email"  # noqa: E731 — test
 
 # ---- T-025a: confirm-before-dispatch ---------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_confirm_none_never_suspends() -> None:
     """confirm omitted (None default): a would-be-flagged tool still executes; no suspend."""
@@ -273,8 +274,11 @@ async def test_confirm_suspends_before_dispatch() -> None:
     # Dangling-tool_use invariant: the suspending round's assistant turn is NOT yet in
     # messages (it lives in state["round"] until the round completes on resume).
     assert all(
-        not (msg["role"] == "assistant" and isinstance(msg["content"], list)
-             and any(b.get("type") == "tool_use" for b in msg["content"]))
+        not (
+            msg["role"] == "assistant"
+            and isinstance(msg["content"], list)
+            and any(b.get("type") == "tool_use" for b in msg["content"])
+        )
         for msg in pc.state["messages"]
     )
 
@@ -498,22 +502,36 @@ async def test_multi_confirm_round_suspends_twice() -> None:
 
     tools = [{"name": "send_email", "input_schema": {}}]
     s1 = await loop.run(
-        static_system_prefix="SYS", user_message="go", tools=tools,
-        executor=ex, max_rounds=3, confirm=_CONFIRM_WRITES,
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=tools,
+        executor=ex,
+        max_rounds=3,
+        confirm=_CONFIRM_WRITES,
     )
     assert s1.pending_confirmation.tool_input == {"n": 1}
 
     s2 = await loop.resume(
-        state=s1.pending_confirmation.state, decision=ExecuteDecision(), tools=tools,
-        executor=ex, confirm=_CONFIRM_WRITES, static_system_prefix="SYS", max_rounds=3,
+        state=s1.pending_confirmation.state,
+        decision=ExecuteDecision(),
+        tools=tools,
+        executor=ex,
+        confirm=_CONFIRM_WRITES,
+        static_system_prefix="SYS",
+        max_rounds=3,
     )
     assert s2.pending_confirmation is not None
     assert s2.pending_confirmation.tool_input == {"n": 2}
 
     sdk.messages.responses.append(make_ok(text="both sent"))
     result = await loop.resume(
-        state=s2.pending_confirmation.state, decision=ExecuteDecision(), tools=tools,
-        executor=ex, confirm=_CONFIRM_WRITES, static_system_prefix="SYS", max_rounds=3,
+        state=s2.pending_confirmation.state,
+        decision=ExecuteDecision(),
+        tools=tools,
+        executor=ex,
+        confirm=_CONFIRM_WRITES,
+        static_system_prefix="SYS",
+        max_rounds=3,
     )
     assert result.final_text == "both sent"
     assert [c.input for c in result.steps[0].tool_calls] == [{"n": 1}, {"n": 2}]
@@ -530,18 +548,24 @@ async def test_state_survives_json_round_trip() -> None:
         make_tool_use(tool_id="tu_w", name="send_email", tool_input={"to": "x"})
     )
     suspended = await loop.run(
-        static_system_prefix="SYS", user_message="email x",
+        static_system_prefix="SYS",
+        user_message="email x",
         tools=[{"name": "send_email", "input_schema": {}}],
-        executor=_ok_executor, max_rounds=3, confirm=_CONFIRM_WRITES,
+        executor=_ok_executor,
+        max_rounds=3,
+        confirm=_CONFIRM_WRITES,
     )
     round_tripped = json.loads(json.dumps(suspended.pending_confirmation.state))
 
     sdk.messages.responses.append(make_ok(text="sent!"))
     result = await loop.resume(
-        state=round_tripped, decision=ExecuteDecision(),
+        state=round_tripped,
+        decision=ExecuteDecision(),
         tools=[{"name": "send_email", "input_schema": {}}],
-        executor=_ok_executor, confirm=_CONFIRM_WRITES,
-        static_system_prefix="SYS", max_rounds=3,
+        executor=_ok_executor,
+        confirm=_CONFIRM_WRITES,
+        static_system_prefix="SYS",
+        max_rounds=3,
     )
     assert result.final_text == "sent!"
     assert result.steps[0].tool_calls[0].name == "send_email"
@@ -552,21 +576,25 @@ async def test_resume_into_cap_forces_final_call() -> None:
     """Suspend in the last allowed round → resume commits it, hits cap, forced no-tools call."""
     fake_sdk = FakeAsyncAnthropic()
     loop, sdk = _make_loop(fake_sdk)
-    sdk.messages.responses.append(
-        make_tool_use(tool_id="tu_w", name="send_email", tool_input={})
-    )
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_w", name="send_email", tool_input={}))
     suspended = await loop.run(
-        static_system_prefix="SYS", user_message="go",
+        static_system_prefix="SYS",
+        user_message="go",
         tools=[{"name": "send_email", "input_schema": {}}],
-        executor=_ok_executor, max_rounds=1, confirm=_CONFIRM_WRITES,
+        executor=_ok_executor,
+        max_rounds=1,
+        confirm=_CONFIRM_WRITES,
     )
 
     sdk.messages.responses.append(make_ok(text="forced final"))
     result = await loop.resume(
-        state=suspended.pending_confirmation.state, decision=ExecuteDecision(),
+        state=suspended.pending_confirmation.state,
+        decision=ExecuteDecision(),
         tools=[{"name": "send_email", "input_schema": {}}],
-        executor=_ok_executor, confirm=_CONFIRM_WRITES,
-        static_system_prefix="SYS", max_rounds=1,
+        executor=_ok_executor,
+        confirm=_CONFIRM_WRITES,
+        static_system_prefix="SYS",
+        max_rounds=1,
     )
     assert result.cap_exhausted is True
     assert result.stop_reason == "cap_exhausted"
