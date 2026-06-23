@@ -253,25 +253,22 @@ class ToolUseLoop:
                 decision.tool_input if decision.tool_input is not None else pending["input"]
             )
             outcome = await executor(pending["name"], tool_input)
-            calls.append(
-                ToolCall(
-                    id=pending["id"],
-                    name=pending["name"],
-                    input=tool_input,
-                    result=outcome.content,
-                    is_error=outcome.is_error,
-                )
-            )
+            call_input, call_result, call_is_error = tool_input, outcome.content, outcome.is_error
         else:  # InjectResultDecision — no executor call (D2)
-            calls.append(
-                ToolCall(
-                    id=pending["id"],
-                    name=pending["name"],
-                    input=pending["input"],
-                    result=decision.content,
-                    is_error=decision.is_error,
-                )
+            call_input, call_result, call_is_error = (
+                pending["input"],
+                decision.content,
+                decision.is_error,
             )
+        calls.append(
+            ToolCall(
+                id=pending["id"],
+                name=pending["name"],
+                input=call_input,
+                result=call_result,
+                is_error=call_is_error,
+            )
+        )
 
         # Finish the rest of the round (may suspend again — D5).
         round_outcome = await self._resolve_round(
