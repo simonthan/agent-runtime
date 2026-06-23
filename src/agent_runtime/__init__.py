@@ -16,4 +16,4 @@ Consumed by teams-bot-platform and ithelpdesk via git-pinned dependency.
 See the three-layer reuse model in teams-bot-platform/ARCHITECTURE.md §2.
 """
 
-__version__ = "0.6.5"
+__version__ = "0.6.6"
