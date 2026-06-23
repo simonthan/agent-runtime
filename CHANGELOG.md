@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.6.6 — 2026-06-23
+
+### Added
+- `ToolUseLoop` confirm-before-dispatch (T-025a): optional `confirm(name, input) -> bool`
+  predicate on `run()`. A flagged tool SUSPENDS the loop instead of executing — `run()`
+  returns a `ToolLoopResult.pending_confirmation` (`PendingConfirmation`) carrying the
+  proposed call + an opaque, JSON-serializable `state`. The consumer persists `state`
+  (surviving an async approval round-trip across processes) and calls the new
+  `ToolUseLoop.resume(state=, decision=)` to continue. Decisions are policy-free:
+  `ExecuteDecision(tool_input=None|dict)` runs the tool (Send/Edit); `InjectResultDecision`
+  feeds a synthetic tool_result without executing (Discard). New public exports:
+  `PendingConfirmation`, `ExecuteDecision`, `InjectResultDecision`, `ResumeDecision`,
+  `ConfirmPredicate`. **Purely additive** — `confirm=None` (default) is byte-for-byte the
+  prior behaviour.
+
 ## v0.6.5 — 2026-06-21
 
 ### Added
