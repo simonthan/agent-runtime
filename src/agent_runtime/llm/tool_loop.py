@@ -346,9 +346,7 @@ class ToolUseLoop:
                     resp.content, resp.stop_reason, cap_exhausted=False, steps=steps, agg=agg
                 )
             rounds += 1
-            tool_uses = [
-                {"id": tu.id, "name": tu.name, "input": tu.input} for tu in resp.tool_use
-            ]
+            tool_uses = [{"id": tu.id, "name": tu.name, "input": tu.input} for tu in resp.tool_use]
             outcome = await self._resolve_round(
                 tool_uses=tool_uses,
                 start_index=0,
