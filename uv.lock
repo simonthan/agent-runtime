@@ -4,7 +4,7 @@ requires-python = ">=3.12"
 
 [[package]]
 name = "agent-runtime"
-version = "0.6.6"
+version = "0.6.7"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -49,7 +49,7 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", marker = "extra == 'teams'", specifier = ">=3.9,<4" },
-    { name = "anthropic", marker = "extra == 'llm'", specifier = ">=0.42,<1.0" },
+    { name = "anthropic", marker = "extra == 'llm'", specifier = ">=0.102,<1.0" },
     { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.29,<1" },
     { name = "botbuilder-core", marker = "extra == 'teams'", specifier = ">=4.15,<5" },
     { name = "botbuilder-schema", marker = "extra == 'teams'", specifier = ">=4.15,<5" },

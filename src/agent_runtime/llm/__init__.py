@@ -3,6 +3,7 @@
 Public surface:
 
 - ``AnthropicClient`` — async client with ``complete()`` / ``complete_messages()`` methods
+- ``build_anthropic_sdk_client`` — provider factory (public Anthropic API vs Azure AI Foundry)
 - ``ClaudeResponse`` — frozen dataclass with token-usage + cache-stats
 - ``Message`` / ``History`` — conversation history types
 - ``LLMError``, ``LLMRateLimitError``, ``LLMAPIError``, ``LLMResponseError`` — exception hierarchy
@@ -23,6 +24,7 @@ from agent_runtime.llm.errors import (
     LLMRateLimitError,
     LLMResponseError,
 )
+from agent_runtime.llm.factory import build_anthropic_sdk_client
 from agent_runtime.llm.models import ClaudeResponse, History, Message, ToolUseBlock
 from agent_runtime.llm.tool_loop import (
     ConfirmPredicate,
@@ -59,4 +61,5 @@ __all__ = [
     "ToolResult",
     "ToolUseBlock",
     "ToolUseLoop",
+    "build_anthropic_sdk_client",
 ]
