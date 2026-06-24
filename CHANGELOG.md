@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.6.7 — 2026-06-24
+
+### Added
+- `agent_runtime.llm.build_anthropic_sdk_client(provider=, api_key=, foundry_resource=,
+  foundry_base_url=)` — provider factory returning the SDK client to inject into
+  `AnthropicClient`. `provider="anthropic"` → `AsyncAnthropic` (public api.anthropic.com);
+  `provider="foundry"` → `AsyncAnthropicFoundry` against the in-tenant Azure AI Foundry
+  `/anthropic/` passthrough (data stays in the Azure tenant). Foundry auth is API-key only
+  (the SDK sets the Foundry auth header(s) automatically); requires exactly one of
+  `foundry_resource` or `foundry_base_url`.
+  `AsyncAnthropicFoundry` is an `AsyncAnthropic` subclass, so the two-cache-breakpoint contract
+  and native model IDs are unchanged — a transport change, not a contract change. **Additive**;
+  no existing call path changes. Consumer wiring is TBP T-034a-b.
+
+### Changed
+- `llm` extra floor bumped `anthropic>=0.42` → `>=0.102,<1.0` (the `AsyncAnthropicFoundry`
+  client the factory imports).
+
 ## v0.6.6 — 2026-06-23
 
 ### Added
