@@ -21,6 +21,16 @@ if TYPE_CHECKING:
     from agent_runtime.llm.client import AnthropicClient
 
 
+_MERGE_SYSTEM_PROMPT = (
+    "You maintain a running summary of an ongoing assistant conversation. "
+    "Given the existing summary and the next batch of conversation turns, return "
+    "a single updated summary that preserves durable facts, decisions, open "
+    "threads, and user preferences from BOTH the existing summary and the new "
+    "turns. Be concise and factual. Do not add commentary, headers, or "
+    "meta-text — return only the updated summary prose."
+)
+
+
 def estimate_tokens(text: str) -> int:
     """Cheap deterministic token estimate (~4 chars/token).
 
@@ -133,3 +143,29 @@ class CompactionEngine:
             wm=working_memory, history=history, extra_block_text=extra_block_text
         )
         return live >= threshold
+
+    def _format_turns(self, turns: list[dict[str, Any]]) -> str:
+        """Format a list of turns as ``role: content`` lines for the merge prompt."""
+        return "\n".join(
+            f"{t.get('role', 'user')}: {t.get('content', '')}" for t in turns
+        )
+
+    async def _merge_summary(
+        self,
+        *,
+        existing_summary: str | None,
+        turns_to_fold: list[dict[str, Any]],
+    ) -> str:
+        """Call the LLM to merge old turns into the running summary."""
+        existing = existing_summary or "(none yet)"
+        user_message = (
+            f"EXISTING SUMMARY:\n{existing}\n\n"
+            f"NEW TURNS TO FOLD IN:\n{self._format_turns(turns_to_fold)}"
+        )
+        response = await self._client.complete(
+            static_system_prefix=_MERGE_SYSTEM_PROMPT,
+            user_message=user_message,
+            max_tokens=self._cfg.summary_max_tokens,
+            model=self._cfg.summary_model,
+        )
+        return response.content

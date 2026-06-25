@@ -82,3 +82,30 @@ def test_should_compact_counts_only_turns_after_last_compacted_index(client) -> 
     engine = CompactionEngine(client=client, config=cfg)
     wm = WorkingMemory(last_compacted_turn_index=18)
     assert engine.should_compact(working_memory=wm, history=_turns(20)) is False
+
+
+# ---------------------------------------------------------------------------
+# Task 3: _merge_summary LLM call
+# ---------------------------------------------------------------------------
+from .fakes import make_ok  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_merge_summary_calls_client_and_returns_text(client, fake_sdk) -> None:
+    fake_sdk.messages.responses.append(make_ok(text="MERGED SUMMARY"))
+    cfg = CompactionConfig(model_window_tokens=1000, summary_model="claude-haiku-4-5-20251001")
+    engine = CompactionEngine(client=client, config=cfg)
+
+    out = await engine._merge_summary(
+        existing_summary="earlier: user wants weekly reports",
+        turns_to_fold=[{"role": "user", "content": "also track the Q3 renewal", "timestamp": "t"}],
+    )
+
+    assert out == "MERGED SUMMARY"
+    req = fake_sdk.messages.captured_requests[0]
+    # both the existing summary and the folded turn content reach the model
+    sent = str(req)
+    assert "weekly reports" in sent
+    assert "Q3 renewal" in sent
+    # honors the configured cheaper summary model
+    assert req["model"] == "claude-haiku-4-5-20251001"
