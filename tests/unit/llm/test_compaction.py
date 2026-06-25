@@ -42,3 +42,43 @@ def test_compaction_config_defaults() -> None:
     assert cfg.threshold_fraction == 0.6
     assert cfg.keep_k == 6
     assert cfg.summary_model is None
+
+
+# ---------------------------------------------------------------------------
+# Task 2: should_compact threshold logic
+# ---------------------------------------------------------------------------
+from agent_runtime.llm.compaction import CompactionEngine  # noqa: E402
+
+
+def _turns(n: int, *, content: str = "x" * 400) -> list[dict]:
+    """n turns, each ~100 estimated tokens (400 chars)."""
+    return [{"role": "user", "content": content, "timestamp": "t"} for _ in range(n)]
+
+
+def test_should_not_compact_when_few_verbatim_turns(client) -> None:
+    # keep_k=6; with 6 turns there is nothing to fold even if huge window crossed
+    cfg = CompactionConfig(model_window_tokens=100, threshold_fraction=0.6, keep_k=6)
+    engine = CompactionEngine(client=client, config=cfg)
+    assert engine.should_compact(working_memory=WorkingMemory(), history=_turns(6)) is False
+
+
+def test_should_compact_when_over_threshold_with_foldable_turns(client) -> None:
+    # 20 turns * ~100 tokens = ~2000 est; threshold = 0.6 * 1000 = 600 -> compact
+    cfg = CompactionConfig(model_window_tokens=1000, threshold_fraction=0.6, keep_k=6)
+    engine = CompactionEngine(client=client, config=cfg)
+    assert engine.should_compact(working_memory=WorkingMemory(), history=_turns(20)) is True
+
+
+def test_should_not_compact_when_under_threshold(client) -> None:
+    # 8 turns * ~100 = ~800 est; threshold = 0.6 * 100000 = 60000 -> no
+    cfg = CompactionConfig(model_window_tokens=100_000, threshold_fraction=0.6, keep_k=6)
+    engine = CompactionEngine(client=client, config=cfg)
+    assert engine.should_compact(working_memory=WorkingMemory(), history=_turns(8)) is False
+
+
+def test_should_compact_counts_only_turns_after_last_compacted_index(client) -> None:
+    # 20 turns total but 18 already summarized -> only 2 verbatim, below keep_k -> no
+    cfg = CompactionConfig(model_window_tokens=1000, threshold_fraction=0.6, keep_k=6)
+    engine = CompactionEngine(client=client, config=cfg)
+    wm = WorkingMemory(last_compacted_turn_index=18)
+    assert engine.should_compact(working_memory=wm, history=_turns(20)) is False

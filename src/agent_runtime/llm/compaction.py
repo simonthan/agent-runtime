@@ -78,3 +78,58 @@ class CompactionResult:
 
     working_memory: WorkingMemory
     compacted: bool
+
+
+class CompactionEngine:
+    """Folds old turns into a running summary when the live prompt grows too large."""
+
+    def __init__(
+        self,
+        *,
+        client: AnthropicClient,
+        config: CompactionConfig,
+        audit_logger: AuditLogger | None = None,
+    ) -> None:
+        """Initialise with an ``AnthropicClient``, compaction config, and optional audit logger."""
+        self._client = client
+        self._cfg = config
+        self._audit = audit_logger or NullAuditLogger()
+
+    def _verbatim_turns(
+        self, history: list[dict[str, Any]], wm: WorkingMemory
+    ) -> list[dict[str, Any]]:
+        """Turns not yet folded into the summary."""
+        return history[wm.last_compacted_turn_index :]
+
+    def _live_token_estimate(
+        self,
+        *,
+        wm: WorkingMemory,
+        history: list[dict[str, Any]],
+        extra_block_text: str,
+    ) -> int:
+        """Estimate the live prompt token count from verbatim turns + summary + extra block."""
+        verbatim = self._verbatim_turns(history, wm)
+        body = (
+            extra_block_text
+            + (wm.running_summary or "")
+            + "".join(str(t.get("content", "")) for t in verbatim)
+        )
+        return estimate_tokens(body)
+
+    def should_compact(
+        self,
+        *,
+        working_memory: WorkingMemory,
+        history: list[dict[str, Any]],
+        extra_block_text: str = "",
+    ) -> bool:
+        """True when there are foldable turns AND the live prompt crosses the threshold."""
+        verbatim = self._verbatim_turns(history, working_memory)
+        if len(verbatim) <= self._cfg.keep_k:
+            return False
+        threshold = int(self._cfg.model_window_tokens * self._cfg.threshold_fraction)
+        live = self._live_token_estimate(
+            wm=working_memory, history=history, extra_block_text=extra_block_text
+        )
+        return live >= threshold
