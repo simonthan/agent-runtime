@@ -18,6 +18,13 @@ two-breakpoint cache contract (static system prefix + per-turn retrieval block).
 """
 
 from agent_runtime.llm.client import AnthropicClient
+from agent_runtime.llm.compaction import (
+    CompactionConfig,
+    CompactionEngine,
+    CompactionResult,
+    WorkingMemory,
+    estimate_tokens,
+)
 from agent_runtime.llm.errors import (
     LLMAPIError,
     LLMError,
@@ -43,6 +50,9 @@ from agent_runtime.llm.tool_loop import (
 __all__ = [
     "AnthropicClient",
     "ClaudeResponse",
+    "CompactionConfig",
+    "CompactionEngine",
+    "CompactionResult",
     "ConfirmPredicate",
     "ExecuteDecision",
     "History",
@@ -61,5 +71,7 @@ __all__ = [
     "ToolResult",
     "ToolUseBlock",
     "ToolUseLoop",
+    "WorkingMemory",
     "build_anthropic_sdk_client",
+    "estimate_tokens",
 ]
