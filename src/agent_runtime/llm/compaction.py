@@ -169,3 +169,46 @@ class CompactionEngine:
             model=self._cfg.summary_model,
         )
         return response.content
+
+    async def maybe_compact(
+        self,
+        *,
+        working_memory: WorkingMemory,
+        history: list[dict[str, Any]],
+        extra_block_text: str = "",
+        session_id: str | None = None,
+    ) -> CompactionResult:
+        """Compact if over threshold; otherwise return the input unchanged.
+
+        On compaction: folds all verbatim turns except the most recent
+        ``keep_k`` into the running summary, advances the covered-index, bumps
+        the count, and emits a ``memory_compacted`` event. The LLM merge call is
+        only made when compaction actually fires.
+        """
+        wm = working_memory
+        if not self.should_compact(
+            working_memory=wm, history=history, extra_block_text=extra_block_text
+        ):
+            return CompactionResult(working_memory=wm, compacted=False)
+
+        verbatim = self._verbatim_turns(history, wm)
+        n_to_fold = len(verbatim) - self._cfg.keep_k
+        to_fold = verbatim[:n_to_fold]
+
+        new_summary = await self._merge_summary(
+            existing_summary=wm.running_summary, turns_to_fold=to_fold
+        )
+        new_wm = WorkingMemory(
+            running_summary=new_summary,
+            summary_token_estimate=estimate_tokens(new_summary),
+            last_compacted_turn_index=wm.last_compacted_turn_index + n_to_fold,
+            compaction_count=wm.compaction_count + 1,
+        )
+        self._audit.info(
+            "memory_compacted",
+            session_id=session_id,
+            folded_turns=n_to_fold,
+            compaction_count=new_wm.compaction_count,
+            summary_token_estimate=new_wm.summary_token_estimate,
+        )
+        return CompactionResult(working_memory=new_wm, compacted=True)
