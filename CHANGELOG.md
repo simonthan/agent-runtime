@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.7.0 — 2026-06-25
+
+### Added
+- `agent_runtime.llm.compaction` module (T-028): in-session conversation compaction primitive.
+  Exposes `CompactionConfig`, `WorkingMemory`, `CompactionResult`, `CompactionEngine`, and
+  `estimate_tokens`. `CompactionEngine.maybe_compact()` folds the oldest turns into a running
+  prose summary (via `AnthropicClient.complete()`) while keeping the most recent `keep_k` turns
+  verbatim. Triggered when estimated live-prompt tokens cross a configurable fraction of the model
+  window. Failed merge calls are best-effort — turns are never dropped; a `memory_compaction_failed`
+  audit event is emitted instead. All types exported from `agent_runtime.llm`.
+
 ## v0.6.8 — 2026-06-24
 
 ### Added
