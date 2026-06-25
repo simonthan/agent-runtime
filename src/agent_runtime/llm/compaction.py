@@ -146,9 +146,7 @@ class CompactionEngine:
 
     def _format_turns(self, turns: list[dict[str, Any]]) -> str:
         """Format a list of turns as ``role: content`` lines for the merge prompt."""
-        return "\n".join(
-            f"{t.get('role', 'user')}: {t.get('content', '')}" for t in turns
-        )
+        return "\n".join(f"{t.get('role', 'user')}: {t.get('content', '')}" for t in turns)
 
     async def _merge_summary(
         self,
@@ -200,9 +198,7 @@ class CompactionEngine:
                 existing_summary=wm.running_summary, turns_to_fold=to_fold
             )
         except Exception as exc:  # noqa: BLE001 — compaction is best-effort; never drop turns
-            self._audit.warning(
-                "memory_compaction_failed", session_id=session_id, error=str(exc)
-            )
+            self._audit.warning("memory_compaction_failed", session_id=session_id, error=str(exc))
             return CompactionResult(working_memory=wm, compacted=False)
         new_wm = WorkingMemory(
             running_summary=new_summary,

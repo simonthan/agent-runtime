@@ -198,3 +198,18 @@ async def test_maybe_compact_returns_unchanged_on_llm_error(client, fake_sdk, au
     assert result.compacted is False
     assert result.working_memory == wm  # unchanged: nothing folded, index intact
     assert any(e[1] == "memory_compaction_failed" for e in audit.events)
+
+
+# ---------------------------------------------------------------------------
+# Task 6: Public exports
+# ---------------------------------------------------------------------------
+
+
+def test_public_exports_from_llm_package() -> None:
+    from agent_runtime.llm import (
+        CompactionConfig,
+        CompactionEngine,
+        CompactionResult,
+        WorkingMemory,
+        estimate_tokens,
+    )
