@@ -100,4 +100,6 @@ async def resolve_identity(turn_context: TurnContext) -> ConversationRef | None:
         tenant_id=_extract_tenant_id(activity),
         service_url=activity.service_url or "",
         activity_id=activity.id or "",
+        user_channel_id=from_info.id or "",
+        recipient_id=getattr(activity.recipient, "id", "") or "",
     )

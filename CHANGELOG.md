@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.6.8 — 2026-06-24
+
+### Added
+- `TeamsAdapter.send_proactive(ref, *, bot_app_id, text=, card=)` (T-029a) — send an
+  unsolicited (proactive) message into an existing 1:1 Teams chat. Reconstructs a canonical
+  botbuilder `ConversationReference` from a stored `ConversationRef` and drives
+  `BotFrameworkAdapter.continue_conversation`; the callback reuses `BotFrameworkOutboundChannel`
+  so proactive text/cards render identically to solicited ones.
+- `ConversationRef` gains `user_channel_id` (the `29:…` sender) and `recipient_id`
+  (the `28:<appid>` bot) channel-account ids, captured in `identity.py` on inbound, so the
+  reconstructed proactive reference is byte-canonical (not OID-synthesized). Both default `= ""`
+  (additive; existing construction + equality unchanged).
+- `conversation_ref_to_dict` / `conversation_ref_from_dict` — flat str->str (de)serializers for
+  durable storage of a `ConversationRef`; `from_dict` tolerates missing/unknown keys for schema
+  evolution. Consumer wiring is TBP T-029a-b.
+
 ## v0.6.7 — 2026-06-24
 
 ### Added

@@ -54,6 +54,8 @@ def make_conversation_ref(**overrides: str) -> ConversationRef:
         "tenant_id": "tenant-test",
         "service_url": "https://smba.trafficmanager.net/test/",
         "activity_id": "activity-1",
+        "user_channel_id": "29:user-1",
+        "recipient_id": "28:bot-1",
     }
     defaults.update(overrides)
     return ConversationRef(**defaults)

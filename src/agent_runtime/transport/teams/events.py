@@ -22,6 +22,51 @@ class ConversationRef:
     tenant_id: str  # Entra tenant ID
     service_url: str  # Bot Framework Service base URL for outbound routing
     activity_id: str  # Inbound activity ID — reserved for future reply_to_id
+    user_channel_id: str = ""  # "29:…" sender channel id → proactive ConversationReference.user
+    recipient_id: str = ""  # "28:<appid>" bot channel id → proactive ConversationReference.bot
+
+
+def conversation_ref_to_dict(ref: ConversationRef) -> dict[str, str]:
+    """Serialize a ConversationRef to a flat str->str dict for durable storage.
+
+    Consumers persist this (e.g. a Postgres row) to send a proactive message
+    later via ``TeamsAdapter.send_proactive``. Rebuild with
+    ``conversation_ref_from_dict``, which tolerates missing keys so a row
+    written by an older schema still loads.
+    """
+    return {
+        "aad_object_id": ref.aad_object_id,
+        "user_email": ref.user_email,
+        "user_display_name": ref.user_display_name,
+        "conversation_id": ref.conversation_id,
+        "channel_id": ref.channel_id,
+        "tenant_id": ref.tenant_id,
+        "service_url": ref.service_url,
+        "activity_id": ref.activity_id,
+        "user_channel_id": ref.user_channel_id,
+        "recipient_id": ref.recipient_id,
+    }
+
+
+def conversation_ref_from_dict(data: dict[str, str]) -> ConversationRef:
+    """Rebuild a ConversationRef from ``conversation_ref_to_dict`` output.
+
+    Missing keys default to "" (``channel_id`` to "msteams") so a dict persisted
+    before a field existed still loads — forward-compat for schema evolution.
+    Unknown keys are ignored for the same reason.
+    """
+    return ConversationRef(
+        aad_object_id=data.get("aad_object_id", ""),
+        user_email=data.get("user_email", ""),
+        user_display_name=data.get("user_display_name", ""),
+        conversation_id=data.get("conversation_id", ""),
+        channel_id=data.get("channel_id", "") or "msteams",
+        tenant_id=data.get("tenant_id", ""),
+        service_url=data.get("service_url", ""),
+        activity_id=data.get("activity_id", ""),
+        user_channel_id=data.get("user_channel_id", ""),
+        recipient_id=data.get("recipient_id", ""),
+    )
 
 
 @dataclass(frozen=True, slots=True)

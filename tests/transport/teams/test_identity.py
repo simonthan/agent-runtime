@@ -9,15 +9,24 @@ import pytest
 from agent_runtime.transport.teams.identity import _extract_tenant_id, resolve_identity
 
 
-def _turn_context(from_id="user-1", from_aad="", from_name="User One"):
+def _turn_context(
+    from_id="user-1",
+    from_aad="",
+    from_name="User One",
+    recipient_id="28:app-test",
+):
     """Build a turn_context double mirroring botbuilder's ChannelAccount shape.
 
     Note: ChannelAccount has NO email field — only id, name, aad_object_id, role,
     properties. We don't pass from_email because identity.py never reads it from
     from_property; email comes exclusively from the TeamsInfo.get_member() path.
+
+    ``recipient_id`` corresponds to ``activity.recipient.id`` (the bot's ``28:…``
+    channel-account id), added for T-029a channel-id capture tests.
     """
     activity = SimpleNamespace(
         from_property=SimpleNamespace(id=from_id, aad_object_id=from_aad, name=from_name),
+        recipient=SimpleNamespace(id=recipient_id),
         conversation=SimpleNamespace(id="conv-1", tenant_id="tenant-test"),
         channel_id="msteams",
         service_url="https://smba.example/",
@@ -109,3 +118,20 @@ def test_extract_tenant_id_returns_empty_when_channel_data_missing():
         channel_data=None,
     )
     assert _extract_tenant_id(activity) == ""
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_resolve_identity_captures_channel_ids(mock_get_member):
+    """T-029a: resolve_identity populates user_channel_id and recipient_id from the inbound activity.
+
+    ``from_property.id`` (the sender's ``29:…`` Bot Framework channel id) must land in
+    ``ConversationRef.user_channel_id``; ``activity.recipient.id`` (the bot's ``28:<appid>``)
+    must land in ``ConversationRef.recipient_id``.
+    """
+    mock_get_member.return_value = SimpleNamespace(
+        aad_object_id="aad-1", email="u@example.com", name="User One"
+    )
+    ref = await resolve_identity(_turn_context(from_id="29:alice", recipient_id="28:app-123"))
+    assert ref is not None
+    assert ref.user_channel_id == "29:alice"
+    assert ref.recipient_id == "28:app-123"
