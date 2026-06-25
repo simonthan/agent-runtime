@@ -25,6 +25,8 @@ from agent_runtime.transport.teams.events import (
     InboundInvoke,
     InboundMembersAdded,
     InboundMessage,
+    conversation_ref_from_dict,
+    conversation_ref_to_dict,
 )
 from agent_runtime.transport.teams.outbound import BotFrameworkOutboundChannel, OutboundChannel
 from agent_runtime.transport.teams.protocol import TeamsHandler
@@ -41,4 +43,6 @@ __all__ = [
     "TeamsAdapter",
     "TeamsAdapterConfig",
     "TeamsHandler",
+    "conversation_ref_from_dict",
+    "conversation_ref_to_dict",
 ]

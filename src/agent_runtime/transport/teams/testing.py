@@ -1,7 +1,7 @@
 """Test doubles and factory helpers for consumers of the Teams transport.
 
-Public surface: ``FakeOutboundChannel``, ``make_inbound_message``,
-``make_inbound_members_added``, ``make_inbound_invoke``.
+Public surface: ``FakeOutboundChannel``, ``make_conversation_ref``,
+``make_inbound_message``, ``make_inbound_members_added``, ``make_inbound_invoke``.
 """
 
 from __future__ import annotations
@@ -45,18 +45,21 @@ class FakeOutboundChannel:
 
 
 def make_conversation_ref(**overrides: str) -> ConversationRef:
-    defaults: dict[str, str] = {
-        "aad_object_id": "aad-test-user-1",
-        "user_email": "user1@example.com",
-        "user_display_name": "Test User",
-        "conversation_id": "conv-1",
-        "channel_id": "msteams",
-        "tenant_id": "tenant-test",
-        "service_url": "https://smba.trafficmanager.net/test/",
-        "activity_id": "activity-1",
-    }
-    defaults.update(overrides)
-    return ConversationRef(**defaults)
+    return ConversationRef(
+        **{
+            "aad_object_id": "aad-test-user-1",
+            "user_email": "user1@example.com",
+            "user_display_name": "Test User",
+            "conversation_id": "conv-1",
+            "channel_id": "msteams",
+            "tenant_id": "tenant-test",
+            "service_url": "https://smba.trafficmanager.net/test/",
+            "activity_id": "activity-1",
+            "user_channel_id": "29:user-1",
+            "recipient_id": "28:bot-1",
+            **overrides,
+        }
+    )
 
 
 def make_inbound_message(

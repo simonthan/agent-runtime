@@ -12,9 +12,20 @@ from botbuilder.core import (
     BotFrameworkAdapterSettings,
     TurnContext,
 )
-from botbuilder.schema import Activity, InvokeResponse
+from botbuilder.schema import (
+    Activity,
+    ChannelAccount,
+    ConversationAccount,
+    ConversationReference,
+    InvokeResponse,
+)
 
-from agent_runtime.transport.teams.events import InboundInvoke, InboundMembersAdded, InboundMessage
+from agent_runtime.transport.teams.events import (
+    ConversationRef,
+    InboundInvoke,
+    InboundMembersAdded,
+    InboundMessage,
+)
 from agent_runtime.transport.teams.identity import resolve_identity
 from agent_runtime.transport.teams.outbound import BotFrameworkOutboundChannel
 
@@ -144,3 +155,60 @@ class TeamsAdapter:
         if response is None:
             return (201, None)
         return (response.status, response.body)
+
+    async def send_proactive(
+        self,
+        ref: ConversationRef,
+        *,
+        bot_app_id: str,
+        text: str | None = None,
+        card: dict[str, Any] | None = None,
+    ) -> None:
+        """Send an unsolicited (proactive) message into an existing 1:1 Teams chat.
+
+        Reconstructs a canonical botbuilder ``ConversationReference`` from the
+        stored ``ref`` and drives ``BotFrameworkAdapter.continue_conversation``,
+        which manufactures a synthetic ``TurnContext`` routed to
+        ``ref.service_url``. The callback reuses the same
+        ``BotFrameworkOutboundChannel`` surface as the inbound path, so text and
+        Adaptive Cards render identically whether solicited or proactive.
+
+        ``ref.user_channel_id`` / ``ref.recipient_id`` are the Bot Framework
+        channel-account ids captured on inbound; they fill the reference's
+        ``user`` / ``bot`` per botbuilder's continuation contract
+        (``get_continuation_activity`` maps user->from_property, bot->recipient).
+        References persisted before those fields existed deserialize with empty
+        ids — we fall back to the Entra OID / ``28:<bot_app_id>`` so an upgraded
+        deploy can still message pre-existing users (1:1 routing keys off
+        ``conversation.id`` + ``service_url`` regardless).
+
+        Consent is structural: a proactive message is only deliverable when the
+        caller already holds a ``ConversationRef`` — Teams grants one only after
+        the user has messaged the bot. ``bot_app_id`` is the bot's Entra app
+        (client) ID — botbuilder uses it to mint the outbound Connector token. At
+        least one of ``text`` / ``card`` must be provided; passing both sends two
+        activities in order (text first).
+        """
+        if text is None and card is None:
+            msg = "send_proactive requires text and/or card"
+            raise ValueError(msg)
+
+        reference = ConversationReference(
+            channel_id=ref.channel_id or "msteams",
+            service_url=ref.service_url,
+            conversation=ConversationAccount(id=ref.conversation_id),
+            user=ChannelAccount(
+                id=ref.user_channel_id or ref.aad_object_id,
+                name=ref.user_display_name,
+            ),
+            bot=ChannelAccount(id=ref.recipient_id or f"28:{bot_app_id}"),
+        )
+
+        async def _callback(turn_context: TurnContext) -> None:
+            channel = BotFrameworkOutboundChannel(turn_context)
+            if text is not None:
+                await channel.send_text(text)
+            if card is not None:
+                await channel.send_card(card)
+
+        await self._adapter.continue_conversation(reference, _callback, bot_app_id)
