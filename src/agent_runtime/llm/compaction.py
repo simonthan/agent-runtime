@@ -178,33 +178,40 @@ class CompactionEngine:
     ) -> CompactionResult:
         """Compact if over threshold; otherwise return the input unchanged.
 
+        ``history`` MUST be the full, un-truncated turn list — the engine slices
+        the verbatim window internally from ``last_compacted_turn_index``. Do not
+        pre-truncate it to the verbatim tail (that is what the consumer sends to
+        the *model*, not what it passes here); doing so would double-slice and
+        corrupt the covered-index math.
+
         On compaction: folds all verbatim turns except the most recent
         ``keep_k`` into the running summary, advances the covered-index, bumps
         the count, and emits a ``memory_compacted`` event. The LLM merge call is
         only made when compaction actually fires.
         """
-        wm = working_memory
         if not self.should_compact(
-            working_memory=wm, history=history, extra_block_text=extra_block_text
+            working_memory=working_memory,
+            history=history,
+            extra_block_text=extra_block_text,
         ):
-            return CompactionResult(working_memory=wm, compacted=False)
+            return CompactionResult(working_memory=working_memory, compacted=False)
 
-        verbatim = self._verbatim_turns(history, wm)
+        verbatim = self._verbatim_turns(history, working_memory)
         n_to_fold = len(verbatim) - self._cfg.keep_k
         to_fold = verbatim[:n_to_fold]
 
         try:
             new_summary = await self._merge_summary(
-                existing_summary=wm.running_summary, turns_to_fold=to_fold
+                existing_summary=working_memory.running_summary, turns_to_fold=to_fold
             )
         except Exception as exc:  # noqa: BLE001 — compaction is best-effort; never drop turns
             self._audit.warning("memory_compaction_failed", session_id=session_id, error=str(exc))
-            return CompactionResult(working_memory=wm, compacted=False)
+            return CompactionResult(working_memory=working_memory, compacted=False)
         new_wm = WorkingMemory(
             running_summary=new_summary,
             summary_token_estimate=estimate_tokens(new_summary),
-            last_compacted_turn_index=wm.last_compacted_turn_index + n_to_fold,
-            compaction_count=wm.compaction_count + 1,
+            last_compacted_turn_index=working_memory.last_compacted_turn_index + n_to_fold,
+            compaction_count=working_memory.compaction_count + 1,
         )
         self._audit.info(
             "memory_compacted",
