@@ -178,3 +178,23 @@ async def test_planted_early_fact_survives_two_compactions(client, fake_sdk) -> 
     # the existing summary from r1 was passed into the second merge call
     second_req = str(fake_sdk.messages.captured_requests[1])
     assert "batch 1" in second_req  # r1 summary fed into r2 merge
+
+
+# ---------------------------------------------------------------------------
+# Task 5: LLM-failure safety
+# ---------------------------------------------------------------------------
+from agent_runtime.llm import LLMError  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_maybe_compact_returns_unchanged_on_llm_error(client, fake_sdk, audit) -> None:
+    fake_sdk.messages.exceptions.append(LLMError("boom"))
+    cfg = CompactionConfig(model_window_tokens=1000, threshold_fraction=0.6, keep_k=6)
+    engine = CompactionEngine(client=client, config=cfg, audit_logger=audit)
+    wm = WorkingMemory(running_summary="prior", last_compacted_turn_index=2)
+
+    result = await engine.maybe_compact(working_memory=wm, history=_turns(20))
+
+    assert result.compacted is False
+    assert result.working_memory == wm  # unchanged: nothing folded, index intact
+    assert any(e[1] == "memory_compaction_failed" for e in audit.events)

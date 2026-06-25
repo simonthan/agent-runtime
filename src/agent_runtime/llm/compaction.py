@@ -195,9 +195,15 @@ class CompactionEngine:
         n_to_fold = len(verbatim) - self._cfg.keep_k
         to_fold = verbatim[:n_to_fold]
 
-        new_summary = await self._merge_summary(
-            existing_summary=wm.running_summary, turns_to_fold=to_fold
-        )
+        try:
+            new_summary = await self._merge_summary(
+                existing_summary=wm.running_summary, turns_to_fold=to_fold
+            )
+        except Exception as exc:  # noqa: BLE001 — compaction is best-effort; never drop turns
+            self._audit.warning(
+                "memory_compaction_failed", session_id=session_id, error=str(exc)
+            )
+            return CompactionResult(working_memory=wm, compacted=False)
         new_wm = WorkingMemory(
             running_summary=new_summary,
             summary_token_estimate=estimate_tokens(new_summary),
