@@ -163,3 +163,62 @@ async def test_fail_closed_drops_event_when_no_email(mock_get_member):
     await adapter._handler.on_turn(tc)
 
     assert handler.events == []  # handler never called
+
+
+def _deserialize_message_activity(text: str, entities: list[dict] | None = None) -> Activity:
+    """Build a message Activity via the wire (dict) path so entity.additional_properties is
+    populated — remove_recipient_mention reads mentions from additional_properties, not typed attrs."""
+    body: dict = {
+        "type": "message",
+        "id": "activity-1",
+        "channelId": "msteams",
+        "serviceUrl": "https://smba.example/",
+        "conversation": {"id": "conv-1", "tenantId": "tenant-test"},
+        "from": {"id": "user-1", "aadObjectId": "aad-1", "name": "User One"},
+        "recipient": {"id": "bot-1", "name": "Bot"},
+        "text": text,
+    }
+    if entities:
+        body["entities"] = entities
+    return Activity().deserialize(body)
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_message_strips_bot_recipient_mention(mock_get_member):
+    mock_get_member.return_value = SimpleNamespace(
+        aad_object_id="aad-1", email="u@example.com", name="User One"
+    )
+    handler = _CapturingHandler()
+    adapter = TeamsAdapter(TeamsAdapterConfig("aid", "pwd", "tid"), handler)
+    # The mention must target recipient.id ("bot-1") to be removed; another user's mention stays.
+    activity = _deserialize_message_activity(
+        "<at>Knowledge Bot</at> summarize this thread",
+        entities=[
+            {
+                "type": "mention",
+                "text": "<at>Knowledge Bot</at>",
+                "mentioned": {"id": "bot-1", "name": "Knowledge Bot"},
+            }
+        ],
+    )
+    tc = TurnContext(adapter._adapter, activity)
+    await adapter._handler.on_turn(tc)
+
+    assert len(handler.events) == 1
+    assert isinstance(handler.events[0], InboundMessage)
+    assert handler.events[0].text == "summarize this thread"
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_dm_message_without_mention_unchanged(mock_get_member):
+    """Personal-chat path is byte-equivalent: no recipient-mention entity → text verbatim."""
+    mock_get_member.return_value = SimpleNamespace(
+        aad_object_id="aad-1", email="u@example.com", name="User One"
+    )
+    handler = _CapturingHandler()
+    adapter = TeamsAdapter(TeamsAdapterConfig("aid", "pwd", "tid"), handler)
+    activity = _deserialize_message_activity("plain dm question")
+    tc = TurnContext(adapter._adapter, activity)
+    await adapter._handler.on_turn(tc)
+
+    assert handler.events[0].text == "plain dm question"

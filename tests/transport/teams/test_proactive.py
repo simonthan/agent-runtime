@@ -31,6 +31,7 @@ def test_to_dict_includes_channel_ids():
     d = conversation_ref_to_dict(make_conversation_ref())
     assert d["user_channel_id"] == "29:user-1"
     assert d["recipient_id"] == "28:bot-1"
+    assert d["conversation_type"] == "personal"
 
 
 def test_from_dict_defaults_missing_keys():
@@ -40,6 +41,7 @@ def test_from_dict_defaults_missing_keys():
     assert ref.channel_id == "msteams"  # default applied
     assert ref.user_channel_id == ""  # forward-compat default
     assert ref.recipient_id == ""
+    assert ref.conversation_type == "personal"
 
 
 def test_from_dict_ignores_unknown_keys():

@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.9.0 — 2026-06-26
+
+### Added
+- `ConversationRef.conversation_type` (`"personal"` | `"channel"` | `"groupChat"`, default
+  `"personal"`) — captured in `resolve_identity` from `activity.conversation.conversation_type`,
+  serialized by `conversation_ref_to_dict`/`from_dict` (missing key → `"personal"`, forward-compat
+  for rows persisted before the field). Lets a consumer route channel turns differently from 1:1
+  DMs (T-031). Additive: existing construction and durable rows are unaffected.
+- `_EventDispatchingHandler.on_message_activity` now strips the bot's own `<at>…</at>`
+  recipient-mention from inbound text via `TurnContext.remove_recipient_mention`, so a channel
+  `"@Bot summarize this"` arrives as `"summarize this"`. No-op in 1:1 DMs (no recipient-mention
+  entity), so the personal-chat path — and ithelpdesk — is byte-equivalent.
+
 ## v0.8.0 — 2026-06-26
 
 ### Added

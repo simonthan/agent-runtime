@@ -24,6 +24,8 @@ class ConversationRef:
     activity_id: str  # Inbound activity ID — reserved for future reply_to_id
     user_channel_id: str = ""  # "29:…" sender channel id → proactive ConversationReference.user
     recipient_id: str = ""  # "28:<appid>" bot channel id → proactive ConversationReference.bot
+    conversation_type: str = "personal"  # "personal" | "channel" | "groupChat" (T-031a)
+    # Channel turns get stateless single-shot handling; DM turns use the persona/session flow.
 
 
 def conversation_ref_to_dict(ref: ConversationRef) -> dict[str, str]:
@@ -45,15 +47,16 @@ def conversation_ref_to_dict(ref: ConversationRef) -> dict[str, str]:
         "activity_id": ref.activity_id,
         "user_channel_id": ref.user_channel_id,
         "recipient_id": ref.recipient_id,
+        "conversation_type": ref.conversation_type,
     }
 
 
 def conversation_ref_from_dict(data: dict[str, str]) -> ConversationRef:
     """Rebuild a ConversationRef from ``conversation_ref_to_dict`` output.
 
-    Missing keys default to "" (``channel_id`` to "msteams") so a dict persisted
-    before a field existed still loads — forward-compat for schema evolution.
-    Unknown keys are ignored for the same reason.
+    Missing keys default to "" (``channel_id`` to "msteams", ``conversation_type``
+    to "personal") so a dict persisted before a field existed still loads —
+    forward-compat for schema evolution. Unknown keys are ignored for the same reason.
     """
     return ConversationRef(
         aad_object_id=data.get("aad_object_id", ""),
@@ -66,6 +69,7 @@ def conversation_ref_from_dict(data: dict[str, str]) -> ConversationRef:
         activity_id=data.get("activity_id", ""),
         user_channel_id=data.get("user_channel_id", ""),
         recipient_id=data.get("recipient_id", ""),
+        conversation_type=data.get("conversation_type", "") or "personal",
     )
 
 

@@ -102,4 +102,5 @@ async def resolve_identity(turn_context: TurnContext) -> ConversationRef | None:
         activity_id=activity.id or "",
         user_channel_id=from_info.id or "",
         recipient_id=getattr(activity.recipient, "id", "") or "",
+        conversation_type=getattr(activity.conversation, "conversation_type", "") or "personal",
     )

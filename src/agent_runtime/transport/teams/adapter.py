@@ -61,9 +61,14 @@ class _EventDispatchingHandler(ActivityHandler):
         # botbuilder ≥4.16) is intentionally coerced to None until a richer event
         # type is added — v0.4.0 scope is dict-shaped Action.Submit payloads only.
         raw_value = turn_context.activity.value
+        # Strip the bot's own @mention so channel text arrives clean ("@Bot hi" -> "hi").
+        # remove_recipient_mention is a no-op in 1:1 DMs (no recipient-mention entity), so the
+        # personal-chat path is byte-equivalent. Guard None: it returns activity.text verbatim,
+        # which may be None.
+        mention_stripped = TurnContext.remove_recipient_mention(turn_context.activity) or ""
         event = InboundMessage(
             conversation_ref=ref,
-            text=(turn_context.activity.text or "").strip(),
+            text=mention_stripped.strip(),
             value=raw_value if isinstance(raw_value, dict) else None,
         )
         await self._handler.on_event(event, BotFrameworkOutboundChannel(turn_context))
