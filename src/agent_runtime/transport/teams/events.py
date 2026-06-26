@@ -24,8 +24,8 @@ class ConversationRef:
     activity_id: str  # Inbound activity ID — reserved for future reply_to_id
     user_channel_id: str = ""  # "29:…" sender channel id → proactive ConversationReference.user
     recipient_id: str = ""  # "28:<appid>" bot channel id → proactive ConversationReference.bot
-    conversation_type: str = "personal"  # "personal" | "channel" | "groupChat" (T-031a) —
-    # drives consumer routing: channel turns are stateless single-shot, never the DM persona/session flow
+    conversation_type: str = "personal"  # "personal" | "channel" | "groupChat" (T-031a)
+    # Channel turns get stateless single-shot handling; DM turns use the persona/session flow.
 
 
 def conversation_ref_to_dict(ref: ConversationRef) -> dict[str, str]:

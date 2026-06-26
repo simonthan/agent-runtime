@@ -184,7 +184,7 @@ def _deserialize_message_activity(text: str, entities: list[dict] | None = None)
 
 
 @patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
-async def test_message_strips_bot_recipient_mention(mock_get_member, mock_send_activity):
+async def test_message_strips_bot_recipient_mention(mock_get_member):
     mock_get_member.return_value = SimpleNamespace(
         aad_object_id="aad-1", email="u@example.com", name="User One"
     )
@@ -210,7 +210,7 @@ async def test_message_strips_bot_recipient_mention(mock_get_member, mock_send_a
 
 
 @patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
-async def test_dm_message_without_mention_unchanged(mock_get_member, mock_send_activity):
+async def test_dm_message_without_mention_unchanged(mock_get_member):
     """Personal-chat path is byte-equivalent: no recipient-mention entity → text verbatim."""
     mock_get_member.return_value = SimpleNamespace(
         aad_object_id="aad-1", email="u@example.com", name="User One"
