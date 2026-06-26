@@ -60,6 +60,7 @@ async def test_durable_keeps_full_transcript_past_redis_cap():
     for i in range(5):
         await mgr.update_session(s.id, add_message={"role": "user", "content": str(i)})
     redis_session = await mgr.get_session(s.id)
+    assert redis_session is not None
     assert len(redis_session.conversation_history) == 2  # Redis trimmed
     durable = await repo.get_conversation_history(session_id=s.id, user_id="u1", bot_id="b1")
     assert [m["content"] for m in durable] == ["0", "1", "2", "3", "4"]  # durable full
