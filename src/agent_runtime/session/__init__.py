@@ -21,12 +21,22 @@ from agent_runtime.session.events import (
     SessionAlreadyActive,
 )
 from agent_runtime.session.manager import SessionManager
-from agent_runtime.session.models import ConversationState, ResumeRow, SessionData
-from agent_runtime.session.protocol import RedisClientProtocol, SessionRepositoryProtocol
+from agent_runtime.session.models import (
+    ConversationState,
+    ResumeRow,
+    SessionData,
+    SessionSummaryRow,
+)
+from agent_runtime.session.protocol import (
+    DurableHistoryRepository,
+    RedisClientProtocol,
+    SessionRepositoryProtocol,
+)
 
 __all__ = [
     "Active",
     "ConversationState",
+    "DurableHistoryRepository",
     "NewSession",
     "RedisClientProtocol",
     "Resumable",
@@ -36,4 +46,5 @@ __all__ = [
     "SessionData",
     "SessionManager",
     "SessionRepositoryProtocol",
+    "SessionSummaryRow",
 ]

@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from agent_runtime.session.models import ResumeRow, SessionData
+from agent_runtime.session.models import ResumeRow, SessionData, SessionSummaryRow
 
 
 @dataclass
@@ -88,6 +88,8 @@ class FakeSessionRepository:
     _by_token: dict[str, str] = field(default_factory=dict)
     _active_by_pair: dict[tuple[str, str], str] = field(default_factory=dict)
     idle_timeout: timedelta = field(default_factory=lambda: timedelta(minutes=30))
+    supports_durable_history: bool = True
+    _messages: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     async def upsert_resume_data(
         self,
@@ -143,6 +145,62 @@ class FakeSessionRepository:
         if (datetime.now(UTC) - last) > self.idle_timeout:
             return None
         return row
+
+    # --- DurableHistoryRepository (T-036) ---------------------------------
+
+    async def append_message(
+        self,
+        *,
+        session_id: str,
+        user_id: str,  # noqa: ARG002
+        bot_id: str,  # noqa: ARG002
+        message: dict[str, Any],
+    ) -> None:
+        self._messages.setdefault(session_id, []).append(message)
+
+    async def get_conversation_history(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        bot_id: str,
+    ) -> list[dict[str, Any]]:
+        # Ownership guard: _by_id is populated by upsert_resume_data (called from
+        # create_session); a row absent or owned by a different (user,bot) → [].
+        row = self._by_id.get(session_id)
+        if row is None or row.user_id != user_id or row.bot_id != bot_id:
+            return []
+        return list(self._messages.get(session_id, []))
+
+    async def list_sessions(
+        self,
+        *,
+        user_id: str,
+        bot_id: str,
+        limit: int,
+        before: datetime | None = None,
+    ) -> list[SessionSummaryRow]:
+        def _sort_key(r: ResumeRow) -> datetime:
+            return r.last_message_at or r.created_at
+
+        # NB: the Fake does not mirror end_session's status mutation (that lives on the
+        # Redis SessionData, not _by_id) — the history view intentionally lists ALL of a
+        # (user,bot)'s sessions regardless of status, so this is by design.
+        rows = [r for r in self._by_id.values() if r.user_id == user_id and r.bot_id == bot_id]
+        rows.sort(key=_sort_key, reverse=True)
+        if before is not None:
+            rows = [r for r in rows if _sort_key(r) < before]
+        return [
+            SessionSummaryRow(
+                id=r.id,
+                title=None,
+                status=r.status,
+                created_at=r.created_at,
+                last_message_at=r.last_message_at,
+                message_count=len(self._messages.get(str(r.id), [])),
+            )
+            for r in rows[:limit]
+        ]
 
 
 def make_session_data(
