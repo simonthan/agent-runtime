@@ -1,6 +1,6 @@
 [project]
 name = "agent-runtime"
-version = "0.7.0"
+version = "0.8.0"
 description = "Shared runtime primitives for Microsoft Teams knowledge bots — resilience, safety, session flows, execution context. Consumed by teams-bot-platform and ithelpdesk."
 readme = "README.md"
 license = "MIT"

@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.8.0 — 2026-06-26
+
+### Added
+- Durable per-session conversation history (T-036). New `DurableHistoryRepository`
+  Protocol (`append_message`, `get_conversation_history`, `list_sessions`). A repository
+  opts in by setting `supports_durable_history = True`; `SessionManager` gates durable
+  writes/reads on that explicit flag (NOT method-name `isinstance`, which would collide
+  with unrelated `list_sessions` methods). Repos that don't opt in (e.g. ithelpdesk) keep
+  the prior Redis-only behaviour unchanged.
+- `SessionManager.update_session` now best-effort writes each message through to the
+  durable store. Best-effort by design: a store outage degrades to a gap in the cold
+  transcript, never a failed turn (chat availability over completeness; a warning is
+  logged). Redis is source-of-truth while warm; durable once cold.
+- `SessionManager.fork_session(*, source_session_id, user_id, bot_id, ...)` — creates a
+  new active session seeded with a past session's durable transcript (Redis context only;
+  not re-persisted). Ownership scoped by user+bot. The caller must durably end any active
+  session first (else `SessionAlreadyActive`).
+- `SessionManager.list_sessions(*, user_id, bot_id, limit=20, before)` — paginated recent
+  sessions for a history UI; returns `SessionSummaryRow`s. `[]` without a durable repo.
+- `SessionManager.create_session(..., initial_history=)` — seed Redis conversation
+  context (used by `fork_session`); respects `max_history`.
+- New wire type `SessionSummaryRow`; both it and `DurableHistoryRepository` exported
+  from `agent_runtime.session`.
+
 ## v0.7.0 — 2026-06-25
 
 ### Added
