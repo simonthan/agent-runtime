@@ -209,3 +209,37 @@ def test_no_consumer_imports_in_manager():
         assert fragment not in source, (
             f"Forbidden import/reference found in manager.py: {fragment!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# FakeSessionRepository also satisfies DurableHistoryRepository (T-036)
+# ---------------------------------------------------------------------------
+
+
+async def test_fake_session_repository_satisfies_durable_protocol():
+    """FakeSessionRepository structurally satisfies DurableHistoryRepository and
+    advertises the capability flag."""
+    from agent_runtime.session.protocol import DurableHistoryRepository
+
+    repo = FakeSessionRepository()
+    assert isinstance(repo, DurableHistoryRepository)
+    assert repo.supports_durable_history is True
+
+    sid = str(uuid4())
+    # must populate _by_id first so the ownership guard in get_conversation_history passes
+    await repo.upsert_resume_data(
+        session_id=sid, user_id="u1", bot_id="b1", resume_token="t",
+        resume_expires_at=datetime.now(UTC) + timedelta(minutes=30),
+    )
+    await repo.append_message(
+        session_id=sid, user_id="u1", bot_id="b1",
+        message={"role": "user", "content": "hi", "timestamp": "t"},
+    )
+    hist = await repo.get_conversation_history(session_id=sid, user_id="u1", bot_id="b1")
+    assert hist[0]["content"] == "hi"
+    # ownership guard
+    assert await repo.get_conversation_history(
+        session_id=sid, user_id="u2", bot_id="b1"
+    ) == []
+    rows = await repo.list_sessions(user_id="u1", bot_id="b1", limit=5)
+    assert len(rows) == 1 and rows[0].message_count == 1

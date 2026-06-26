@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import secrets
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 from agent_runtime.logging import AuditLogger, NullAuditLogger
@@ -34,7 +34,12 @@ from agent_runtime.session.events import (
 from agent_runtime.session.models import ResumeRow, SessionData
 
 if TYPE_CHECKING:
-    from agent_runtime.session.protocol import RedisClientProtocol, SessionRepositoryProtocol
+    from agent_runtime.session.models import SessionSummaryRow
+    from agent_runtime.session.protocol import (
+        DurableHistoryRepository,
+        RedisClientProtocol,
+        SessionRepositoryProtocol,
+    )
 
 
 def _utc_now() -> datetime:
@@ -84,6 +89,16 @@ class SessionManager:
         self._prefix = key_prefix
         self._max_history = max_history
         self._log: AuditLogger = logger or NullAuditLogger()
+        # T-036: opt a repo into durable history ONLY when it explicitly advertises the
+        # capability (supports_durable_history = True). A name-only isinstance gate would
+        # be satisfied by coincidental method names (ithelpdesk already collides on
+        # `list_sessions`) — the explicit flag cannot be. Repos without it (ithelpdesk)
+        # keep the prior Redis-only behaviour with zero changes.
+        self._durable: DurableHistoryRepository | None = (
+            cast("DurableHistoryRepository", session_repo)
+            if getattr(session_repo, "supports_durable_history", False)
+            else None
+        )
 
     # ------------------------------------------------------------------
     # Key builders
@@ -115,6 +130,7 @@ class SessionManager:
         initial_context: dict[str, Any] | None = None,
         client_context: dict[str, Any] | None = None,
         channel: str = "teams",
+        initial_history: list[dict[str, Any]] | None = None,
     ) -> SessionData:
         """Create a new conversation session.
 
@@ -122,6 +138,9 @@ class SessionManager:
             ValueError: if ``user_id`` or ``bot_id`` is empty/whitespace.
             SessionAlreadyActive: if (user_id, bot_id) already has an active
                 session within the idle window.
+
+        ``initial_history`` seeds Redis conversation context for a fork (T-036)
+        and is not re-persisted durably.
         """
         if not user_id or not user_id.strip():
             msg = "user_id required"
@@ -135,6 +154,13 @@ class SessionManager:
         now = _utc_now()
         resume_expires = now + self._idle_timeout
 
+        # T-036: fork seeds a prior session's transcript as Redis context only. Apply the
+        # same SEC-6 cap; the seeded history is NOT re-persisted to the durable store (it
+        # belongs to the source session_id).
+        seeded = list(initial_history or [])
+        if self._max_history is not None and len(seeded) > self._max_history:
+            seeded = seeded[-self._max_history :]
+
         session = SessionData(
             id=session_id,
             user_id=user_id,
@@ -143,7 +169,7 @@ class SessionManager:
             updated_at=now,
             data=initial_context or {},
             status="active",
-            conversation_history=[],
+            conversation_history=seeded,
             client_context=client_context or {},
         )
 
@@ -236,15 +262,12 @@ class SessionManager:
                 session.data.update(data)
 
         if add_message:
-            session.conversation_history.append(
-                {
-                    **add_message,
-                    "timestamp": _utc_now().isoformat(),
-                }
-            )
-            # SEC-6: bound history growth — drop oldest beyond the cap so a single
-            # session's serialized JSON in Redis (rewritten whole each update) cannot
-            # be bloated by message-spamming within the idle window. None => unbounded.
+            entry = {**add_message, "timestamp": _utc_now().isoformat()}
+            session.conversation_history.append(entry)
+            # SEC-6: bound Redis history growth — drop oldest beyond the cap so a single
+            # session's serialized JSON cannot be bloated by message-spamming within the
+            # idle window. None => unbounded. The durable store below keeps the FULL
+            # transcript regardless of this Redis-only cap.
             if (
                 self._max_history is not None
                 and len(session.conversation_history) > self._max_history
@@ -252,6 +275,12 @@ class SessionManager:
                 session.conversation_history = session.conversation_history[
                     -self._max_history :
                 ]
+            # T-036: durable write-through. Persists `entry` (the individual message),
+            # NOT the trimmed list, so durable completeness holds across turns even when
+            # Redis trims. Best-effort; no-op without a durable repo.
+            await self._persist_message_to_db(
+                session.id, session.user_id, session.bot_id, entry
+            )
 
         session.updated_at = _utc_now()
         await self._save_session(session)
@@ -462,6 +491,64 @@ class SessionManager:
         value = await self.redis.get(count_key)
         return max(0, int(value)) if value is not None else 0
 
+    async def fork_session(
+        self,
+        *,
+        source_session_id: str,
+        user_id: str,
+        bot_id: str,
+        client_context: dict[str, Any] | None = None,
+        channel: str = "teams",
+    ) -> SessionData:
+        """Create a new active session seeded with a past session's transcript (T-036).
+
+        Loads ``source_session_id``'s durable history (scoped to user+bot — the
+        ownership guard) and ``create_session``s a fresh session with it as
+        ``initial_history``. The forked transcript is Redis context only; it is NOT
+        re-persisted under the new session_id.
+
+        The caller MUST durably end any active session for (user_id, bot_id) first (the
+        durable end — Redis ``end_session`` + the consumer's Postgres ``mark_ended`` — is
+        the consumer's responsibility, e.g. tbp ``end_session_durable``; this library
+        owns only the Redis half). Otherwise ``create_session`` raises
+        ``SessionAlreadyActive`` (the same end→create race ``restart`` already has;
+        callers surface it as a retry/notice). If the source is unknown or not owned,
+        history is ``[]`` → a fresh empty session.
+        """
+        history: list[dict[str, Any]] = []
+        if self._durable is not None:
+            history = await self._durable.get_conversation_history(
+                session_id=source_session_id,
+                user_id=user_id,
+                bot_id=bot_id,
+            )
+        return await self.create_session(
+            user_id=user_id,
+            bot_id=bot_id,
+            client_context=client_context,
+            channel=channel,
+            initial_history=history,
+        )
+
+    async def list_sessions(
+        self,
+        *,
+        user_id: str,
+        bot_id: str,
+        limit: int = 20,
+        before: datetime | None = None,
+    ) -> list[SessionSummaryRow]:
+        """Return recent sessions for (user_id, bot_id) for the history card (T-036).
+
+        Delegates to the durable repo; returns ``[]`` when the injected repo does not
+        advertise durable support.
+        """
+        if self._durable is None:
+            return []
+        return await self._durable.list_sessions(
+            user_id=user_id, bot_id=bot_id, limit=limit, before=before
+        )
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
@@ -490,6 +577,35 @@ class SessionManager:
         except Exception as e:  # noqa: BLE001
             self._log.warning(
                 "Failed to persist resume token via repo", error=mask_telemetry(str(e))
+            )
+
+    async def _persist_message_to_db(
+        self,
+        session_id: str,
+        user_id: str,
+        bot_id: str,
+        message: dict[str, Any],
+    ) -> None:
+        """Durably persist one message (best-effort, T-036).
+
+        Best-effort by design: a durable-store outage degrades to a (permanent) gap in
+        the cold transcript rather than a failed turn — chat availability is prioritized
+        over transcript completeness (see design decision 2; the warning log is the ops
+        signal). No-op when the injected repo does not advertise durable support.
+        """
+        if self._durable is None:
+            return
+        try:
+            await self._durable.append_message(
+                session_id=session_id,
+                user_id=user_id,
+                bot_id=bot_id,
+                message=message,
+            )
+        except Exception as e:  # noqa: BLE001
+            self._log.warning(
+                "Failed to persist message to durable store",
+                error=mask_telemetry(str(e)),
             )
 
     async def _resume_from_db(

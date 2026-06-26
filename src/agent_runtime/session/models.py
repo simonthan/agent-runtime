@@ -66,3 +66,21 @@ class ResumeRow(BaseModel):
     created_at: datetime
     last_message_at: datetime | None = None
     client_context: dict[str, Any] = Field(default_factory=dict)
+
+
+class SessionSummaryRow(BaseModel):
+    """Durable per-session summary for the user-facing history list (T-036).
+
+    One row per past session of a (user_id, bot_id). ``title`` is derived by the
+    concrete repository (first user message truncated, or a persisted summary) —
+    agent-runtime defines only the wire shape. ``message_count`` is the durable
+    transcript length. ``last_message_at`` may be ``None`` for a session that never
+    exchanged a message.
+    """
+
+    id: UUID
+    title: str | None = None
+    status: str = "active"
+    created_at: datetime
+    last_message_at: datetime | None = None
+    message_count: int = 0
