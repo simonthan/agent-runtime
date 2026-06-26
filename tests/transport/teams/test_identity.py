@@ -14,6 +14,7 @@ def _turn_context(
     from_aad="",
     from_name="User One",
     recipient_id="28:app-test",
+    conversation_type="personal",
 ):
     """Build a turn_context double mirroring botbuilder's ChannelAccount shape.
 
@@ -23,11 +24,14 @@ def _turn_context(
 
     ``recipient_id`` corresponds to ``activity.recipient.id`` (the bot's ``28:…``
     channel-account id), added for T-029a channel-id capture tests.
+    ``conversation_type`` mirrors ``activity.conversation.conversation_type`` (T-031a).
     """
     activity = SimpleNamespace(
         from_property=SimpleNamespace(id=from_id, aad_object_id=from_aad, name=from_name),
         recipient=SimpleNamespace(id=recipient_id),
-        conversation=SimpleNamespace(id="conv-1", tenant_id="tenant-test"),
+        conversation=SimpleNamespace(
+            id="conv-1", tenant_id="tenant-test", conversation_type=conversation_type
+        ),
         channel_id="msteams",
         service_url="https://smba.example/",
         id="activity-1",
@@ -135,3 +139,24 @@ async def test_resolve_identity_captures_channel_ids(mock_get_member):
     assert ref is not None
     assert ref.user_channel_id == "29:alice"
     assert ref.recipient_id == "28:app-123"
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_resolve_identity_captures_channel_conversation_type(mock_get_member):
+    mock_get_member.return_value = SimpleNamespace(
+        aad_object_id="aad-1", email="u@example.com", name="User One"
+    )
+    ref = await resolve_identity(_turn_context(conversation_type="channel"))
+    assert ref is not None
+    assert ref.conversation_type == "channel"
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_resolve_identity_conversation_type_defaults_personal(mock_get_member):
+    """An activity whose conversation lacks conversation_type → 'personal' (DM-safe default)."""
+    mock_get_member.return_value = SimpleNamespace(
+        aad_object_id="aad-1", email="u@example.com", name="User One"
+    )
+    ref = await resolve_identity(_turn_context(conversation_type=""))
+    assert ref is not None
+    assert ref.conversation_type == "personal"
