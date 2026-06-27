@@ -4,6 +4,9 @@
 pass-through, per-call overrides, defaults, token-usage parsing, cache-write
 detection (incl. unknown-model branch), exception wrapping (rate-limit, API
 error, malformed response — both empty content and non-text first block).
+
+T-038a additions (tests 17-23): ``assemble_history_messages`` helper +
+``_mark_cache_control`` + ``complete()`` cache_history= param.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from agent_runtime.llm import (
     LLMResponseError,
     Message,
 )
+from agent_runtime.llm.client import assemble_history_messages, _mark_cache_control
 
 if TYPE_CHECKING:
     from .conftest import RecordingAudit
@@ -371,3 +375,141 @@ async def test_unknown_block_type_fires_warning_with_count(
     assert len(warnings) == 1
     _, _, kwargs = warnings[0]
     assert kwargs["count"] == 1
+
+
+# ── T-038a: assemble_history_messages + _mark_cache_control + cache_history= ──
+
+
+def test_assemble_history_messages_byte_identical_when_flag_false() -> None:
+    """cache_history=False → output identical to the bare role/content comprehension."""
+    history: tuple[Message, ...] = (
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+    )
+    result = assemble_history_messages(history, cache_history=False)
+    expected = [{"role": m["role"], "content": m["content"]} for m in history]
+    assert result == expected
+    # No cache_control key must appear anywhere
+    for msg in result:
+        assert "cache_control" not in msg
+        content = msg["content"]
+        if isinstance(content, list):
+            for block in content:
+                assert "cache_control" not in block
+
+
+def test_assemble_history_messages_marks_last_message_str_content() -> None:
+    """cache_history=True + str content: last message content becomes a text block
+    with cache_control; first message is unchanged (still bare str)."""
+    history: tuple[Message, ...] = (
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+    )
+    result = assemble_history_messages(history, cache_history=True)
+    # First message unchanged
+    assert result[0]["content"] == "q1"
+    assert "cache_control" not in result[0]
+    # Last message content is a text block list with cache_control
+    last_content = result[-1]["content"]
+    assert isinstance(last_content, list)
+    assert len(last_content) == 1
+    block = last_content[0]
+    assert block["type"] == "text"
+    assert block["text"] == "a1"
+    assert block["cache_control"] == {"type": "ephemeral"}
+
+
+def test_assemble_history_messages_marks_last_message_list_content() -> None:
+    """cache_history=True + block-list content: trailing block gains cache_control;
+    original input list is NOT mutated."""
+    orig_blocks = [
+        {"type": "text", "text": "part1"},
+        {"type": "text", "text": "part2"},
+    ]
+    history: tuple[Message, ...] = (
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": orig_blocks},  # type: ignore[typeddict-item]
+    )
+    result = assemble_history_messages(history, cache_history=True)
+    last_content = result[-1]["content"]
+    assert isinstance(last_content, list)
+    # Trailing block has cache_control
+    assert last_content[-1]["cache_control"] == {"type": "ephemeral"}
+    assert last_content[-1]["text"] == "part2"
+    # Earlier block unchanged
+    assert "cache_control" not in last_content[0]
+    # Original list NOT mutated
+    assert "cache_control" not in orig_blocks[-1]
+
+
+def test_assemble_history_messages_empty_history_noop() -> None:
+    """Empty history with cache_history=True → [] with no IndexError."""
+    result = assemble_history_messages((), cache_history=True)
+    assert result == []
+
+
+def test_mark_cache_control_empty_list_returned_unchanged() -> None:
+    """_mark_cache_control([]) → [] (nothing to mark, no error)."""
+    result = _mark_cache_control([])
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_complete_marks_history_when_cache_history_true(
+    client: AnthropicClient, fake_sdk: FakeAsyncAnthropic
+) -> None:
+    """complete(cache_history=True) with 2-msg history: last history message carries
+    cache_control on its trailing block; first history message does not."""
+    fake_sdk.messages.responses.append(make_ok())
+    history: tuple[Message, ...] = (
+        {"role": "user", "content": "earlier-q"},
+        {"role": "assistant", "content": "earlier-a"},
+    )
+    await client.complete(
+        static_system_prefix="STATIC",
+        history=history,
+        user_message="now",
+        cache_history=True,
+    )
+    msgs = fake_sdk.messages.captured_requests[0]["messages"]
+    # messages[-1] is the current user turn; messages[-2] is the last history msg
+    last_history_msg = msgs[-2]
+    last_history_content = last_history_msg["content"]
+    assert isinstance(last_history_content, list)
+    assert last_history_content[-1]["cache_control"] == {"type": "ephemeral"}
+    # First history message has no cache_control
+    first_history_msg = msgs[0]
+    assert "cache_control" not in first_history_msg
+    first_content = first_history_msg["content"]
+    if isinstance(first_content, list):
+        for block in first_content:
+            assert "cache_control" not in block
+
+
+@pytest.mark.asyncio
+async def test_complete_history_uncached_when_flag_false(
+    client: AnthropicClient, fake_sdk: FakeAsyncAnthropic
+) -> None:
+    """complete(cache_history=False) default: NO history message carries cache_control."""
+    fake_sdk.messages.responses.append(make_ok())
+    history: tuple[Message, ...] = (
+        {"role": "user", "content": "earlier-q"},
+        {"role": "assistant", "content": "earlier-a"},
+    )
+    await client.complete(
+        static_system_prefix="STATIC",
+        history=history,
+        user_message="now",
+        retrieval_block="RETRIEVED",
+        cache_history=False,
+    )
+    msgs = fake_sdk.messages.captured_requests[0]["messages"]
+    # All history messages (all but the last which is the current user turn)
+    for msg in msgs[:-1]:
+        assert "cache_control" not in msg
+        content = msg["content"]
+        if isinstance(content, list):
+            for block in content:
+                assert "cache_control" not in block
+        elif isinstance(content, str):
+            pass  # bare str — fine
