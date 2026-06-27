@@ -668,12 +668,10 @@ async def test_tool_loop_resume_preserves_history_marker() -> None:
     )
     assert suspended.pending_confirmation is not None
 
-    # Verify the marker is in state["messages"] before resume
+    # Verify the marker is in state["messages"] before resume.
+    # state_msgs = [user q1, assistant a1 (marked last history msg), current user turn, ...]
     state_msgs = suspended.pending_confirmation.state["messages"]
-    # First message in state is the last history msg (marked), followed by the
-    # current user turn, but the exact index depends on message order.
-    # The last history message's content should carry cache_control.
-    last_history_in_state = state_msgs[1]  # index 1 = last history msg (assistant)
+    last_history_in_state = state_msgs[1]  # index 1 = last history msg (assistant a1)
     content = last_history_in_state["content"]
     assert isinstance(content, list)
     assert content[-1]["cache_control"] == {"type": "ephemeral"}
