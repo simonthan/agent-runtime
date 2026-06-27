@@ -2,7 +2,8 @@
 
 Covers: no-tool answer, single round then answer, multiple tool_use blocks in one
 round, cap exhaustion, executor error fed back, token aggregation, and
-confirm-before-dispatch suspend/resume (T-025a).
+confirm-before-dispatch suspend/resume (T-025a). T-038a: cache_history= flag
+on run() + resume() preserves marker from state["messages"].
 """
 
 from __future__ import annotations
@@ -600,3 +601,98 @@ async def test_resume_into_cap_forces_final_call() -> None:
     assert result.stop_reason == "cap_exhausted"
     assert result.final_text == "forced final"
     assert "tools" not in sdk.messages.captured_requests[-1]
+
+
+# ── T-038a: cache_history flag on run() + resume() marker preservation ──────
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_run_marks_history_when_cache_history_true() -> None:
+    """run(cache_history=True) with history: first SDK call has cache_control on the
+    last history message; the history message before that does not."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    # No tool use — return immediately
+    sdk.messages.responses.append(make_ok(text="done"))
+    history: tuple[dict, ...] = (
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+    )
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="now",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_ok_executor,
+        max_rounds=3,
+        history=history,
+        cache_history=True,
+    )
+    msgs = sdk.messages.captured_requests[0]["messages"]
+    # messages[-1] is the current user turn; messages[-2] is the last history msg
+    last_history_msg = msgs[-2]
+    last_content = last_history_msg["content"]
+    assert isinstance(last_content, list)
+    assert last_content[-1]["cache_control"] == {"type": "ephemeral"}
+    # First history message has no cache_control
+    first_history_msg = msgs[0]
+    assert "cache_control" not in first_history_msg
+    first_content = first_history_msg["content"]
+    if isinstance(first_content, list):
+        for block in first_content:
+            assert "cache_control" not in block
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_resume_preserves_history_marker() -> None:
+    """resume() does NOT strip the cache_control marker placed by run() on the last
+    history message — the marker rides state['messages'] unchanged."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    # Suspend on a confirm-required write tool
+    sdk.messages.responses.append(
+        make_tool_use(tool_id="tu_w", name="send_email", tool_input={"to": "x"})
+    )
+    history: tuple[dict, ...] = (
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+    )
+    suspended = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[{"name": "send_email", "input_schema": {}}],
+        executor=_ok_executor,
+        max_rounds=3,
+        confirm=_CONFIRM_WRITES,
+        history=history,
+        cache_history=True,
+    )
+    assert suspended.pending_confirmation is not None
+
+    # Verify the marker is in state["messages"] before resume
+    state_msgs = suspended.pending_confirmation.state["messages"]
+    # First message in state is the last history msg (marked), followed by the
+    # current user turn, but the exact index depends on message order.
+    # The last history message's content should carry cache_control.
+    last_history_in_state = state_msgs[1]  # index 1 = last history msg (assistant)
+    content = last_history_in_state["content"]
+    assert isinstance(content, list)
+    assert content[-1]["cache_control"] == {"type": "ephemeral"}
+
+    # Now resume and check the marker is still present in the continuation call
+    sdk.messages.responses.append(make_ok(text="sent!"))
+    result = await loop.resume(
+        state=suspended.pending_confirmation.state,
+        decision=ExecuteDecision(),
+        tools=[{"name": "send_email", "input_schema": {}}],
+        executor=_ok_executor,
+        confirm=_CONFIRM_WRITES,
+        static_system_prefix="SYS",
+        max_rounds=3,
+    )
+    assert result.final_text == "sent!"
+    # The continuation call's messages should still carry the marker
+    continuation_msgs = sdk.messages.captured_requests[-1]["messages"]
+    last_history_in_cont = continuation_msgs[1]
+    cont_content = last_history_in_cont["content"]
+    assert isinstance(cont_content, list)
+    assert cont_content[-1]["cache_control"] == {"type": "ephemeral"}

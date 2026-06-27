@@ -1,9 +1,10 @@
 """``AnthropicClient`` — opinionated wrapper around the Anthropic SDK.
 
-Encodes ARCHITECTURE.md §4 decision #5: every request carries exactly two
-``cache_control`` ephemeral breakpoints — one on the static system prefix,
-one on the per-turn retrieval block. Prompt caching is GA on the Anthropic
-API (since SDK 0.39) — no ``anthropic-beta`` header is sent.
+Encodes ARCHITECTURE.md §4 decision #5 (reopened 2026-06-27): every request carries a
+``cache_control`` ephemeral breakpoint on the static system prefix and one on the
+per-turn retrieval block, plus an OPTIONAL third on the conversation-history prefix
+(``cache_history=True``). Prompt caching is GA on the Anthropic API (since SDK 0.39) —
+no ``anthropic-beta`` header is sent.
 
 The SDK client is dependency-injected via constructor (real ``AsyncAnthropic``
 or a fake satisfying the same structural Protocol). This enables (a) shared
@@ -40,7 +41,7 @@ from agent_runtime.llm.errors import (
 from agent_runtime.llm.models import ClaudeResponse, History, ToolUseBlock
 from agent_runtime.logging import AuditLogger, NullAuditLogger
 
-__all__ = ["AnthropicClient"]
+__all__ = ["AnthropicClient", "assemble_history_messages"]
 
 
 _CACHE_MIN_TOKENS: dict[str, int] = {
@@ -65,6 +66,45 @@ def _cache_threshold_hint(model: str) -> tuple[int, bool]:
         return _DEFAULT_CACHE_HINT, True
     _, n = max(matches, key=lambda pair: len(pair[0]))
     return n, False
+
+
+def assemble_history_messages(
+    history: History | tuple[Any, ...], *, cache_history: bool = False
+) -> list[dict[str, Any]]:
+    """Project conversation ``history`` into SDK message dicts.
+
+    With ``cache_history=True`` AND non-empty history, a single ``cache_control``
+    ephemeral breakpoint is placed on the LAST block of the LAST history message — the
+    stable conversation prefix. Anthropic then incrementally caches the growing history
+    across turns (turn N's prefix = turn N-1's cached prefix + one new exchange).
+
+    With ``cache_history=False`` (the default) the output is byte-identical to the prior
+    ``[{"role": m["role"], "content": m["content"]} for m in history]`` projection — the
+    regression guarantee for existing callers (ithelpdesk). See ARCHITECTURE.md §4 #5
+    (reopened 2026-06-27 to permit a third, opt-in breakpoint).
+    """
+    messages = [{"role": m["role"], "content": m["content"]} for m in history]
+    if cache_history and messages:
+        messages[-1] = {
+            "role": messages[-1]["role"],
+            "content": _mark_cache_control(messages[-1]["content"]),
+        }
+    return messages
+
+
+def _mark_cache_control(content: Any) -> Any:
+    """Return ``content`` with a ``cache_control`` ephemeral marker on its last block.
+
+    ``str`` content becomes a one-element text block list; a block list is copied (the
+    caller's list is never mutated) with the marker merged onto the trailing dict block.
+    Empty lists or a non-dict trailing block are returned unchanged — nothing to mark.
+    """
+    cc = {"type": "ephemeral"}
+    if isinstance(content, str):
+        return [{"type": "text", "text": content, "cache_control": cc}]
+    if isinstance(content, list) and content and isinstance(content[-1], dict):
+        return [*content[:-1], {**content[-1], "cache_control": cc}]
+    return content
 
 
 class _AnthropicMessages(Protocol):
@@ -197,16 +237,20 @@ class AnthropicClient:
         history: History = (),
         retrieval_block: str | None = None,
         tools: list[dict[str, Any]] | None = None,
+        cache_history: bool = False,
         max_tokens: int | None = None,
         temperature: float | None = None,
         model: str | None = None,
     ) -> ClaudeResponse:
-        """Send a completion request with two ``cache_control`` ephemeral breakpoints.
+        """Send a completion request with ``cache_control`` ephemeral breakpoints.
 
         Breakpoint #1: ``static_system_prefix`` (always cached).
         Breakpoint #2: ``retrieval_block`` (cached when present; prepended to user_message).
+        Breakpoint #3 (opt-in): the last history message, marked when
+        ``cache_history=True`` and ``history`` is non-empty — caches the stable
+        conversation prefix so multi-turn sessions read it from cache (T-038a).
 
-        ``dynamic_system_suffix`` and ``history`` are passed through uncached.
+        ``dynamic_system_suffix`` is passed through uncached.
 
         Delegates to ``complete_messages`` after assembling blocks. ``tools`` is
         passed verbatim; ``None`` omits the param entirely (D5 — byte-identical
@@ -231,9 +275,9 @@ class AnthropicClient:
             )
         user_content.append({"type": "text", "text": user_message})
 
-        messages: list[dict[str, Any]] = [
-            {"role": m["role"], "content": m["content"]} for m in history
-        ]
+        messages: list[dict[str, Any]] = assemble_history_messages(
+            history, cache_history=cache_history
+        )
         messages.append({"role": "user", "content": user_content})
 
         return await self.complete_messages(

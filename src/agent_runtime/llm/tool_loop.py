@@ -23,7 +23,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from agent_runtime.llm.client import AnthropicClient
+from agent_runtime.llm.client import AnthropicClient, assemble_history_messages
 from agent_runtime.logging import AuditLogger, NullAuditLogger
 
 __all__ = [
@@ -163,6 +163,7 @@ class ToolUseLoop:
         dynamic_system_suffix: str | None = None,
         retrieval_block: str | None = None,
         history: tuple[dict[str, Any], ...] = (),
+        cache_history: bool = False,
         model: str | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
@@ -177,7 +178,12 @@ class ToolUseLoop:
         BEFORE PATH A/B classification — a suspended turn is neither A nor B.
 
         `max_rounds=N` issues up to N+1 SDK calls (N tool rounds + 1 final no-tools
-        call). With `confirm=None` (default) behaviour is byte-for-byte unchanged."""
+        call). With `confirm=None` (default) behaviour is byte-for-byte unchanged.
+
+        `cache_history=True` marks the last history message with a ``cache_control``
+        ephemeral breakpoint so Anthropic caches the stable history prefix across
+        turns. `cache_history=False` (default) keeps behaviour byte-for-byte
+        unchanged — the regression guarantee for existing callers (T-038a)."""
         system_blocks = self._build_system_blocks(static_system_prefix, dynamic_system_suffix)
         first_user: list[dict[str, Any]] = []
         if retrieval_block:
@@ -185,9 +191,9 @@ class ToolUseLoop:
                 {"type": "text", "text": retrieval_block, "cache_control": {"type": "ephemeral"}}
             )
         first_user.append({"type": "text", "text": user_message})
-        messages: list[dict[str, Any]] = [
-            {"role": m["role"], "content": m["content"]} for m in history
-        ]
+        messages: list[dict[str, Any]] = assemble_history_messages(
+            history, cache_history=cache_history
+        )
         messages.append({"role": "user", "content": first_user})
 
         return await self._drive(
@@ -236,6 +242,7 @@ class ToolUseLoop:
         IDEMPOTENCY: resume CONSUMES `state` (it appends to the live `messages` list).
         Re-resuming the same `state` object is undefined — persist a fresh copy per
         attempt if you need to retry."""
+        # cache_history: no param — the run()-time history marker rides state["messages"].
         system_blocks = self._build_system_blocks(static_system_prefix, dynamic_system_suffix)
         messages: list[dict[str, Any]] = state["messages"]
         steps: list[ToolLoopStep] = [self._step_from_dict(s) for s in state["steps"]]

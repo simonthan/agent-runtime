@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.10.0 — 2026-06-27
+
+### Added
+- `AnthropicClient.complete(..., cache_history=False)` and
+  `ToolUseLoop.run(..., cache_history=False)` — opt-in third `cache_control` ephemeral
+  breakpoint on the last conversation-history message. When `True` and history is
+  non-empty, Anthropic incrementally caches the stable history prefix across turns
+  (~20–30% input-token cut on 3+ turn sessions). Default `False` keeps message assembly
+  byte-identical for existing callers (ithelpdesk). New exported helper
+  `assemble_history_messages(history, *, cache_history)`. Reopens ARCHITECTURE.md §4 #5
+  ("two breakpoints") to permit a third; the 5-min TTL choice is unchanged.
+
 ## v0.9.0 — 2026-06-26
 
 ### Added
