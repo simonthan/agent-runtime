@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.11.0 — 2026-06-28
+
+### Added
+- `FileAttachment` dataclass + `InboundMessage.attachments: tuple[FileAttachment, ...]`
+  (default empty tuple) — surfaces Teams file uploads. The adapter parses
+  `turn_context.activity.attachments`, keeping only attachments with
+  `contentType == "application/vnd.microsoft.teams.file.download.info"` and a
+  non-empty `content.uniqueId` (the OneDrive driveItem id used for read-on-demand);
+  everything else (inline images, cards) is ignored. Exported from
+  `agent_runtime.transport.teams`; `make_inbound_message(attachments=…)` +
+  `make_file_attachment` added to the testing helpers. Byte-identical for any
+  message without a readable file attachment (empty tuple). Enables consumer
+  file-capture into user Projects (tbp T-037c).
+
 ## v0.10.0 — 2026-06-27
 
 ### Added
