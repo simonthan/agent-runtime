@@ -15,6 +15,7 @@ from botbuilder.core import TurnContext
 from botbuilder.schema import (
     Activity,
     ActivityTypes,
+    Attachment,
     ChannelAccount,
     ConversationAccount,
     InvokeResponse,
@@ -222,3 +223,118 @@ async def test_dm_message_without_mention_unchanged(mock_get_member):
     await adapter._handler.on_turn(tc)
 
     assert handler.events[0].text == "plain dm question"
+
+
+# ---------------------------------------------------------------------------
+# FileAttachment parsing tests (T-037c-a)
+# ---------------------------------------------------------------------------
+
+
+def _file_download_attachment(
+    *, unique_id: str = "drive-item-1", file_type: str = "docx", name: str = "report.docx"
+) -> Attachment:
+    return Attachment(
+        content_type="application/vnd.microsoft.teams.file.download.info",
+        name=name,
+        content={
+            "uniqueId": unique_id,
+            "fileType": file_type,
+            "downloadUrl": "https://example.invalid/dl",
+        },
+    )
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_message_with_file_upload_surfaces_attachment(mock_get_member):
+    mock_get_member.return_value = SimpleNamespace(
+        aad_object_id="aad-1", email="u@example.com", name="User One"
+    )
+    handler = _CapturingHandler()
+    adapter = TeamsAdapter(TeamsAdapterConfig("aid", "pwd", "tid"), handler)
+    activity = _make_activity(
+        ActivityTypes.message, text="summarize this", attachments=[_file_download_attachment()]
+    )
+    tc = TurnContext(adapter._adapter, activity)
+    await adapter._handler.on_turn(tc)
+    msg = handler.events[0]
+    assert isinstance(msg, InboundMessage)
+    assert len(msg.attachments) == 1
+    assert msg.attachments[0].item_id == "drive-item-1"
+    assert msg.attachments[0].file_type == "docx"
+    assert msg.attachments[0].name == "report.docx"
+    assert msg.text == "summarize this"
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_message_without_attachments_is_empty_tuple(mock_get_member):
+    mock_get_member.return_value = SimpleNamespace(
+        aad_object_id="aad-1", email="u@example.com", name="User One"
+    )
+    handler = _CapturingHandler()
+    adapter = TeamsAdapter(TeamsAdapterConfig("aid", "pwd", "tid"), handler)
+    tc = TurnContext(adapter._adapter, _make_activity(ActivityTypes.message, text="hi"))
+    await adapter._handler.on_turn(tc)
+    assert handler.events[0].attachments == ()
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_non_file_attachment_ignored(mock_get_member):
+    mock_get_member.return_value = SimpleNamespace(
+        aad_object_id="aad-1", email="u@example.com", name="User One"
+    )
+    handler = _CapturingHandler()
+    adapter = TeamsAdapter(TeamsAdapterConfig("aid", "pwd", "tid"), handler)
+    img = Attachment(content_type="image/png", name="pic.png", content_url="https://x.invalid/p")
+    tc = TurnContext(adapter._adapter, _make_activity(ActivityTypes.message, attachments=[img]))
+    await adapter._handler.on_turn(tc)
+    assert handler.events[0].attachments == ()
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_file_attachment_missing_unique_id_skipped(mock_get_member):
+    mock_get_member.return_value = SimpleNamespace(
+        aad_object_id="aad-1", email="u@example.com", name="User One"
+    )
+    handler = _CapturingHandler()
+    adapter = TeamsAdapter(TeamsAdapterConfig("aid", "pwd", "tid"), handler)
+    bad = Attachment(
+        content_type="application/vnd.microsoft.teams.file.download.info",
+        name="x.docx",
+        content={"fileType": "docx"},  # no uniqueId → cannot be read back → dropped
+    )
+    tc = TurnContext(adapter._adapter, _make_activity(ActivityTypes.message, attachments=[bad]))
+    await adapter._handler.on_turn(tc)
+    assert handler.events[0].attachments == ()
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_only_file_attachments_surfaced_from_mixed_list(mock_get_member):
+    mock_get_member.return_value = SimpleNamespace(
+        aad_object_id="aad-1", email="u@example.com", name="User One"
+    )
+    handler = _CapturingHandler()
+    adapter = TeamsAdapter(TeamsAdapterConfig("aid", "pwd", "tid"), handler)
+    img = Attachment(content_type="image/png", name="pic.png", content_url="https://x.invalid/p")
+    activity = _make_activity(ActivityTypes.message, attachments=[img, _file_download_attachment()])
+    await adapter._handler.on_turn(TurnContext(adapter._adapter, activity))
+    assert len(handler.events[0].attachments) == 1
+    assert handler.events[0].attachments[0].item_id == "drive-item-1"
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_string_content_is_parsed(mock_get_member):
+    """An upstream serializer may hand content as a JSON string; it must still parse."""
+    mock_get_member.return_value = SimpleNamespace(
+        aad_object_id="aad-1", email="u@example.com", name="User One"
+    )
+    handler = _CapturingHandler()
+    adapter = TeamsAdapter(TeamsAdapterConfig("aid", "pwd", "tid"), handler)
+    att = Attachment(
+        content_type="application/vnd.microsoft.teams.file.download.info",
+        name="report.docx",
+        content='{"uniqueId": "drive-item-2", "fileType": "docx"}',
+    )
+    await adapter._handler.on_turn(
+        TurnContext(adapter._adapter, _make_activity(ActivityTypes.message, attachments=[att]))
+    )
+    assert handler.events[0].attachments[0].item_id == "drive-item-2"
