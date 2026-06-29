@@ -69,15 +69,19 @@ def _extract_file_attachments(raw: list | None) -> tuple[FileAttachment, ...]:
                 continue
         if not isinstance(content, dict):
             continue
-        item_id = str(content.get("uniqueId") or "")
-        if not item_id:
+        item_id = content.get("uniqueId")
+        if not isinstance(item_id, str) or not item_id:
+            # A non-string uniqueId (adversarial JSON) is not a readable driveItem
+            # id; coercing it would smuggle junk into FileAttachment.item_id.
             continue
+        file_type = content.get("fileType")
+        download_url = content.get("downloadUrl")
         out.append(
             FileAttachment(
                 item_id=item_id,
                 name=getattr(a, "name", None) or "",
-                file_type=str(content.get("fileType") or "").lower(),
-                download_url=str(content.get("downloadUrl") or ""),
+                file_type=file_type.lower() if isinstance(file_type, str) else "",
+                download_url=download_url if isinstance(download_url, str) else "",
             )
         )
     return tuple(out)

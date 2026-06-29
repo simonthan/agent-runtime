@@ -308,6 +308,24 @@ async def test_file_attachment_missing_unique_id_skipped(mock_get_member):
 
 
 @patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_file_attachment_non_string_unique_id_skipped(mock_get_member):
+    """A non-string uniqueId (adversarial JSON) must NOT be coerced into an item_id."""
+    mock_get_member.return_value = SimpleNamespace(
+        aad_object_id="aad-1", email="u@example.com", name="User One"
+    )
+    handler = _CapturingHandler()
+    adapter = TeamsAdapter(TeamsAdapterConfig("aid", "pwd", "tid"), handler)
+    bad = Attachment(
+        content_type="application/vnd.microsoft.teams.file.download.info",
+        name="x.docx",
+        content={"uniqueId": {"nested": "junk"}, "fileType": ["docx"]},  # type-confused
+    )
+    tc = TurnContext(adapter._adapter, _make_activity(ActivityTypes.message, attachments=[bad]))
+    await adapter._handler.on_turn(tc)
+    assert handler.events[0].attachments == ()
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
 async def test_only_file_attachments_surfaced_from_mixed_list(mock_get_member):
     mock_get_member.return_value = SimpleNamespace(
         aad_object_id="aad-1", email="u@example.com", name="User One"
