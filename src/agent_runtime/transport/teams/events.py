@@ -74,12 +74,32 @@ def conversation_ref_from_dict(data: dict[str, str]) -> ConversationRef:
 
 
 @dataclass(frozen=True, slots=True)
+class FileAttachment:
+    """A Teams file upload surfaced on an inbound message.
+
+    Teams stores a 1:1 chat file upload in the *sender's* OneDrive and delivers it
+    as an activity attachment whose ``contentType`` is
+    ``application/vnd.microsoft.teams.file.download.info``. ``item_id`` is the
+    OneDrive driveItem id (``content.uniqueId``) — the ``resource_id`` a consumer
+    passes to a drive read (e.g. eyeglass ``read_resource(type="drive")``).
+    ``file_type`` is ``content.fileType`` (e.g. ``"docx"``, lowercase, no dot; may
+    be ``""``). ``download_url`` is a pre-authenticated, time-limited URL — NOT used
+    for durable read-on-demand, surfaced only for completeness."""
+
+    item_id: str
+    name: str
+    file_type: str = ""
+    download_url: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class InboundMessage:
     """User text message or Adaptive Card Action.Submit payload."""
 
     conversation_ref: ConversationRef
     text: str = ""  # may be empty when value is set
     value: dict | None = None  # Adaptive Card Action.Submit data
+    attachments: tuple[FileAttachment, ...] = field(default_factory=tuple)  # T-037c
     kind: Literal["message"] = "message"
 
 

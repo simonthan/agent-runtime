@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -22,6 +23,7 @@ from botbuilder.schema import (
 
 from agent_runtime.transport.teams.events import (
     ConversationRef,
+    FileAttachment,
     InboundInvoke,
     InboundMembersAdded,
     InboundMessage,
@@ -35,6 +37,50 @@ if TYPE_CHECKING:
     from agent_runtime.transport.teams.protocol import TeamsHandler
 
 logger = logging.getLogger(__name__)
+
+# Teams delivers a 1:1 chat file upload as an attachment with this contentType;
+# its `content.uniqueId` is the OneDrive driveItem id (the read-on-demand key).
+_TEAMS_FILE_DOWNLOAD_INFO = "application/vnd.microsoft.teams.file.download.info"
+
+
+def _extract_file_attachments(raw: list | None) -> tuple[FileAttachment, ...]:
+    """Pull Teams file uploads off an inbound activity.
+
+    Surfaces ONLY attachments that (a) carry the Teams file-download contentType,
+    (b) have a parseable ``content`` (dict, or a JSON-string an upstream serializer
+    left unparsed), and (c) expose a non-empty ``uniqueId`` (the OneDrive item id
+    required to read the file back). Inline images, Adaptive Cards, and link
+    unfurls are ignored, so a message with no readable file attachment yields an
+    empty tuple — byte-identical to the prior behaviour. A file-download attachment
+    whose content can't be parsed is logged at debug and skipped (observable, not a
+    silent vanish)."""
+    if not raw:
+        return ()
+    out: list[FileAttachment] = []
+    for a in raw:
+        if getattr(a, "content_type", None) != _TEAMS_FILE_DOWNLOAD_INFO:
+            continue
+        content = getattr(a, "content", None)
+        if isinstance(content, str):  # botbuilder does not recursively parse string content
+            try:
+                content = json.loads(content)
+            except (ValueError, TypeError):
+                logger.debug("Unparseable file.download.info content; skipping attachment")
+                continue
+        if not isinstance(content, dict):
+            continue
+        item_id = str(content.get("uniqueId") or "")
+        if not item_id:
+            continue
+        out.append(
+            FileAttachment(
+                item_id=item_id,
+                name=getattr(a, "name", None) or "",
+                file_type=str(content.get("fileType") or "").lower(),
+                download_url=str(content.get("downloadUrl") or ""),
+            )
+        )
+    return tuple(out)
 
 
 @dataclass(frozen=True)
@@ -70,6 +116,7 @@ class _EventDispatchingHandler(ActivityHandler):
             conversation_ref=ref,
             text=mention_stripped.strip(),
             value=raw_value if isinstance(raw_value, dict) else None,
+            attachments=_extract_file_attachments(turn_context.activity.attachments),
         )
         await self._handler.on_event(event, BotFrameworkOutboundChannel(turn_context))
 
