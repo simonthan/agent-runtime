@@ -1,7 +1,8 @@
 """Test doubles and factory helpers for consumers of the Teams transport.
 
 Public surface: ``FakeOutboundChannel``, ``make_conversation_ref``,
-``make_inbound_message``, ``make_inbound_members_added``, ``make_inbound_invoke``.
+``make_file_attachment``, ``make_inbound_message``, ``make_inbound_members_added``,
+``make_inbound_invoke``.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from dataclasses import dataclass, field
 
 from agent_runtime.transport.teams.events import (
     ConversationRef,
+    FileAttachment,
     InboundInvoke,
     InboundMembersAdded,
     InboundMessage,
@@ -66,12 +68,26 @@ def make_conversation_ref(**overrides: str) -> ConversationRef:
 def make_inbound_message(
     text: str = "hello",
     value: dict | None = None,
+    attachments: tuple[FileAttachment, ...] = (),
     **ref_overrides: str,
 ) -> InboundMessage:
     return InboundMessage(
         conversation_ref=make_conversation_ref(**ref_overrides),
         text=text,
         value=value,
+        attachments=attachments,
+    )
+
+
+def make_file_attachment(
+    item_id: str = "item-1",
+    name: str = "report.docx",
+    file_type: str = "docx",
+    download_url: str = "https://example.invalid/download",
+) -> FileAttachment:
+    """Build a ``FileAttachment`` test double with sensible defaults."""
+    return FileAttachment(
+        item_id=item_id, name=name, file_type=file_type, download_url=download_url
     )
 
 

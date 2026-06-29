@@ -8,12 +8,13 @@ Public surface:
 - ``TeamsAdapter`` + ``TeamsAdapterConfig`` — wraps BotFrameworkAdapter
 - ``TeamsHandler`` Protocol — consumer implements ``on_event``
 - ``OutboundChannel`` Protocol + ``BotFrameworkOutboundChannel`` impl
-- ``ConversationRef`` + ``InboundMessage`` / ``InboundMembersAdded`` / ``InboundInvoke``
+- ``ConversationRef`` + ``FileAttachment`` + ``InboundMessage`` / ``InboundMembersAdded``
+  / ``InboundInvoke``
 - ``InvokeResponse`` (re-exported from botbuilder.schema for invoke return values)
 
 Testing helpers in ``agent_runtime.transport.teams.testing``:
-- ``FakeOutboundChannel``, ``make_inbound_message``, ``make_inbound_members_added``,
-  ``make_inbound_invoke``
+- ``FakeOutboundChannel``, ``make_file_attachment``, ``make_inbound_message``,
+  ``make_inbound_members_added``, ``make_inbound_invoke``
 """
 
 from botbuilder.schema import InvokeResponse
@@ -21,6 +22,7 @@ from botbuilder.schema import InvokeResponse
 from agent_runtime.transport.teams.adapter import TeamsAdapter, TeamsAdapterConfig
 from agent_runtime.transport.teams.events import (
     ConversationRef,
+    FileAttachment,
     InboundEvent,
     InboundInvoke,
     InboundMembersAdded,
@@ -34,6 +36,7 @@ from agent_runtime.transport.teams.protocol import TeamsHandler
 __all__ = [
     "BotFrameworkOutboundChannel",
     "ConversationRef",
+    "FileAttachment",
     "InboundEvent",
     "InboundInvoke",
     "InboundMembersAdded",
