@@ -16,4 +16,27 @@ Consumed by teams-bot-platform and ithelpdesk via git-pinned dependency.
 See the three-layer reuse model in teams-bot-platform/ARCHITECTURE.md §2.
 """
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
+
+from agent_runtime.observability import (
+    RequestIDMiddleware,
+    clear_request_id,
+    error_envelope,
+    generate_request_id,
+    get_or_create_request_id,
+    get_request_id,
+    request_id_log_fields,
+    set_request_id,
+)
+
+__all__ = [
+    "RequestIDMiddleware",
+    "__version__",
+    "clear_request_id",
+    "error_envelope",
+    "generate_request_id",
+    "get_or_create_request_id",
+    "get_request_id",
+    "request_id_log_fields",
+    "set_request_id",
+]

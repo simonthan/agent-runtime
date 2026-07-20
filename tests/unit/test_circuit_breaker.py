@@ -268,6 +268,47 @@ class TestRetryAfterSeconds:
         assert breaker.retry_after_seconds() == 0.0
 
 
+class TestCancelledErrorClassification:
+    """T-063a: CancelledError inside `async with breaker:` is neither success nor failure."""
+
+    async def test_cancelled_error_does_not_trip(self):
+        config = CircuitBreakerConfig(failure_threshold=3)
+        breaker = CircuitBreaker("test", config)
+
+        for _ in range(5):
+            try:
+                async with breaker:
+                    raise asyncio.CancelledError
+            except asyncio.CancelledError:
+                pass
+
+        assert breaker.is_closed
+        assert breaker._failure_count == 0
+        assert breaker._total_failures == 0
+
+    async def test_cancelled_error_does_not_reset_failures(self):
+        breaker = CircuitBreaker("test")
+
+        await breaker.record_failure()
+        await breaker.record_failure()
+        assert breaker._failure_count == 2
+
+        try:
+            async with breaker:
+                raise asyncio.CancelledError
+        except asyncio.CancelledError:
+            pass
+
+        assert breaker._failure_count == 2
+
+    async def test_cancelled_error_reraises(self):
+        breaker = CircuitBreaker("test")
+
+        with pytest.raises(asyncio.CancelledError):
+            async with breaker:
+                raise asyncio.CancelledError
+
+
 class TestRecordFailureMasking:
     """SEC-2: secrets/PII in a recorded failure's exception text must be masked."""
 
