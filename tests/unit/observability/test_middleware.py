@@ -65,6 +65,42 @@ async def test_reuses_inbound_header():
     assert header_value == b"proxy-123"
 
 
+async def test_rejects_inbound_with_control_chars():
+    # A permissive ASGI server can pass non-CRLF control bytes through. Such a
+    # value must NOT be reflected/bound — a fresh UUID4 is generated instead.
+    captured: dict[str, Any] = {}
+    inner = _make_inner_app(captured)
+    middleware = RequestIDMiddleware(inner)
+    messages, send = _make_send()
+
+    evil = b"abc\x1b[31mred\x07"
+    await middleware({"type": "http", "headers": [(b"x-request-id", evil)]}, _receive, send)
+
+    assert captured["request_id"] != evil.decode("latin-1")
+    assert "\x1b" not in captured["request_id"] and "\x07" not in captured["request_id"]
+    header_value = next(
+        v
+        for m in messages
+        if m["type"] == "http.response.start"
+        for name, v in m["headers"]
+        if name == b"x-request-id"
+    )
+    assert header_value == captured["request_id"].encode("latin-1")
+
+
+async def test_rejects_oversized_inbound():
+    captured: dict[str, Any] = {}
+    inner = _make_inner_app(captured)
+    middleware = RequestIDMiddleware(inner)
+    _, send = _make_send()
+
+    huge = b"a" * 500  # exceeds the 128-char cap
+    await middleware({"type": "http", "headers": [(b"x-request-id", huge)]}, _receive, send)
+
+    assert captured["request_id"] != huge.decode("latin-1")
+    assert len(captured["request_id"]) <= 128
+
+
 async def test_contextvar_reset_after_request():
     captured: dict[str, Any] = {}
     inner = _make_inner_app(captured)

@@ -9,6 +9,7 @@ wrap any ASGI app directly. Depends on nothing outside the stdlib + this package
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -18,6 +19,15 @@ from agent_runtime.observability.request_context import _request_id_var
 Scope = dict[str, Any]
 Receive = Callable[[], Awaitable[dict[str, Any]]]
 Send = Callable[[dict[str, Any]], Awaitable[None]]
+
+# Accept only a conservative id charset (letters, digits, and ``. _ : -``) up to
+# 128 chars — covers UUIDs and common proxy/trace ids. An inbound X-Request-ID
+# that fails this (control/escape bytes a permissive ASGI server like httptools
+# can pass through, or an oversized value) is rejected and a fresh UUID4 is
+# generated instead, so attacker-controlled bytes are never reflected into the
+# response header, bound to the contextvar, or written into every log line
+# (log-injection / amplification defense-in-depth).
+_SAFE_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 
 
 class RequestIDMiddleware:
@@ -50,5 +60,6 @@ class RequestIDMiddleware:
     def _extract(self, scope: Scope) -> str | None:
         for name, value in scope.get("headers", []):
             if name.lower() == self._header:
-                return value.decode("latin-1")
+                candidate = value.decode("latin-1")
+                return candidate if _SAFE_REQUEST_ID_RE.fullmatch(candidate) else None
         return None
