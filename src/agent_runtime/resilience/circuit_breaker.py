@@ -232,6 +232,14 @@ class CircuitBreaker:
         """Context manager exit - record success or failure."""
         if exc_type is None:
             await self.record_success()
+        elif issubclass(exc_type, asyncio.CancelledError):
+            # T-063a: caller-side cancellation (e.g. a turn-level LLM deadline's
+            # asyncio.wait_for) is NOT a service failure — the caller gave up; the
+            # downstream service may be perfectly healthy. Counting it would let a
+            # few slow turns open the SHARED breaker and degrade every other user's
+            # fast turns for recovery_timeout seconds. It is also NOT a success (it
+            # must not reset the failure count). Record neither; re-raise below.
+            pass
         else:
             await self.record_failure(exc_val)
         return False  # Don't suppress exceptions

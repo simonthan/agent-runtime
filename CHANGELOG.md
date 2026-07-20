@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.12.0 — 2026-07-19
+
+### Added
+- `agent_runtime.observability` — correlation-ID + error-envelope primitives (T-060a).
+  - `RequestIDMiddleware`: pure-ASGI (no new dependency) middleware that reuses an inbound
+    `X-Request-ID` header or generates a UUID4, binds it to a request contextvar for the
+    request's duration, and echoes it on the response `X-Request-ID` header. Register via
+    `app.add_middleware(RequestIDMiddleware)` on any Starlette/FastAPI app.
+  - `get_request_id` / `set_request_id` / `generate_request_id` / `clear_request_id` /
+    `get_or_create_request_id`: contextvar accessors that thread the id across async
+    boundaries so the runtime's OWN log lines carry it.
+  - `request_id_log_fields()`: audit-inject hook returning `{"request_id": <id>}` when set,
+    `{}` when unset (no-op safe) — consumers fold it into log kwargs.
+  - `error_envelope(...)`: pure-data helper producing
+    `{error, error_code, detail, request_id, timestamp}` (request_id defaults to the
+    contextvar; timestamp to UTC ISO-8601).
+  - Re-exported at top level (`from agent_runtime import ...`) and from
+    `agent_runtime.observability`. Opt-in: middleware must be registered by the consumer;
+    existing consumers that don't register it are byte-identical.
+
+### Fixed
+- Circuit breaker (`resilience.circuit_breaker`): `asyncio.CancelledError` raised inside an
+  `async with breaker:` block is now classified as **neither success nor failure** and re-raised
+  (T-063a). A caller-side deadline/timeout cancellation no longer counts toward the failure
+  threshold (can't trip the SHARED breaker) nor resets it. Ports ithelpdesk's T-617 rule.
+
 ## v0.11.0 — 2026-06-28
 
 ### Added
