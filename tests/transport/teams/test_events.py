@@ -11,7 +11,7 @@ from agent_runtime.transport.teams.events import (
     conversation_ref_from_dict,
     conversation_ref_to_dict,
 )
-from agent_runtime.transport.teams.testing import make_conversation_ref
+from agent_runtime.transport.teams.testing import make_conversation_ref, make_inline_image
 
 
 def test_conversation_ref_is_frozen():
@@ -95,3 +95,17 @@ def test_inline_image_attachment_name_defaults_empty():
         content_url="https://smba.trafficmanager.net/x", content_type="image/*"
     )
     assert img.name == ""
+
+
+def test_make_inline_image_test_double_defaults():
+    img = make_inline_image()
+    assert isinstance(img, InlineImageAttachment)
+    assert img.content_type == "image/*"
+    assert img.name == ""
+    assert img.content_url != ""
+
+
+def test_make_inline_image_overrides():
+    img = make_inline_image(content_url="https://smba.trafficmanager.net/x", name="photo.jpg")
+    assert img.content_url == "https://smba.trafficmanager.net/x"
+    assert img.name == "photo.jpg"
