@@ -146,3 +146,22 @@ async def test_permission_error_from_token_acquisition_surfaces_as_download_erro
         pytest.raises(InlineImageDownloadError),
     ):
         await download_inline_image(att, _CREDENTIALS, client=client)
+
+
+def test_credentials_repr_excludes_password():
+    assert "pwd" not in repr(_CREDENTIALS)
+    assert "aid" in repr(_CREDENTIALS)
+
+
+async def test_redirect_not_followed_off_allowlist():
+    def _redirect_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "smba.trafficmanager.net":
+            return httpx.Response(302, headers={"location": "https://evil.example/x"})
+        pytest.fail("redirect was followed off the allowlisted host")
+
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/r")
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_redirect_handler), follow_redirects=True
+    )
+    with pytest.raises(InlineImageDownloadError):
+        await download_inline_image(att, _CREDENTIALS, client=client)

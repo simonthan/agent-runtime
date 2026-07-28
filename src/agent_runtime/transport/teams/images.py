@@ -12,7 +12,7 @@ so the host allowlist below is a security boundary, not a convenience check.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
@@ -50,7 +50,7 @@ class BotFrameworkCredentials:
     """
 
     app_id: str
-    app_password: str
+    app_password: str = field(repr=False)  # secret — keep out of repr/tracebacks
     tenant_id: str
 
 
@@ -98,7 +98,9 @@ async def _stream_download(
     max_bytes: int,
 ) -> DownloadedImage:
     """Stream the GET response, enforcing the size cap and image Content-Type."""
-    async with client.stream("GET", url, headers=headers) as response:
+    # follow_redirects pinned False even if an injected client enables it: a
+    # redirect must never carry the fetch off the allowlisted host.
+    async with client.stream("GET", url, headers=headers, follow_redirects=False) as response:
         if response.status_code != httpx.codes.OK:
             status = response.status_code
             msg = f"Inline image download failed with HTTP status {status}"
@@ -141,8 +143,8 @@ async def download_inline_image(
     """
     hosts = allowed_hosts if allowed_hosts is not None else _DEFAULT_ALLOWED_HOSTS
     if not _host_is_allowed(att.content_url, hosts):
-        content_url = att.content_url
-        msg = f"Refusing to attach a connector token to a non-allowlisted host: {content_url!r}"
+        host = urlsplit(att.content_url).hostname
+        msg = f"Refusing to attach a connector token to a non-allowlisted host: {host!r}"
         raise InlineImageDownloadError(msg)
 
     token = await _acquire_token(credentials)
