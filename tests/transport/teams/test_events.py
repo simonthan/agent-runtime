@@ -7,10 +7,11 @@ from agent_runtime.transport.teams.events import (
     InboundInvoke,
     InboundMembersAdded,
     InboundMessage,
+    InlineImageAttachment,
     conversation_ref_from_dict,
     conversation_ref_to_dict,
 )
-from agent_runtime.transport.teams.testing import make_conversation_ref
+from agent_runtime.transport.teams.testing import make_conversation_ref, make_inline_image
 
 
 def test_conversation_ref_is_frozen():
@@ -73,3 +74,38 @@ def test_conversation_ref_from_dict_empty_conversation_type_coerces_personal():
     legacy = conversation_ref_to_dict(make_conversation_ref())
     legacy["conversation_type"] = ""
     assert conversation_ref_from_dict(legacy).conversation_type == "personal"
+
+
+def test_inbound_message_images_defaults_to_empty_tuple():
+    """T-067a: InboundMessage.images is additive and dormant for existing consumers."""
+    msg = InboundMessage(conversation_ref=make_conversation_ref(), text="hi")
+    assert msg.images == ()
+
+
+def test_inline_image_attachment_is_frozen():
+    img = InlineImageAttachment(
+        content_url="https://smba.trafficmanager.net/x", content_type="image/*"
+    )
+    with pytest.raises(AttributeError):
+        img.content_url = "https://other.invalid"  # type: ignore[misc]
+
+
+def test_inline_image_attachment_name_defaults_empty():
+    img = InlineImageAttachment(
+        content_url="https://smba.trafficmanager.net/x", content_type="image/*"
+    )
+    assert img.name == ""
+
+
+def test_make_inline_image_test_double_defaults():
+    img = make_inline_image()
+    assert isinstance(img, InlineImageAttachment)
+    assert img.content_type == "image/*"
+    assert img.name == ""
+    assert img.content_url != ""
+
+
+def test_make_inline_image_overrides():
+    img = make_inline_image(content_url="https://smba.trafficmanager.net/x", name="photo.jpg")
+    assert img.content_url == "https://smba.trafficmanager.net/x"
+    assert img.name == "photo.jpg"

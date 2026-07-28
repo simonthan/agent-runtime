@@ -93,6 +93,26 @@ class FileAttachment:
 
 
 @dataclass(frozen=True, slots=True)
+class InlineImageAttachment:
+    """A Teams inline image surfaced on an inbound message (camera capture, pasted photo).
+
+    Unlike ``FileAttachment`` (a paperclip upload backed by an OneDrive driveItem),
+    an inline image lives on the Bot Framework attachment store and requires an
+    authenticated GET with a connector token to read back — see
+    ``agent_runtime.transport.teams.images.download_inline_image``. ``content_url``
+    is model-external input (rides the activity payload) and must be validated
+    against the Bot Framework host allowlist before any credential is attached to
+    a request built from it. ``content_type`` is the activity's declared value
+    (Teams sends the literal string ``"image/*"``; the real mime comes from the
+    download response's ``Content-Type``). ``name`` is usually empty for camera
+    captures."""
+
+    content_url: str
+    content_type: str
+    name: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class InboundMessage:
     """User text message or Adaptive Card Action.Submit payload."""
 
@@ -100,6 +120,7 @@ class InboundMessage:
     text: str = ""  # may be empty when value is set
     value: dict | None = None  # Adaptive Card Action.Submit data
     attachments: tuple[FileAttachment, ...] = field(default_factory=tuple)  # T-037c
+    images: tuple[InlineImageAttachment, ...] = field(default_factory=tuple)  # T-067a
     kind: Literal["message"] = "message"
 
 

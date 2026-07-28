@@ -27,6 +27,7 @@ from agent_runtime.transport.teams.events import (
     InboundInvoke,
     InboundMembersAdded,
     InboundMessage,
+    InlineImageAttachment,
 )
 from agent_runtime.transport.teams.identity import resolve_identity
 from agent_runtime.transport.teams.outbound import BotFrameworkOutboundChannel
@@ -87,6 +88,42 @@ def _extract_file_attachments(raw: list | None) -> tuple[FileAttachment, ...]:
     return tuple(out)
 
 
+def _extract_inline_images(raw: list | None) -> tuple[InlineImageAttachment, ...]:
+    """Pull Teams inline images (camera captures, pasted photos) off an inbound activity.
+
+    Surfaces attachments whose declared ``content_type`` is the literal
+    ``"image/*"`` Teams sends for a camera capture, or starts with ``"image/"``
+    for clients that send a concrete mime, AND expose a non-empty, ``https``
+    ``content_url``. File-download-info attachments, Adaptive Cards, and link
+    unfurls are ignored — the two extractors are disjoint by contentType, same
+    as ``_extract_file_attachments``. A missing, non-string, or non-``https``
+    ``content_url`` is logged at debug and skipped (observable, not a silent
+    vanish) — the download helper later enforces the stricter Bot Framework
+    host allowlist; this extractor only enforces the transport scheme."""
+    if not raw:
+        return ()
+    out: list[InlineImageAttachment] = []
+    for a in raw:
+        # Teams sends the literal "image/*" for camera captures; some clients send
+        # a concrete mime (e.g. "image/png") — "image/*".startswith("image/") is
+        # True, so this single check covers both per the plan's matching rule.
+        content_type = getattr(a, "content_type", None)
+        if not isinstance(content_type, str) or not content_type.startswith("image/"):
+            continue
+        content_url = getattr(a, "content_url", None)
+        if not isinstance(content_url, str) or not content_url.startswith("https://"):
+            logger.debug("Inline image missing a https content_url; skipping attachment")
+            continue
+        out.append(
+            InlineImageAttachment(
+                content_url=content_url,
+                content_type=content_type,
+                name=getattr(a, "name", None) or "",
+            )
+        )
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class TeamsAdapterConfig:
     app_id: str
@@ -121,6 +158,7 @@ class _EventDispatchingHandler(ActivityHandler):
             text=mention_stripped.strip(),
             value=raw_value if isinstance(raw_value, dict) else None,
             attachments=_extract_file_attachments(turn_context.activity.attachments),
+            images=_extract_inline_images(turn_context.activity.attachments),
         )
         await self._handler.on_event(event, BotFrameworkOutboundChannel(turn_context))
 

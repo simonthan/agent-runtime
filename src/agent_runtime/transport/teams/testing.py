@@ -1,8 +1,8 @@
 """Test doubles and factory helpers for consumers of the Teams transport.
 
 Public surface: ``FakeOutboundChannel``, ``make_conversation_ref``,
-``make_file_attachment``, ``make_inbound_message``, ``make_inbound_members_added``,
-``make_inbound_invoke``.
+``make_file_attachment``, ``make_inline_image``, ``make_inbound_message``,
+``make_inbound_members_added``, ``make_inbound_invoke``.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from agent_runtime.transport.teams.events import (
     InboundInvoke,
     InboundMembersAdded,
     InboundMessage,
+    InlineImageAttachment,
 )
 
 
@@ -69,6 +70,7 @@ def make_inbound_message(
     text: str = "hello",
     value: dict | None = None,
     attachments: tuple[FileAttachment, ...] = (),
+    images: tuple[InlineImageAttachment, ...] = (),
     **ref_overrides: str,
 ) -> InboundMessage:
     return InboundMessage(
@@ -76,6 +78,7 @@ def make_inbound_message(
         text=text,
         value=value,
         attachments=attachments,
+        images=images,
     )
 
 
@@ -89,6 +92,15 @@ def make_file_attachment(
     return FileAttachment(
         item_id=item_id, name=name, file_type=file_type, download_url=download_url
     )
+
+
+def make_inline_image(
+    content_url: str = "https://smba.trafficmanager.net/amer/v3/attachments/att-1/views/original",
+    content_type: str = "image/*",
+    name: str = "",
+) -> InlineImageAttachment:
+    """Build an ``InlineImageAttachment`` test double with sensible defaults."""
+    return InlineImageAttachment(content_url=content_url, content_type=content_type, name=name)
 
 
 def make_inbound_members_added(

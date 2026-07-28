@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.13.0 — 2026-07-28
+
+### Added
+- `InlineImageAttachment` dataclass + `InboundMessage.images: tuple[InlineImageAttachment, ...]`
+  (default empty tuple) — surfaces Teams **inline images** (camera captures, pasted/shared
+  photos), which arrive with contentType `image/*` (or a concrete `image/*` mime) and a
+  `contentUrl` on the Bot Framework attachment store, distinct from the paperclip
+  file-upload path (`FileAttachment`/`.attachments`). Additive and dormant for existing
+  consumers: images land on the **new** `.images` field, never mixed into `.attachments`
+  (T-067a).
+- `agent_runtime.transport.teams.images.download_inline_image` — authenticated download
+  helper for inline images. Refuses to attach a Bot Framework connector token unless the
+  attachment's `content_url` is `https` and its host is allowlisted (default
+  `smba.trafficmanager.net` + subdomains; override via `allowed_hosts`) — this check runs
+  before any token acquisition or HTTP call, since `content_url` is model-external input.
+  Streams the response with a hard `max_bytes` cap (default 10 MiB) and validates the
+  response `Content-Type` starts with `image/`; oversize or non-image responses raise
+  `InlineImageDownloadError` with partial bytes discarded. Token acquisition uses
+  `botframework-connector`'s `MicrosoftAppCredentials` (blocking call wrapped in
+  `asyncio.to_thread`); `PermissionError` on token failure surfaces as
+  `InlineImageDownloadError`. New `BotFrameworkCredentials` + `DownloadedImage` dataclasses.
+  No new dependency (`httpx` is a core dep; `botframework-connector` ships via the `teams`
+  extra).
+- `make_inline_image` test double + `make_inbound_message(images=...)` param in
+  `agent_runtime.transport.teams.testing`.
+- All new symbols exported from `agent_runtime.transport.teams`.
+
 ## v0.12.0 — 2026-07-19
 
 ### Added
