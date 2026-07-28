@@ -11,6 +11,8 @@ Public surface:
 - ``ConversationRef`` + ``FileAttachment`` + ``InlineImageAttachment`` +
   ``InboundMessage`` / ``InboundMembersAdded`` / ``InboundInvoke``
 - ``InvokeResponse`` (re-exported from botbuilder.schema for invoke return values)
+- ``download_inline_image`` + ``BotFrameworkCredentials`` + ``DownloadedImage`` +
+  ``InlineImageDownloadError`` — authenticated inline-image download (T-067a)
 
 Testing helpers in ``agent_runtime.transport.teams.testing``:
 - ``FakeOutboundChannel``, ``make_file_attachment``, ``make_inline_image``,
@@ -31,18 +33,27 @@ from agent_runtime.transport.teams.events import (
     conversation_ref_from_dict,
     conversation_ref_to_dict,
 )
+from agent_runtime.transport.teams.images import (
+    BotFrameworkCredentials,
+    DownloadedImage,
+    InlineImageDownloadError,
+    download_inline_image,
+)
 from agent_runtime.transport.teams.outbound import BotFrameworkOutboundChannel, OutboundChannel
 from agent_runtime.transport.teams.protocol import TeamsHandler
 
 __all__ = [
+    "BotFrameworkCredentials",
     "BotFrameworkOutboundChannel",
     "ConversationRef",
+    "DownloadedImage",
     "FileAttachment",
     "InboundEvent",
     "InboundInvoke",
     "InboundMembersAdded",
     "InboundMessage",
     "InlineImageAttachment",
+    "InlineImageDownloadError",
     "InvokeResponse",
     "OutboundChannel",
     "TeamsAdapter",
@@ -50,4 +61,5 @@ __all__ = [
     "TeamsHandler",
     "conversation_ref_from_dict",
     "conversation_ref_to_dict",
+    "download_inline_image",
 ]
