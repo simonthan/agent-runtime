@@ -25,6 +25,7 @@ from agent_runtime.transport.teams import (
     InboundInvoke,
     InboundMembersAdded,
     InboundMessage,
+    InlineImageAttachment,
     TeamsAdapter,
     TeamsAdapterConfig,
 )
@@ -356,3 +357,142 @@ async def test_string_content_is_parsed(mock_get_member):
         TurnContext(adapter._adapter, _make_activity(ActivityTypes.message, attachments=[att]))
     )
     assert handler.events[0].attachments[0].item_id == "drive-item-2"
+
+
+# ---------------------------------------------------------------------------
+# InlineImageAttachment parsing tests (T-067a)
+# ---------------------------------------------------------------------------
+
+
+def _inline_image_attachment(
+    *, content_url: str = "https://smba.trafficmanager.net/amer/v3/attachments/abc/views/original"
+) -> Attachment:
+    return Attachment(content_type="image/*", content_url=content_url)
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_message_with_inline_image_surfaces_image(mock_get_member):
+    mock_get_member.return_value = SimpleNamespace(
+        aad_object_id="aad-1", email="u@example.com", name="User One"
+    )
+    handler = _CapturingHandler()
+    adapter = TeamsAdapter(TeamsAdapterConfig("aid", "pwd", "tid"), handler)
+    activity = _make_activity(
+        ActivityTypes.message, text="check this out", attachments=[_inline_image_attachment()]
+    )
+    tc = TurnContext(adapter._adapter, activity)
+    await adapter._handler.on_turn(tc)
+    msg = handler.events[0]
+    assert isinstance(msg, InboundMessage)
+    assert len(msg.images) == 1
+    assert isinstance(msg.images[0], InlineImageAttachment)
+    assert (
+        msg.images[0].content_url
+        == "https://smba.trafficmanager.net/amer/v3/attachments/abc/views/original"
+    )
+    assert msg.images[0].content_type == "image/*"
+    assert msg.attachments == ()  # image never lands in the file bucket (invariant 1)
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_mixed_image_file_and_card_route_to_correct_bucket(mock_get_member):
+    """Image -> .images, file -> .attachments, adaptive card -> neither."""
+    mock_get_member.return_value = SimpleNamespace(
+        aad_object_id="aad-1", email="u@example.com", name="User One"
+    )
+    handler = _CapturingHandler()
+    adapter = TeamsAdapter(TeamsAdapterConfig("aid", "pwd", "tid"), handler)
+    card = Attachment(
+        content_type="application/vnd.microsoft.card.adaptive",
+        content={"type": "AdaptiveCard", "body": []},
+    )
+    activity = _make_activity(
+        ActivityTypes.message,
+        attachments=[_inline_image_attachment(), _file_download_attachment(), card],
+    )
+    tc = TurnContext(adapter._adapter, activity)
+    await adapter._handler.on_turn(tc)
+    msg = handler.events[0]
+    assert len(msg.images) == 1
+    assert len(msg.attachments) == 1
+    assert msg.attachments[0].item_id == "drive-item-1"
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_inline_image_missing_content_url_skipped(mock_get_member):
+    mock_get_member.return_value = SimpleNamespace(
+        aad_object_id="aad-1", email="u@example.com", name="User One"
+    )
+    handler = _CapturingHandler()
+    adapter = TeamsAdapter(TeamsAdapterConfig("aid", "pwd", "tid"), handler)
+    bad = Attachment(content_type="image/*", content_url=None)
+    tc = TurnContext(adapter._adapter, _make_activity(ActivityTypes.message, attachments=[bad]))
+    await adapter._handler.on_turn(tc)
+    assert handler.events[0].images == ()
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_inline_image_non_https_content_url_skipped(mock_get_member):
+    mock_get_member.return_value = SimpleNamespace(
+        aad_object_id="aad-1", email="u@example.com", name="User One"
+    )
+    handler = _CapturingHandler()
+    adapter = TeamsAdapter(TeamsAdapterConfig("aid", "pwd", "tid"), handler)
+    bad = _inline_image_attachment(content_url="http://smba.trafficmanager.net/insecure")
+    tc = TurnContext(adapter._adapter, _make_activity(ActivityTypes.message, attachments=[bad]))
+    await adapter._handler.on_turn(tc)
+    assert handler.events[0].images == ()
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_inline_image_concrete_mime_matched(mock_get_member):
+    """Some clients send a concrete mime (e.g. image/png) instead of the literal 'image/*'."""
+    mock_get_member.return_value = SimpleNamespace(
+        aad_object_id="aad-1", email="u@example.com", name="User One"
+    )
+    handler = _CapturingHandler()
+    adapter = TeamsAdapter(TeamsAdapterConfig("aid", "pwd", "tid"), handler)
+    att = Attachment(content_type="image/png", content_url="https://smba.trafficmanager.net/x")
+    tc = TurnContext(adapter._adapter, _make_activity(ActivityTypes.message, attachments=[att]))
+    await adapter._handler.on_turn(tc)
+    assert len(handler.events[0].images) == 1
+    assert handler.events[0].images[0].content_type == "image/png"
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_inline_image_real_shape_activity_dict(mock_get_member):
+    """MockDB lesson: drive extraction through a captured real-shape Teams payload,
+    not just botbuilder object construction, so the wire-shape (camelCase JSON,
+    string-typed fields) is exercised too."""
+    mock_get_member.return_value = SimpleNamespace(
+        aad_object_id="aad-1", email="u@example.com", name="User One"
+    )
+    handler = _CapturingHandler()
+    adapter = TeamsAdapter(TeamsAdapterConfig("aid", "pwd", "tid"), handler)
+    body: dict = {
+        "type": "message",
+        "id": "activity-1",
+        "channelId": "msteams",
+        "serviceUrl": "https://smba.trafficmanager.net/amer/",
+        "conversation": {"id": "conv-1", "tenantId": "tenant-test"},
+        "from": {"id": "user-1", "aadObjectId": "aad-1", "name": "User One"},
+        "recipient": {"id": "bot-1", "name": "Bot"},
+        "text": "photo from my phone",
+        "attachments": [
+            {
+                "contentType": "image/*",
+                "contentUrl": (
+                    "https://smba.trafficmanager.net/amer/v3/attachments/"
+                    "abc123-def456/views/original"
+                ),
+            }
+        ],
+    }
+    activity = Activity().deserialize(body)
+    tc = TurnContext(adapter._adapter, activity)
+    await adapter._handler.on_turn(tc)
+    msg = handler.events[0]
+    assert len(msg.images) == 1
+    assert msg.images[0].content_url == (
+        "https://smba.trafficmanager.net/amer/v3/attachments/abc123-def456/views/original"
+    )
