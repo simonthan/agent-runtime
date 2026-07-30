@@ -513,3 +513,55 @@ async def test_complete_history_uncached_when_flag_false(
                 assert "cache_control" not in block
         elif isinstance(content, str):
             pass  # bare str — fine
+
+
+# ── T-067d: images kwarg on complete() (vision passthrough) ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_complete_images_block_order(
+    client: AnthropicClient, fake_sdk: FakeAsyncAnthropic
+) -> None:
+    """retrieval + 2 images + text ordering; breakpoint #1 (system) and #3
+    (cache_history=True last-history-block) are untouched by images."""
+    from agent_runtime.llm.models import LLMImage
+
+    fake_sdk.messages.responses.append(make_ok())
+    img1 = LLMImage(media_type="image/png", data_b64="AAAA")
+    img2 = LLMImage(media_type="image/jpeg", data_b64="BBBB")
+    history: tuple[Message, ...] = (
+        {"role": "user", "content": "earlier-q"},
+        {"role": "assistant", "content": "earlier-a"},
+    )
+
+    await client.complete(
+        static_system_prefix="STATIC",
+        history=history,
+        user_message="what is this",
+        retrieval_block="RETRIEVED",
+        images=(img1, img2),
+        cache_history=True,
+    )
+    req = fake_sdk.messages.captured_requests[0]
+    # Breakpoint #1: system prefix untouched by images.
+    assert req["system"] == [
+        {"type": "text", "text": "STATIC", "cache_control": {"type": "ephemeral"}}
+    ]
+    # Breakpoint #2 + images + text, in order; only retrieval carries cache_control.
+    user_msg = req["messages"][-1]
+    assert user_msg["role"] == "user"
+    content = user_msg["content"]
+    assert content == [
+        {"type": "text", "text": "RETRIEVED", "cache_control": {"type": "ephemeral"}},
+        img1.to_block(),
+        img2.to_block(),
+        {"type": "text", "text": "what is this"},
+    ]
+    assert "cache_control" not in content[1]
+    assert "cache_control" not in content[2]
+    # Breakpoint #3: last history message still carries cache_control, untouched
+    # by the presence of images on the CURRENT turn.
+    last_history_msg = req["messages"][-2]
+    last_history_content = last_history_msg["content"]
+    assert isinstance(last_history_content, list)
+    assert last_history_content[-1]["cache_control"] == {"type": "ephemeral"}

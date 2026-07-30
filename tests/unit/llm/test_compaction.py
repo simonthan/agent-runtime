@@ -213,3 +213,41 @@ def test_public_exports_from_llm_package() -> None:
         WorkingMemory,
         estimate_tokens,
     )
+
+
+# ---------------------------------------------------------------------------
+# T-067d: content-block-aware folding (compaction hazard 1)
+# ---------------------------------------------------------------------------
+
+
+def test_format_turns_collapses_image_blocks(client) -> None:
+    """A turn whose content is a content-block list (image + text) folds to a
+    ``[image]`` placeholder + the text, never dumping the raw base64 payload
+    into the merge prompt or inflating the live token estimate's body."""
+    cfg = CompactionConfig(model_window_tokens=1000, threshold_fraction=0.6, keep_k=6)
+    engine = CompactionEngine(client=client, config=cfg)
+    fake_b64_payload = "QQ==" * 10_000  # large fake base64 payload
+    block_turn = {
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": fake_b64_payload,
+                },
+            },
+            {"type": "text", "text": "hi"},
+        ],
+    }
+
+    formatted = engine._format_turns([block_turn])
+
+    assert formatted == "user: [image]\nhi"
+    assert fake_b64_payload not in formatted
+
+    live = engine._live_token_estimate(
+        wm=WorkingMemory(), history=[block_turn], extra_block_text=""
+    )
+    assert live == estimate_tokens("[image]\nhi")
