@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent_runtime.llm.client import AnthropicClient, assemble_history_messages
+from agent_runtime.llm.models import LLMImage
 from agent_runtime.logging import AuditLogger, NullAuditLogger
 
 __all__ = [
@@ -162,6 +163,7 @@ class ToolUseLoop:
         confirm: ConfirmPredicate | None = None,
         dynamic_system_suffix: str | None = None,
         retrieval_block: str | None = None,
+        images: tuple[LLMImage, ...] = (),
         history: tuple[dict[str, Any], ...] = (),
         cache_history: bool = False,
         model: str | None = None,
@@ -183,14 +185,27 @@ class ToolUseLoop:
         `cache_history=True` marks the last history message with a ``cache_control``
         ephemeral breakpoint so Anthropic caches the stable history prefix across
         turns. `cache_history=False` (default) keeps behaviour byte-for-byte
-        unchanged — the regression guarantee for existing callers (T-038a)."""
+        unchanged — the regression guarantee for existing callers (T-038a).
+
+        `images` (T-067d) inserts base64 image content blocks between the cached
+        retrieval block and the user text (vision passthrough). Default () is
+        byte-for-byte unchanged — the regression guarantee for existing callers.
+        Image bytes bypass `sanitize_for_llm_prompt` (text-only by design) and,
+        if the turn suspends on a confirm-gated tool, ride `state["messages"]`
+        into the consumer's suspend store verbatim — cap count/size upstream.
+        Consumers persist their OWN history; store a text manifest for image
+        turns, not content blocks."""
         system_blocks = self._build_system_blocks(static_system_prefix, dynamic_system_suffix)
         first_user: list[dict[str, Any]] = []
         if retrieval_block:
             first_user.append(
                 {"type": "text", "text": retrieval_block, "cache_control": {"type": "ephemeral"}}
             )
-        first_user.append({"type": "text", "text": user_message})
+        first_user.extend(img.to_block() for img in images)
+        if user_message or not images:
+            # Byte-identical to pre-T-067d for images=(); with images present an
+            # empty text block is omitted (Anthropic rejects empty text).
+            first_user.append({"type": "text", "text": user_message})
         messages: list[dict[str, Any]] = assemble_history_messages(
             history, cache_history=cache_history
         )

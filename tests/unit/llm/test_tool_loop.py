@@ -694,3 +694,144 @@ async def test_tool_loop_resume_preserves_history_marker() -> None:
     cont_content = last_history_in_cont["content"]
     assert isinstance(cont_content, list)
     assert cont_content[-1]["cache_control"] == {"type": "ephemeral"}
+
+
+# ── T-067d: images kwarg on run() (vision passthrough) ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_images_block_order() -> None:
+    """retrieval + 2 images + text: block order is
+    [retrieval(cache_control), image, image, text]; only retrieval carries
+    cache_control."""
+    from agent_runtime.llm.models import LLMImage
+
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_ok(text="done"))
+    img1 = LLMImage(media_type="image/png", data_b64="AAAA")
+    img2 = LLMImage(media_type="image/jpeg", data_b64="BBBB")
+
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="what is this",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_ok_executor,
+        max_rounds=3,
+        retrieval_block="RETRIEVED",
+        images=(img1, img2),
+    )
+    first_user = sdk.messages.captured_requests[0]["messages"][-1]
+    assert first_user["role"] == "user"
+    content = first_user["content"]
+    assert content == [
+        {"type": "text", "text": "RETRIEVED", "cache_control": {"type": "ephemeral"}},
+        img1.to_block(),
+        img2.to_block(),
+        {"type": "text", "text": "what is this"},
+    ]
+    assert "cache_control" not in content[1]
+    assert "cache_control" not in content[2]
+
+
+@pytest.mark.asyncio
+async def test_run_images_default_empty_byte_identical() -> None:
+    """images=() (default) produces exactly today's first-user structure."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_ok(text="done"))
+
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="hello",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_ok_executor,
+        max_rounds=3,
+        retrieval_block="RETRIEVED",
+    )
+    first_user = sdk.messages.captured_requests[0]["messages"][-1]
+    assert first_user["content"] == [
+        {"type": "text", "text": "RETRIEVED", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "hello"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_images_with_empty_text_omits_text_block() -> None:
+    """user_message="" + one image: no text block. user_message="" + images=():
+    the empty text block is still appended (pre-existing behavior preserved)."""
+    from agent_runtime.llm.models import LLMImage
+
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_ok(text="done"))
+    img = LLMImage(media_type="image/png", data_b64="AAAA")
+
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_ok_executor,
+        max_rounds=3,
+        images=(img,),
+    )
+    first_user = sdk.messages.captured_requests[0]["messages"][-1]
+    assert first_user["content"] == [img.to_block()]
+
+    fake_sdk2 = FakeAsyncAnthropic()
+    loop2, sdk2 = _make_loop(fake_sdk2)
+    sdk2.messages.responses.append(make_ok(text="done"))
+    await loop2.run(
+        static_system_prefix="SYS",
+        user_message="",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_ok_executor,
+        max_rounds=3,
+    )
+    first_user2 = sdk2.messages.captured_requests[0]["messages"][-1]
+    assert first_user2["content"] == [{"type": "text", "text": ""}]
+
+
+@pytest.mark.asyncio
+async def test_resume_roundtrips_image_blocks() -> None:
+    """Drive a confirm-suspending tool turn with one image; state["messages"]
+    JSON-round-trips; resume proceeds and the first user message still
+    contains the image block."""
+    import json
+
+    from agent_runtime.llm.models import LLMImage
+
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        make_tool_use(tool_id="tu_w", name="send_email", tool_input={"to": "x"})
+    )
+    img = LLMImage(media_type="image/png", data_b64="AAAA")
+
+    suspended = await loop.run(
+        static_system_prefix="SYS",
+        user_message="describe this",
+        tools=[{"name": "send_email", "input_schema": {}}],
+        executor=_ok_executor,
+        max_rounds=3,
+        confirm=_CONFIRM_WRITES,
+        images=(img,),
+    )
+    assert suspended.pending_confirmation is not None
+    round_tripped = json.loads(json.dumps(suspended.pending_confirmation.state))
+    state_first_user = round_tripped["messages"][0]
+    assert img.to_block() in state_first_user["content"]
+
+    sdk.messages.responses.append(make_ok(text="sent!"))
+    result = await loop.resume(
+        state=round_tripped,
+        decision=ExecuteDecision(),
+        tools=[{"name": "send_email", "input_schema": {}}],
+        executor=_ok_executor,
+        confirm=_CONFIRM_WRITES,
+        static_system_prefix="SYS",
+        max_rounds=3,
+    )
+    assert result.final_text == "sent!"
+    continuation_first_user = sdk.messages.captured_requests[-1]["messages"][0]
+    assert img.to_block() in continuation_first_user["content"]

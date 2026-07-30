@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.14.0 — 2026-07-29
+
+### Added
+- `LLMImage` frozen dataclass + `ANTHROPIC_IMAGE_MEDIA_TYPES` (`llm/models.py`, re-exported
+  from `agent_runtime.llm`): base64 image content blocks with fail-fast media-type
+  validation; `from_bytes()` / `to_block()` helpers (T-067d).
+- `images: tuple[LLMImage, ...] = ()` keyword on `ToolUseLoop.run` AND
+  `AnthropicClient.complete` — vision passthrough. Image blocks are inserted between the
+  cached retrieval block (breakpoint #2 untouched) and the user text block. Default `()`
+  is byte-for-byte identical to v0.13.0 (regression guarantee). With images present and an
+  empty `user_message`, the empty text block is omitted (Anthropic rejects empty text).
+  Note: image blocks live in the uncached suffix and are re-billed each tool round —
+  consumers bound cost via round caps; a cache_control on the last image block is a
+  possible future consumer-level hardening.
+
+### Fixed
+- Compaction folding is now content-block-aware (`_content_to_text`): a block-shaped
+  history turn folds its text blocks and collapses non-text blocks to `[<type>]`
+  placeholders instead of dumping raw base64 reprs into the merge prompt and the token
+  estimate (defense-in-depth — consumers are contracted to persist text-only history).
+
 ## v0.13.0 — 2026-07-28
 
 ### Added
