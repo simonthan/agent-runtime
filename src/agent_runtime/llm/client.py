@@ -38,7 +38,7 @@ from agent_runtime.llm.errors import (
     LLMRateLimitError,
     LLMResponseError,
 )
-from agent_runtime.llm.models import ClaudeResponse, History, ToolUseBlock
+from agent_runtime.llm.models import ClaudeResponse, History, LLMImage, ToolUseBlock
 from agent_runtime.logging import AuditLogger, NullAuditLogger
 
 __all__ = ["AnthropicClient", "assemble_history_messages"]
@@ -236,6 +236,7 @@ class AnthropicClient:
         dynamic_system_suffix: str | None = None,
         history: History = (),
         retrieval_block: str | None = None,
+        images: tuple[LLMImage, ...] = (),
         tools: list[dict[str, Any]] | None = None,
         cache_history: bool = False,
         max_tokens: int | None = None,
@@ -251,6 +252,12 @@ class AnthropicClient:
         conversation prefix so multi-turn sessions read it from cache (T-038a).
 
         ``dynamic_system_suffix`` is passed through uncached.
+
+        ``images`` (T-067d) inserts base64 image content blocks between the
+        cached retrieval block and the user text (vision passthrough). They sit
+        AFTER the breakpoint-#2 marker, so per-turn images never join (or
+        invalidate) the cached retrieval prefix. Default ``()`` is byte-for-byte
+        unchanged — the regression guarantee for existing callers.
 
         Delegates to ``complete_messages`` after assembling blocks. ``tools`` is
         passed verbatim; ``None`` omits the param entirely (D5 — byte-identical
@@ -273,7 +280,9 @@ class AnthropicClient:
             user_content.append(
                 {"type": "text", "text": retrieval_block, "cache_control": {"type": "ephemeral"}}
             )
-        user_content.append({"type": "text", "text": user_message})
+        user_content.extend(img.to_block() for img in images)
+        if user_message or not images:
+            user_content.append({"type": "text", "text": user_message})
 
         messages: list[dict[str, Any]] = assemble_history_messages(
             history, cache_history=cache_history
