@@ -40,6 +40,29 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
+def _content_to_text(content: Any) -> str:
+    """Textual view of a history entry's content for folding/estimation.
+
+    ``str`` passes through. A content-block list yields its text blocks joined
+    by newlines with non-text blocks (e.g. image) collapsed to a ``[<type>]``
+    placeholder — folding a block-shaped turn must never dump base64 payloads
+    into the merge prompt (T-067d hazard).
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+            elif isinstance(block, dict):
+                parts.append(f"[{block.get('type', 'block')}]")
+            else:
+                parts.append(str(block))
+        return "\n".join(parts)
+    return str(content)
+
+
 @dataclass(frozen=True, slots=True)
 class CompactionConfig:
     """Per-persona compaction tuning."""
@@ -123,7 +146,7 @@ class CompactionEngine:
         body = (
             extra_block_text
             + (wm.running_summary or "")
-            + "".join(str(t.get("content", "")) for t in verbatim)
+            + "".join(_content_to_text(t.get("content", "")) for t in verbatim)
         )
         return estimate_tokens(body)
 
@@ -146,7 +169,9 @@ class CompactionEngine:
 
     def _format_turns(self, turns: list[dict[str, Any]]) -> str:
         """Format a list of turns as ``role: content`` lines for the merge prompt."""
-        return "\n".join(f"{t.get('role', 'user')}: {t.get('content', '')}" for t in turns)
+        return "\n".join(
+            f"{t.get('role', 'user')}: {_content_to_text(t.get('content', ''))}" for t in turns
+        )
 
     async def _merge_summary(
         self,
