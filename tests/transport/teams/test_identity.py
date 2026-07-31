@@ -160,3 +160,31 @@ async def test_resolve_identity_conversation_type_defaults_personal(mock_get_mem
     ref = await resolve_identity(_turn_context(conversation_type=""))
     assert ref is not None
     assert ref.conversation_type == "personal"
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_get_member_transient_failure_retries_and_resolves(mock_get_member):
+    """T-084b: a transient Graph failure on the first call is retried once — the
+    message is NOT dropped (the exact live regression, TBP T-084 Issue 5)."""
+    mock_get_member.side_effect = [
+        RuntimeError("transient Graph error"),
+        SimpleNamespace(aad_object_id="aad-1", email="u@example.com", name="User One"),
+    ]
+    ref = await resolve_identity(_turn_context())
+    assert ref is not None
+    assert ref.user_email == "u@example.com"
+    assert mock_get_member.await_count == 2
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_get_member_double_failure_falls_back_and_drops(mock_get_member, caplog):
+    """Both the initial call and the retry fail — existing fallback/drop behavior preserved."""
+    mock_get_member.side_effect = [
+        RuntimeError("transient Graph error"),
+        RuntimeError("still down"),
+    ]
+    caplog.set_level(logging.WARNING)
+    ref = await resolve_identity(_turn_context(from_aad="aad-fb"))
+    assert ref is None
+    assert mock_get_member.await_count == 2
+    assert any("Dropping inbound activity" in r.message for r in caplog.records)
