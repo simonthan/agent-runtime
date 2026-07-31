@@ -39,7 +39,11 @@ from agent_runtime.transport.teams.images import (
     InlineImageDownloadError,
     download_inline_image,
 )
-from agent_runtime.transport.teams.outbound import BotFrameworkOutboundChannel, OutboundChannel
+from agent_runtime.transport.teams.outbound import (
+    BotFrameworkOutboundChannel,
+    OutboundChannel,
+    SignInResource,
+)
 from agent_runtime.transport.teams.protocol import TeamsHandler
 
 __all__ = [
@@ -56,6 +60,7 @@ __all__ = [
     "InlineImageDownloadError",
     "InvokeResponse",
     "OutboundChannel",
+    "SignInResource",
     "TeamsAdapter",
     "TeamsAdapterConfig",
     "TeamsHandler",
