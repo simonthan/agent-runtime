@@ -575,8 +575,15 @@ class SessionManager:
                 channel=channel,
             )
         except Exception as e:  # noqa: BLE001
-            self._log.warning(
-                "Failed to persist resume token via repo", error=mask_telemetry(str(e))
+            # T-084b: this swallow hid a UniqueViolation that cost 40 turns of
+            # durable transcript (TBP T-084). error + classifier + traceback so
+            # a wired sink can grep the cause; still swallowed — persist failure
+            # must not fail session creation (availability over completeness).
+            self._log.error(
+                "Failed to persist resume token via repo",
+                error=mask_telemetry(str(e)),
+                exc_type=type(e).__name__,
+                exc_info=True,
             )
 
     async def _persist_message_to_db(
@@ -603,9 +610,13 @@ class SessionManager:
                 message=message,
             )
         except Exception as e:  # noqa: BLE001
-            self._log.warning(
+            # T-084b: same escalation as _persist_resume_to_db — a lost
+            # transcript message is silent data loss, not a routine warning.
+            self._log.error(
                 "Failed to persist message to durable store",
                 error=mask_telemetry(str(e)),
+                exc_type=type(e).__name__,
+                exc_info=True,
             )
 
     async def _resume_from_db(

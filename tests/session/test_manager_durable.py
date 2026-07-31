@@ -10,12 +10,18 @@ from agent_runtime.session.manager import SessionManager
 from agent_runtime.session.testing import FakeRedisClient, FakeSessionRepository
 
 
-def _make_manager(*, repo: Any | None = None, max_history: int | None = None) -> SessionManager:
+def _make_manager(
+    *,
+    repo: Any | None = None,
+    max_history: int | None = None,
+    logger: Any | None = None,
+) -> SessionManager:
     return SessionManager(
         session_repo=repo or FakeSessionRepository(),
         redis_client=FakeRedisClient(),
         idle_timeout=timedelta(minutes=30),
         max_history=max_history,
+        logger=logger,
     )
 
 
@@ -180,3 +186,56 @@ async def test_create_session_initial_history_respects_cap():
     seeded = [{"role": "user", "content": str(i)} for i in range(5)]
     s = await mgr.create_session(user_id="u1", bot_id="b1", initial_history=seeded)
     assert [m["content"] for m in s.conversation_history] == ["3", "4"]
+
+
+class _RecordingAuditLogger:
+    """T-084b: records `.error(...)` calls so tests can assert on the escalated
+    persist-swallow sites (classifier + traceback kwargs)."""
+
+    def __init__(self) -> None:
+        self.errors: list[tuple[str, dict]] = []
+
+    def debug(self, message, **kw): ...
+    def info(self, message, **kw): ...
+    def warning(self, message, **kw): ...
+
+    def error(self, message, **kw):
+        self.errors.append((message, kw))
+
+    def security(self, message, **kw): ...
+    def action(self, action, result, user_id=None, session_id=None, details=None, **kw): ...
+
+
+async def test_persist_resume_failure_logs_error_with_exc_type(monkeypatch):
+    repo = FakeSessionRepository()
+    recorder = _RecordingAuditLogger()
+    mgr = _make_manager(repo=repo, logger=recorder)
+
+    async def _boom(**_: Any) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(repo, "upsert_resume_data", _boom)
+    s = await mgr.create_session(user_id="u1", bot_id="b1")  # succeeds despite the swallow
+    assert s is not None
+    assert len(recorder.errors) == 1
+    _, kw = recorder.errors[0]
+    assert kw["exc_type"] == "RuntimeError"
+    assert kw["exc_info"] is True
+
+
+async def test_persist_message_failure_logs_error_with_exc_type(monkeypatch):
+    repo = FakeSessionRepository()
+    recorder = _RecordingAuditLogger()
+    mgr = _make_manager(repo=repo, logger=recorder)
+    s = await mgr.create_session(user_id="u1", bot_id="b1")
+
+    async def _boom(**_: Any) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(repo, "append_message", _boom)
+    updated = await mgr.update_session(s.id, add_message={"role": "user", "content": "x"})
+    assert updated is not None  # turn still succeeds
+    assert len(recorder.errors) == 1
+    _, kw = recorder.errors[0]
+    assert kw["exc_type"] == "RuntimeError"
+    assert kw["exc_info"] is True

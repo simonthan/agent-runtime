@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.17.0 — 2026-07-31
+
+### Changed
+- `SessionManager._persist_resume_to_db` / `_persist_message_to_db` failures now log at
+  `error` with `exc_type` + `exc_info=True` (was `warning`, message-only). Still swallowed —
+  persist failure never fails the turn. Surfaced TBP T-084's 40-turn silent transcript loss.
+- `download_inline_image` (Teams transport): a non-`image/*` Content-Type no longer rejects
+  up front. The body is streamed (still bounded by `max_bytes`) and sniffed by magic bytes
+  (PNG/JPEG/GIF/WebP — exactly Anthropic's supported set); `DownloadedImage.mime` carries the
+  sniffed type. Teams' CDN serves real images as `application/octet-stream` (TBP T-084
+  Issue 4 — live receipt rejected). Genuinely non-image payloads raise the same error.
+- `resolve_identity` (Teams transport): `TeamsInfo.get_member` gets one immediate retry
+  before the no-email fallback/drop path — a transient Graph error no longer silently
+  discards the user's message (TBP T-084 Issue 5). Worst case 2 Graph calls per activity.
+
 ## v0.16.0 — 2026-07-31
 
 ### Added

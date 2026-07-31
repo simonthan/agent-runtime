@@ -153,6 +153,74 @@ def test_credentials_repr_excludes_password():
     assert "aid" in repr(_CREDENTIALS)
 
 
+async def test_octet_stream_with_png_magic_accepted():
+    png_bytes = b"\x89PNG\r\n\x1a\n" + b"x" * 16
+
+    def _octet_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=png_bytes, headers={"content-type": "application/octet-stream"}
+        )
+
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    client = _client_with_handler(_octet_handler)
+    result = await download_inline_image(att, _CREDENTIALS, client=client)
+    assert result.data == png_bytes
+    assert result.mime == "image/png"
+
+
+async def test_octet_stream_with_jpeg_magic_accepted():
+    def _octet_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=_JPEG_BYTES, headers={"content-type": "application/octet-stream"}
+        )
+
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    client = _client_with_handler(_octet_handler)
+    result = await download_inline_image(att, _CREDENTIALS, client=client)
+    assert result.data == _JPEG_BYTES
+    assert result.mime == "image/jpeg"
+
+
+async def test_octet_stream_non_image_still_rejected():
+    def _octet_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b"%PDF-1.7 not an image at all",
+            headers={"content-type": "application/octet-stream"},
+        )
+
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    client = _client_with_handler(_octet_handler)
+    with pytest.raises(InlineImageDownloadError, match="non-image Content-Type"):
+        await download_inline_image(att, _CREDENTIALS, client=client)
+
+
+async def test_declared_image_content_type_unchanged():
+    """A declared image/* type is trusted as-is — no sniff, byte-identical path."""
+    arbitrary_bytes = b"not-actually-a-jpeg-but-declared-as-one"
+
+    def _declared_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=arbitrary_bytes, headers={"content-type": "image/jpeg"})
+
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    client = _client_with_handler(_declared_handler)
+    result = await download_inline_image(att, _CREDENTIALS, client=client)
+    assert result.data == arbitrary_bytes
+    assert result.mime == "image/jpeg"
+
+
+async def test_octet_stream_still_respects_size_cap():
+    def _big_octet_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=b"x" * 100, headers={"content-type": "application/octet-stream"}
+        )
+
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    client = _client_with_handler(_big_octet_handler)
+    with pytest.raises(InlineImageDownloadError):
+        await download_inline_image(att, _CREDENTIALS, client=client, max_bytes=10)
+
+
 async def test_redirect_not_followed_off_allowlist():
     def _redirect_handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "smba.trafficmanager.net":

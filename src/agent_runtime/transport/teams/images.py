@@ -29,6 +29,30 @@ _DEFAULT_ALLOWED_HOSTS: frozenset[str] = frozenset({"smba.trafficmanager.net"})
 
 _DEFAULT_MAX_BYTES = 10 * 1024 * 1024  # phone photos are typically 1-5 MiB
 
+_MAGIC_SNIFFS: tuple[tuple[bytes, str], ...] = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+)
+
+
+def _sniff_image_mime(data: bytes) -> str | None:
+    """Return the image MIME type from magic bytes, or None if not a known image.
+
+    Teams' attachment CDN serves inline images as ``application/octet-stream``
+    (TBP T-084 Issue 4 — live receipt rejected), so the declared Content-Type
+    cannot be trusted to say "not an image". The four types here are exactly
+    Anthropic's supported image media types. WebP is RIFF-framed
+    (``RIFF<size>WEBP``), hence the offset check.
+    """
+    for magic, mime in _MAGIC_SNIFFS:
+        if data.startswith(magic):
+            return mime
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":  # noqa: PLR2004
+        return "image/webp"
+    return None
+
 
 class InlineImageDownloadError(Exception):
     """An inline image could not be downloaded or failed validation.
@@ -106,9 +130,7 @@ async def _stream_download(
             msg = f"Inline image download failed with HTTP status {status}"
             raise InlineImageDownloadError(msg)
         content_type = response.headers.get("content-type", "")
-        if not content_type.startswith("image/"):
-            msg = f"Inline image download returned a non-image Content-Type: {content_type!r}"
-            raise InlineImageDownloadError(msg)
+        declared_image = content_type.startswith("image/")
         chunks: list[bytes] = []
         total = 0
         async for chunk in response.aiter_bytes():
@@ -117,7 +139,18 @@ async def _stream_download(
                 msg = f"Inline image exceeded the {max_bytes}-byte download cap"
                 raise InlineImageDownloadError(msg)
             chunks.append(chunk)
-        return DownloadedImage(data=b"".join(chunks), mime=content_type)
+        data = b"".join(chunks)
+        if declared_image:
+            return DownloadedImage(data=data, mime=content_type)
+        # T-084b: a non-image Content-Type no longer rejects up front — Teams'
+        # CDN serves real images as application/octet-stream. The magic bytes
+        # decide; the max_bytes cap above still bounds the speculative read,
+        # and a genuinely non-image payload still raises the same error.
+        sniffed = _sniff_image_mime(data)
+        if sniffed is None:
+            msg = f"Inline image download returned a non-image Content-Type: {content_type!r}"
+            raise InlineImageDownloadError(msg)
+        return DownloadedImage(data=data, mime=sniffed)
 
 
 async def download_inline_image(
@@ -135,8 +168,13 @@ async def download_inline_image(
     module default — a consumer may widen it from the session's own
     ``ConversationRef.service_url`` host); this check runs before any token
     acquisition or HTTP call. The response is streamed with a hard
-    ``max_bytes`` cap and its ``Content-Type`` must start with ``"image/"``;
-    oversize or non-image responses raise with the partial bytes discarded.
+    ``max_bytes`` cap. A declared ``Content-Type`` starting with ``"image/"``
+    is trusted as-is (byte-identical path). Any other declared type (Teams'
+    CDN serves real images as ``application/octet-stream`` — T-084b) is still
+    streamed under the same ``max_bytes`` cap, then sniffed by magic bytes
+    (PNG/JPEG/GIF/WebP); ``DownloadedImage.mime`` carries the sniffed type in
+    that case. Oversize responses, or non-image responses whose bytes don't
+    match a known image signature, raise with the partial bytes discarded.
 
     ``client`` is an injectable ``httpx.AsyncClient`` for tests / connection
     pool reuse; when omitted, a client is created and closed for this call.

@@ -56,6 +56,17 @@ def _extract_tenant_id(activity: Any) -> str:
     return ""
 
 
+async def _get_member_with_retry(turn_context: TurnContext, member_id: str) -> Any:
+    """One immediate retry (T-084b): the observed failure is a transient
+    Graph/Connector error that silently costs the user their message. A single
+    retry keeps the worst case at 2 Graph calls per activity — the module-header
+    rate-limit warning still holds; do NOT turn this into a loop."""
+    try:
+        return await TeamsInfo.get_member(turn_context, member_id)
+    except Exception:  # noqa: BLE001 — Graph call has no narrow exception class
+        return await TeamsInfo.get_member(turn_context, member_id)
+
+
 async def resolve_identity(turn_context: TurnContext) -> ConversationRef | None:
     """Return a populated ConversationRef or None if the user cannot be identified."""
     activity = turn_context.activity
@@ -66,7 +77,7 @@ async def resolve_identity(turn_context: TurnContext) -> ConversationRef | None:
     display_name = from_info.name or "Teams User"
 
     try:
-        member = await TeamsInfo.get_member(turn_context, from_info.id)
+        member = await _get_member_with_retry(turn_context, from_info.id)
         # member is a TeamsChannelAccount (botbuilder.schema.teams) — has email + aad_object_id.
         aad_object_id = getattr(member, "aad_object_id", "") or ""
         email = getattr(member, "email", "") or ""
