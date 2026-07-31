@@ -835,3 +835,160 @@ async def test_resume_roundtrips_image_blocks() -> None:
     assert result.final_text == "sent!"
     continuation_first_user = sdk.messages.captured_requests[-1]["messages"][0]
     assert img.to_block() in continuation_first_user["content"]
+
+
+class _CapturingAudit:
+    """Minimal AuditLogger that records warning() calls for truncation assertions."""
+
+    def __init__(self) -> None:
+        self.warnings: list[tuple[str, dict]] = []
+
+    def debug(self, message: str, **kw) -> None: ...
+    def info(self, message: str, **kw) -> None: ...
+    def warning(self, message: str, **kw) -> None:
+        self.warnings.append((message, kw))
+
+    def error(self, message: str, **kw) -> None: ...
+    def security(self, message: str, **kw) -> None: ...
+    def action(self, *a, **kw) -> None: ...
+
+
+def _big_executor(text: str):
+    async def _run_tool(_name: str, _inp: dict) -> ToolResult:
+        return ToolResult(content=text)
+
+    return _run_tool
+
+
+@pytest.mark.asyncio
+async def test_result_under_cap_not_truncated() -> None:
+    """Content shorter than the cap passes through byte-identical, no marker."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(name="search", tool_input={"q": "x"}))
+    sdk.messages.responses.append(make_ok(text="done"))
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="find x",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_big_executor("short"),
+        max_rounds=3,
+        max_result_chars=100,
+    )
+    tc = result.steps[0].tool_calls[0]
+    assert tc.result == "short"
+    assert "TRUNCATED" not in tc.result
+
+
+@pytest.mark.asyncio
+async def test_result_over_cap_truncated_with_marker() -> None:
+    """Content longer than the cap → first `cap` chars kept + explicit marker."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(name="search", tool_input={"q": "x"}))
+    sdk.messages.responses.append(make_ok(text="done"))
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="find x",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_big_executor("A" * 500),
+        max_rounds=3,
+        max_result_chars=100,
+    )
+    tc = result.steps[0].tool_calls[0]
+    assert tc.result.startswith("A" * 100)
+    assert "TRUNCATED BY agent-runtime" in tc.result
+    assert "500 characters" in tc.result  # original size reported
+    assert "400 characters were removed" in tc.result
+    assert tc.is_error is False
+
+
+@pytest.mark.asyncio
+async def test_no_cap_default_leaves_huge_result_verbatim() -> None:
+    """Regression guarantee: max_result_chars omitted → no truncation at any size."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(name="search", tool_input={"q": "x"}))
+    sdk.messages.responses.append(make_ok(text="done"))
+    huge = "B" * 10_000
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="find x",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_big_executor(huge),
+        max_rounds=3,
+    )
+    tc = result.steps[0].tool_calls[0]
+    assert tc.result == huge
+    assert "TRUNCATED" not in tc.result
+
+
+@pytest.mark.asyncio
+async def test_truncation_preserves_is_error_and_audits() -> None:
+    """is_error survives truncation; a tool_loop_result_truncated warning is emitted."""
+    audit = _CapturingAudit()
+    fake_sdk = FakeAsyncAnthropic()
+    loop = ToolUseLoop(client=_make_client(fake_sdk), audit_logger=audit)  # type: ignore[arg-type]
+    fake_sdk.messages.responses.append(make_tool_use(name="search", tool_input={"q": "x"}))
+    fake_sdk.messages.responses.append(make_ok(text="done"))
+
+    async def _err_big(_name: str, _inp: dict) -> ToolResult:
+        return ToolResult(content="C" * 500, is_error=True)
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="find x",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_err_big,
+        max_rounds=3,
+        max_result_chars=100,
+    )
+    tc = result.steps[0].tool_calls[0]
+    assert tc.is_error is True
+    assert "TRUNCATED" in tc.result
+    assert any(m == "tool_loop_result_truncated" for m, _ in audit.warnings)
+    _, kw = next(w for w in audit.warnings if w[0] == "tool_loop_result_truncated")
+    assert kw["original_chars"] == 500
+    assert kw["cap_chars"] == 100
+    assert kw["removed_chars"] == 400
+    assert kw["tool_name"] == "search"
+
+
+@pytest.mark.asyncio
+async def test_resume_execute_decision_truncates() -> None:
+    """The post-approval resume() executor path is capped too."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    # Round 1: model asks for a confirm-required tool -> loop suspends.
+    sdk.messages.responses.append(make_tool_use(name="write", tool_input={"body": "x"}))
+    # After resume executes + commits, model answers.
+    sdk.messages.responses.append(make_ok(text="ok"))
+
+    def _confirm(name: str, _inp: dict) -> bool:
+        return name == "write"
+
+    suspend = await loop.run(
+        static_system_prefix="SYS",
+        user_message="do it",
+        tools=[{"name": "write", "input_schema": {}}],
+        executor=_never_called,
+        max_rounds=3,
+        confirm=_confirm,
+        max_result_chars=100,
+    )
+    assert suspend.pending_confirmation is not None
+    resumed = await loop.resume(
+        state=suspend.pending_confirmation.state,
+        decision=ExecuteDecision(),
+        tools=[{"name": "write", "input_schema": {}}],
+        executor=_big_executor("D" * 500),
+        confirm=_confirm,
+        static_system_prefix="SYS",
+        max_rounds=3,
+        max_result_chars=100,
+    )
+    # The suspending round's call is in the committed steps of the resumed result.
+    all_calls = [c for s in resumed.steps for c in s.tool_calls]
+    write_call = next(c for c in all_calls if c.name == "write")
+    assert write_call.result.startswith("D" * 100)
+    assert "TRUNCATED" in write_call.result

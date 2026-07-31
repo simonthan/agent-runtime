@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.16.0 — 2026-07-31
+
+### Added
+- `max_result_chars: int | None = None` keyword on `ToolUseLoop.run` AND
+  `ToolUseLoop.resume` (`llm/tool_loop.py`). When set, every EXECUTOR-produced tool
+  result longer than the cap is truncated to the first `max_result_chars` characters
+  and an explicit `_TRUNCATION_MARKER` is appended, so the model is told the result is
+  partial (silent clipping would make a knowledge bot summarise a fragment as if it were
+  whole). `is_error` is preserved; the `InjectResultDecision` (consumer-supplied)
+  content is not capped. A `tool_loop_result_truncated` warning is emitted to the
+  consumer's `AuditLogger`. Measurement is on characters (exact, zero-cost,
+  deterministic — keeps the multi-round cache prefix byte-stable); the marker reports an
+  estimated token figure via `estimate_tokens`. Default `None` = no cap = byte-for-byte
+  identical to v0.15.0 (regression guarantee for ithelpdesk and all existing callers).
+  The loop owns no default ceiling; the consumer supplies it, exactly as with
+  `max_rounds`. Fixes the unbounded-tool-result class behind TBP T-081 (a live
+  `copilot_retrieval` returned 163,563 tokens into a single turn).
+
+### Notes
+- The cap is per result, not per turn: a round with several large tools can still stack
+  multiple capped results. The per-turn aggregate remains bounded only by `max_rounds`;
+  a per-turn aggregate cap is a possible future hardening.
+- `_resolve_round` changed from a static to an instance method (internal) so it can
+  reach the loop's `AuditLogger`. No public API impact.
+
 ## v0.15.0 — 2026-07-30
 
 ### Added

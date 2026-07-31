@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent_runtime.llm.client import AnthropicClient, assemble_history_messages
+from agent_runtime.llm.compaction import estimate_tokens
 from agent_runtime.llm.models import LLMImage
 from agent_runtime.logging import AuditLogger, NullAuditLogger
 
@@ -40,6 +41,16 @@ __all__ = [
     "ToolResult",
     "ToolUseLoop",
 ]
+
+# Appended to a tool result that exceeded `max_result_chars`. EXPLICIT by design:
+# a knowledge bot handed a silently-clipped corpus will summarise a fragment as if it
+# were whole (a correctness bug, not just a cost bug). See TBP T-081.
+_TRUNCATION_MARKER = (
+    "\n\n[TRUNCATED BY agent-runtime: this tool result was {original} characters "
+    "(~{est_tokens} tokens) and exceeded the {cap}-character limit; {removed} "
+    "characters were removed from the end. This is a PARTIAL result — do not assume "
+    "it is complete, and do not treat the omitted content as unimportant.]"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +180,7 @@ class ToolUseLoop:
         model: str | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        max_result_chars: int | None = None,
     ) -> ToolLoopResult:
         """Run the fenced loop. `max_rounds` caps model turns that return
         stop_reason=='tool_use'. Returns once the model stops requesting tools, the
@@ -194,7 +206,12 @@ class ToolUseLoop:
         if the turn suspends on a confirm-gated tool, ride `state["messages"]`
         into the consumer's suspend store verbatim — cap count/size upstream.
         Consumers persist their OWN history; store a text manifest for image
-        turns, not content blocks."""
+        turns, not content blocks.
+
+        `max_result_chars` (T-081a) caps each EXECUTOR-produced tool result to that
+        many characters, appending an explicit truncation marker on overflow. Default
+        `None` = no cap = byte-for-byte unchanged (regression guarantee). The loop owns
+        no default; the consumer supplies the ceiling, exactly as it supplies max_rounds."""
         system_blocks = self._build_system_blocks(static_system_prefix, dynamic_system_suffix)
         first_user: list[dict[str, Any]] = []
         if retrieval_block:
@@ -224,6 +241,7 @@ class ToolUseLoop:
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
+            max_result_chars=max_result_chars,
         )
 
     async def resume(
@@ -240,6 +258,7 @@ class ToolUseLoop:
         model: str | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        max_result_chars: int | None = None,
     ) -> ToolLoopResult:
         """Resume a loop suspended by a confirm-required tool. `state` is the opaque
         dict from `PendingConfirmation.state` (may have been JSON round-tripped through
@@ -247,6 +266,9 @@ class ToolUseLoop:
         round (may suspend AGAIN on a later confirm-required block in the same round —
         D5) and drives on. Re-supply the same `tools`/`executor`/`confirm`/system args
         as the originating `run()`; only conversation progress lives in `state`.
+
+        `max_result_chars` mirrors `run()` (T-081a) and must be re-supplied by the
+        consumer on every call — only conversation progress lives in `state`.
 
         TOKENS (split billing, D6): the returned counts are CONTINUATION-ONLY — they do
         NOT include the suspending run()'s tokens. A consumer tracking per-turn spend
@@ -275,6 +297,9 @@ class ToolUseLoop:
                 decision.tool_input if decision.tool_input is not None else pending["input"]
             )
             outcome = await executor(pending["name"], tool_input)
+            outcome = self._cap_result(
+                tool_name=pending["name"], outcome=outcome, max_result_chars=max_result_chars
+            )
             call_input, call_result, call_is_error = tool_input, outcome.content, outcome.is_error
         else:  # InjectResultDecision — no executor call (D2)
             call_input, call_result, call_is_error = (
@@ -299,6 +324,7 @@ class ToolUseLoop:
             calls=calls,
             executor=executor,
             confirm=confirm,
+            max_result_chars=max_result_chars,
         )
         if isinstance(round_outcome, _RoundSuspended):
             return self._suspend(
@@ -330,6 +356,7 @@ class ToolUseLoop:
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
+            max_result_chars=max_result_chars,
         )
 
     async def _drive(
@@ -347,6 +374,7 @@ class ToolUseLoop:
         model: str | None,
         max_tokens: int | None,
         temperature: float | None,
+        max_result_chars: int | None,
     ) -> ToolLoopResult:
         """Shared round engine. `while rounds < max_rounds` (correct at the
         max_rounds=0 boundary — zero tool rounds, straight to the forced answer)."""
@@ -372,6 +400,7 @@ class ToolUseLoop:
                 calls=[],
                 executor=executor,
                 confirm=confirm,
+                max_result_chars=max_result_chars,
             )
             if isinstance(outcome, _RoundSuspended):
                 return self._suspend(
@@ -407,23 +436,29 @@ class ToolUseLoop:
             final.content, "cap_exhausted", cap_exhausted=True, steps=steps, agg=agg
         )
 
-    @staticmethod
     async def _resolve_round(
+        self,
         *,
         tool_uses: list[dict[str, Any]],
         start_index: int,
         calls: list[ToolCall],
         executor: ToolExecutor,
         confirm: ConfirmPredicate | None,
+        max_result_chars: int | None,
     ) -> _RoundOutcome:
         """Iterate tool_use blocks from `start_index`, executing non-confirm tools
         (D3). Returns _RoundSuspended at the first confirm-required block, else
-        _RoundCompleted once every block has a call. Mutates+returns `calls`."""
+        _RoundCompleted once every block has a call. Mutates+returns `calls`.
+        Each executor result is size-capped via `_cap_result` before it is frozen
+        into a ToolCall (T-081a)."""
         for i in range(start_index, len(tool_uses)):
             tu = tool_uses[i]
             if confirm is not None and confirm(tu["name"], tu["input"]):
                 return _RoundSuspended(pending_index=i, calls=calls)
             outcome = await executor(tu["name"], tu["input"])
+            outcome = self._cap_result(
+                tool_name=tu["name"], outcome=outcome, max_result_chars=max_result_chars
+            )
             calls.append(
                 ToolCall(
                     id=tu["id"],
@@ -434,6 +469,40 @@ class ToolUseLoop:
                 )
             )
         return _RoundCompleted(calls=calls)
+
+    def _cap_result(
+        self, *, tool_name: str, outcome: ToolResult, max_result_chars: int | None
+    ) -> ToolResult:
+        """Bound an executor's tool result before it enters the conversation.
+
+        Returns `outcome` unchanged when no cap is set (`None`) or the content fits —
+        the byte-for-byte regression guarantee for callers that never pass a cap.
+        On overflow, keeps the first `max_result_chars` characters and appends an
+        EXPLICIT truncation marker (silent clipping misleads the model). `is_error`
+        is preserved: truncation is not a tool failure. Measurement is on characters
+        (exact, zero-cost, deterministic — see plan §2); the marker reports an
+        estimated token figure via `estimate_tokens` for readability only."""
+        if max_result_chars is None:
+            return outcome
+        original = len(outcome.content)
+        if original <= max_result_chars:
+            return outcome
+        removed = original - max_result_chars
+        kept = outcome.content[:max_result_chars]
+        marker = _TRUNCATION_MARKER.format(
+            original=original,
+            est_tokens=estimate_tokens(outcome.content),
+            cap=max_result_chars,
+            removed=removed,
+        )
+        self._audit.warning(
+            "tool_loop_result_truncated",
+            tool_name=tool_name,
+            original_chars=original,
+            cap_chars=max_result_chars,
+            removed_chars=removed,
+        )
+        return ToolResult(content=kept + marker, is_error=outcome.is_error)
 
     @staticmethod
     def _commit_round(
