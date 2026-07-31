@@ -49,3 +49,53 @@ async def test_send_oauth_card_wraps_in_oauth_attachment(turn_context):
     assert len(activity.attachments) == 1
     assert activity.attachments[0].content_type == "application/vnd.microsoft.card.oauth"
     assert activity.attachments[0].content == card
+
+
+async def test_get_sign_in_resource_maps_response(turn_context):
+    turn_context.activity.from_property.id = "29:user-abc"
+    resp = MagicMock()
+    resp.sign_in_link = "https://token.botframework.com/api/oauth/signin?signature=xyz"
+    resp.token_exchange_resource = MagicMock(uri="api://obo-client-id")
+    turn_context.adapter.get_sign_in_resource_from_user = AsyncMock(return_value=resp)
+    channel = BotFrameworkOutboundChannel(turn_context)
+    out = await channel.get_sign_in_resource(connection_name="tbp-sso-conn")
+    assert out is not None
+    assert out.sign_in_link == "https://token.botframework.com/api/oauth/signin?signature=xyz"
+    assert out.token_exchange_uri == "api://obo-client-id"
+    turn_context.adapter.get_sign_in_resource_from_user.assert_awaited_once_with(
+        turn_context, "tbp-sso-conn", "29:user-abc"
+    )
+
+
+async def test_get_sign_in_resource_none_without_link(turn_context):
+    turn_context.activity.from_property.id = "29:user-abc"
+    resp = MagicMock()
+    resp.sign_in_link = None
+    turn_context.adapter.get_sign_in_resource_from_user = AsyncMock(return_value=resp)
+    channel = BotFrameworkOutboundChannel(turn_context)
+    assert await channel.get_sign_in_resource(connection_name="c") is None
+
+
+async def test_get_sign_in_resource_none_without_connection(turn_context):
+    channel = BotFrameworkOutboundChannel(turn_context)
+    # Empty connection short-circuits BEFORE touching the adapter.
+    assert await channel.get_sign_in_resource(connection_name="") is None
+
+
+async def test_get_sign_in_resource_none_when_adapter_lacks_method(turn_context):
+    turn_context.activity.from_property.id = "29:user-abc"
+    turn_context.adapter = object()  # e.g. a continued/proactive context
+    channel = BotFrameworkOutboundChannel(turn_context)
+    assert await channel.get_sign_in_resource(connection_name="c") is None
+
+
+async def test_get_sign_in_resource_none_on_token_service_error(turn_context):
+    # Fail-safe (Opus R3 HIGH): a transient token-service raise must degrade to None,
+    # NOT propagate — the dispatcher prompts SSO before answering the turn, so a raise
+    # here would strand the user.
+    turn_context.activity.from_property.id = "29:user-abc"
+    turn_context.adapter.get_sign_in_resource_from_user = AsyncMock(
+        side_effect=RuntimeError("token service 503")
+    )
+    channel = BotFrameworkOutboundChannel(turn_context)
+    assert await channel.get_sign_in_resource(connection_name="c") is None

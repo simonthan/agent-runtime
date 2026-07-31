@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.15.0 — 2026-07-30
+
+### Added
+- `SignInResource` frozen dataclass + `OutboundChannel.get_sign_in_resource(*, connection_name)`
+  (`transport/teams/outbound.py`, re-exported from `agent_runtime.transport.teams`).
+  `BotFrameworkOutboundChannel` implements it via
+  `BotFrameworkAdapter.get_sign_in_resource_from_user`, returning the signed
+  token-service sign-in link + token-exchange URI, or `None` when no resource can be
+  obtained (empty connection, missing user id, non-BotFramework turn context, or no
+  sign-in link). Enables consumers to build a Teams-renderable OAuthCard with a valid
+  `signin` button instead of a hand-authored `api://` value (unblocks TBP T-075).
+  `FakeOutboundChannel` gains an injectable `sign_in_resource` field. Additive —
+  existing `OutboundChannel` implementations gain one Protocol method; default `None`
+  return keeps all current send paths byte-identical.
+
 ## v0.14.0 — 2026-07-29
 
 ### Added

@@ -8,6 +8,7 @@ Public surface: ``FakeOutboundChannel``, ``make_conversation_ref``,
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from agent_runtime.transport.teams.events import (
     ConversationRef,
@@ -18,6 +19,9 @@ from agent_runtime.transport.teams.events import (
     InlineImageAttachment,
 )
 
+if TYPE_CHECKING:
+    from agent_runtime.transport.teams.outbound import SignInResource
+
 
 @dataclass
 class FakeOutboundChannel:
@@ -27,6 +31,7 @@ class FakeOutboundChannel:
     sent_cards: list[dict] = field(default_factory=list)
     sent_oauth_cards: list[dict] = field(default_factory=list)
     sent_typing_count: int = 0
+    sign_in_resource: SignInResource | None = None
 
     async def send_text(self, text: str) -> None:
         self.sent_texts.append(text)
@@ -39,6 +44,13 @@ class FakeOutboundChannel:
 
     async def send_typing(self) -> None:
         self.sent_typing_count += 1
+
+    async def get_sign_in_resource(
+        self,
+        *,
+        connection_name: str,  # noqa: ARG002 — Fake ignores the arg, returns the injected value
+    ) -> SignInResource | None:
+        return self.sign_in_resource
 
     def clear(self) -> None:
         self.sent_texts.clear()
