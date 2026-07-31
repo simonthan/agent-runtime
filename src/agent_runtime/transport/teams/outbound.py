@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Protocol
 
 from botbuilder.schema import Activity, ActivityTypes, Attachment
 
+from agent_runtime.safety import mask_telemetry
+
 if TYPE_CHECKING:
     from botbuilder.core import TurnContext
 
@@ -90,11 +92,14 @@ class BotFrameworkOutboundChannel:
             return None
         try:
             resp = await get(self._turn_context, connection_name, user_id)
-        except Exception:  # noqa: BLE001 — token-service blip must not strand the turn (fail-safe)
+        except Exception as exc:  # noqa: BLE001 — token-service blip must not strand the turn (fail-safe)
+            # mask_telemetry (not exc_info=True): the underlying msrest/Graph HTTP error can
+            # embed the token-service request URL, which may carry an Entra OID or tenant
+            # GUID segment (T-021a telemetry-leak precedent — see identity.py, connectors/base.py).
             logger.warning(
-                "Token-service get_sign_in_resource failed (connection=%s)",
+                "Token-service get_sign_in_resource failed (connection=%s): %s",
                 connection_name,
-                exc_info=True,
+                mask_telemetry(str(exc)),
             )
             return None
         sign_in_link = getattr(resp, "sign_in_link", None)
