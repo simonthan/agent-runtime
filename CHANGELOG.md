@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.18.0 — 2026-08-02
+
+### Fixed
+- **`SessionManager` silently reset a live conversation every `idle_timeout`.** The
+  `(user_id, bot_id)` reverse index was written with `ex=idle_timeout` exactly ONCE, in
+  `create_session`, and never refreshed — while the session key's own lease *was*
+  extended on every turn. So the index expired `idle_timeout` after session CREATION even
+  on a continuously active conversation. The next turn missed the `Active` hot path, fell
+  into cold-cache rehydration, and that path built `SessionData` with a hard-coded empty
+  `conversation_history`; `_save_session` then overwrote the still-intact Redis blob with
+  it. Net effect: the bot forgot the entire conversation while the session kept its id and
+  `status="active"`, so the user got no notice at all. Observed live in TBP 2026-08-02 — a
+  10-turn session created 00:12:32Z lost all 18 messages on the 00:43:49Z turn (77 s after
+  the index's 30-minute expiry); token telemetry showed `cache_read=0` and a
+  `cache_creation` byte-identical to the session's cold start.
+  - **Fix A** — `_rearm_active_index`: the index lease is now extended on the same beat as
+    the session lease, on every `Active` decision. `xx=True`, so a session closed by
+    `end_session` (which deletes the key) is never resurrected.
+  - **Fix B** — `_load_durable_history`: both rebuild-from-Postgres paths
+    (`get_or_prompt_resume` cold-cache rehydration and `_resume_from_db`) now hydrate the
+    transcript from the durable store instead of hard-coding `[]`. Requires a repo
+    advertising `supports_durable_history = True` (T-036); without one, behaviour is
+    unchanged. Best-effort — a durable-read failure logs a warning and degrades to empty
+    history rather than denying the user their session.
+
+  Fix B is the safety net: it makes *any* future loss of the Redis hot cache
+  (eviction, restart, flush) non-destructive, not just the index-expiry path in Fix A.
+
 ## v0.17.0 — 2026-07-31
 
 ### Changed

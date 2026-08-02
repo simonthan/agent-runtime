@@ -188,18 +188,12 @@ class SessionManager:
                 case Active(session_id=existing_sid):
                     existing = await self.get_session(existing_sid)
                     last_ts = existing.updated_at if existing else _utc_now()
-                    raise SessionAlreadyActive(
-                        session_id=existing_sid, last_activity_ts=last_ts
-                    )
+                    raise SessionAlreadyActive(session_id=existing_sid, last_activity_ts=last_ts)
                 case Resumable(session_id=existing_sid, last_activity_ts=last_ts):
-                    raise SessionAlreadyActive(
-                        session_id=existing_sid, last_activity_ts=last_ts
-                    )
+                    raise SessionAlreadyActive(session_id=existing_sid, last_activity_ts=last_ts)
                 case NewSession():
                     # Shouldn't happen here, but treat defensively as a race loss
-                    raise SessionAlreadyActive(
-                        session_id=session_id, last_activity_ts=_utc_now()
-                    )
+                    raise SessionAlreadyActive(session_id=session_id, last_activity_ts=_utc_now())
 
         await self._save_session(session)
 
@@ -272,15 +266,11 @@ class SessionManager:
                 self._max_history is not None
                 and len(session.conversation_history) > self._max_history
             ):
-                session.conversation_history = session.conversation_history[
-                    -self._max_history :
-                ]
+                session.conversation_history = session.conversation_history[-self._max_history :]
             # T-036: durable write-through. Persists `entry` (the individual message),
             # NOT the trimmed list, so durable completeness holds across turns even when
             # Redis trims. Best-effort; no-op without a durable repo.
-            await self._persist_message_to_db(
-                session.id, session.user_id, session.bot_id, entry
-            )
+            await self._persist_message_to_db(session.id, session.user_id, session.bot_id, entry)
 
         session.updated_at = _utc_now()
         await self._save_session(session)
@@ -297,9 +287,7 @@ class SessionManager:
         await self._save_session(session)
 
         # Clear the reverse index so create_session may claim it again
-        await self.redis.delete(
-            self._active_index_key(session.user_id, session.bot_id)
-        )
+        await self.redis.delete(self._active_index_key(session.user_id, session.bot_id))
 
         # Decrement per-user active session counter
         count_key = self._count_key(session.user_id)
@@ -329,9 +317,7 @@ class SessionManager:
             bot_id: Owning bot (for ownership validation — new dimension).
         """
         # Check if this is a resume token (OID-scoped per T-512)
-        mapped_session_id = await self.redis.get(
-            self._resume_key(user_id, session_id_or_token)
-        )
+        mapped_session_id = await self.redis.get(self._resume_key(user_id, session_id_or_token))
         actual_session_id = mapped_session_id or session_id_or_token
 
         session = await self.get_session(actual_session_id)
@@ -400,6 +386,55 @@ class SessionManager:
         )
         return bool(result)
 
+    async def _load_durable_history(
+        self, session_id: str, user_id: str, bot_id: str
+    ) -> list[dict[str, Any]]:
+        """Read the durable transcript for a session being rebuilt from Postgres.
+
+        T-093 Fix B: both rebuild paths (cold-cache rehydration in
+        ``get_or_prompt_resume`` and ``_resume_from_db``) used to hard-code an empty
+        ``conversation_history``. ``_save_session`` then OVERWROTE an otherwise-intact
+        Redis blob with it — the session kept its id and stayed "active", so the user
+        got no notice and the bot silently forgot the whole conversation (observed
+        live 2026-08-02). Returns ``[]`` when the repo has no durable capability.
+
+        Best-effort by design: a durable-store outage must not deny the user their
+        session, so a read failure degrades to the old empty-history behaviour.
+        """
+        if self._durable is None:
+            return []
+        try:
+            return await self._durable.get_conversation_history(
+                session_id=session_id,
+                user_id=user_id,
+                bot_id=bot_id,
+            )
+        except Exception as e:  # noqa: BLE001 - degrade, never block the turn
+            self._log.warning(
+                "Durable history rehydration failed; continuing with empty history",
+                session_id=session_id,
+                error=mask_telemetry(str(e)),
+            )
+            return []
+
+    async def _rearm_active_index(self, user_id: str, bot_id: str, session_id: str) -> None:
+        """Extend the (user, bot) reverse-index lease alongside the session lease.
+
+        T-093 Fix A: the index was written with `ex` exactly ONCE, at
+        create_session, and never refreshed — so it expired ``idle_timeout`` after
+        session CREATION even while the user was still actively talking, while the
+        session key's own lease kept being extended on every turn. The next turn
+        then missed the hot path and fell into cold-cache rehydration, which used to
+        reset the transcript (see Fix B). ``xx=True`` so a session deliberately
+        closed by ``end_session`` (which deletes this key) is never resurrected.
+        """
+        await self.redis.set(
+            self._active_index_key(user_id, bot_id),
+            session_id,
+            ex=self._ttl_seconds,
+            xx=True,
+        )
+
     async def get_or_prompt_resume(
         self,
         *,
@@ -449,6 +484,7 @@ class SessionManager:
                         xx=True,
                     )
                     if ok:
+                        await self._rearm_active_index(user_id, bot_id, session_id)
                         return Active(session_id=session_id)
                     # XX-set failed → key evicted between get_session and SET.
                     # Fall through to Resumable — do NOT do a fresh DB lookup
@@ -468,6 +504,8 @@ class SessionManager:
             return NewSession()
 
         last = _ensure_utc(row.last_message_at or row.created_at)
+        # T-093 Fix B — see _load_durable_history for why this is load-bearing.
+        history = await self._load_durable_history(str(row.id), user_id, bot_id)
         session = SessionData(
             id=str(row.id),
             user_id=row.user_id,
@@ -475,6 +513,7 @@ class SessionManager:
             created_at=_ensure_utc(row.created_at),
             updated_at=last,
             status="active",
+            conversation_history=history,
             client_context=row.client_context,
         )
         await self._save_session(session)
@@ -641,6 +680,10 @@ class SessionManager:
             )
             if not row:
                 return None
+            # T-093 Fix B: same empty-transcript defect as the cold-cache path — this
+            # is the branch reached when the session key is evicted mid-window
+            # (get_session's XX-lease-extend failure).
+            history = await self._load_durable_history(str(row.id), user_id, bot_id)
             return SessionData(
                 id=str(row.id),
                 user_id=row.user_id,
@@ -649,7 +692,7 @@ class SessionManager:
                 updated_at=_ensure_utc(row.last_message_at or row.created_at),
                 data={},
                 status=row.status,
-                conversation_history=[],
+                conversation_history=history,
                 client_context=row.client_context,
             )
         except Exception as e:  # noqa: BLE001

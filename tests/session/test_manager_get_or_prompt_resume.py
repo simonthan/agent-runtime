@@ -26,6 +26,130 @@ def _make_manager(
 
 
 # ---------------------------------------------------------------------------
+# T-093 — the reverse index must not outlive-by-expiry an active conversation,
+# and a cold rehydration must never silently drop the transcript.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingRedis(FakeRedisClient):
+    """FakeRedisClient that records every set() so TTL re-arming is observable
+    (the base fake ignores `ex`, so the effect is invisible in the store)."""
+
+    def __init__(self):
+        super().__init__()
+        self.sets: list[tuple[str, int | None, bool, bool]] = []
+
+    async def set(self, key, value, ex=None, px=None, nx=False, xx=False):
+        result = await super().set(key, value, ex=ex, px=px, nx=nx, xx=xx)
+        if result:
+            self.sets.append((key, ex, nx, xx))
+        return result
+
+
+async def test_active_turn_rearms_reverse_index_ttl():
+    """T-093 Fix A: every Active decision re-arms the (user,bot) index lease.
+
+    Before the fix the index was written once, at create_session, with a plain
+    `ex` — so it expired idle_timeout after CREATION even while the user was
+    still talking, and the very next turn missed the hot path.
+    """
+    redis = _RecordingRedis()
+    repo = FakeSessionRepository()
+    mgr = SessionManager(session_repo=repo, redis_client=redis, idle_timeout=timedelta(minutes=30))
+    session = await mgr.create_session(user_id="u1", bot_id="b1")
+    index_key = "session:active:u1:b1"
+    redis.sets.clear()
+
+    decision = await mgr.get_or_prompt_resume(user_id="u1", bot_id="b1")
+    assert isinstance(decision, Active)
+
+    rearms = [s for s in redis.sets if s[0] == index_key]
+    assert rearms, "the reverse index lease was never extended on an active turn"
+    key, ex, _nx, xx = rearms[-1]
+    assert ex == 1800, "index TTL must be re-armed to the full idle window"
+    assert xx is True, "must not resurrect an index deleted by end_session"
+    assert await redis.get(index_key) == session.id
+
+
+async def test_ended_session_index_is_not_resurrected():
+    """Fix A uses XX so a deliberately ended session cannot be revived."""
+    redis = _RecordingRedis()
+    repo = FakeSessionRepository()
+    mgr = SessionManager(session_repo=repo, redis_client=redis)
+    session = await mgr.create_session(user_id="u1", bot_id="b1")
+    await mgr.end_session(session.id)
+
+    assert await redis.get("session:active:u1:b1") is None
+    decision = await mgr.get_or_prompt_resume(user_id="u1", bot_id="b1")
+    assert not isinstance(decision, Active)
+
+
+async def test_cold_rehydration_restores_durable_transcript():
+    """T-093 Fix B: the live 2026-08-02 failure, end to end.
+
+    The reverse index expires mid-conversation; the next turn falls into
+    cold-cache rehydration. That path used to build SessionData with an empty
+    conversation_history and then _save_session OVERWROTE the intact Redis blob
+    with it — the bot forgot everything while the session stayed active.
+    """
+    mgr, redis, _repo = _make_manager()
+    session = await mgr.create_session(user_id="u1", bot_id="b1")
+    await mgr.update_session(session.id, add_message={"role": "user", "content": "receipt?"})
+    await mgr.update_session(session.id, add_message={"role": "assistant", "content": "got it"})
+
+    # Simulate ONLY the reverse index lapsing (the real bug: the session blob's
+    # lease is still being extended every turn, so it is very much alive).
+    await redis.delete("session:active:u1:b1")
+
+    decision = await mgr.get_or_prompt_resume(user_id="u1", bot_id="b1")
+    assert isinstance(decision, Resumable)
+    assert decision.session_id == session.id
+
+    rehydrated = await mgr.get_session(session.id)
+    assert rehydrated is not None
+    contents = [m["content"] for m in rehydrated.conversation_history]
+    assert contents == ["receipt?", "got it"], "cold rehydration silently dropped the transcript"
+
+
+async def test_cold_rehydration_without_durable_repo_still_works():
+    """No durable capability → old behaviour (empty history), never a crash."""
+    redis = FakeRedisClient()
+    repo = FakeSessionRepository()
+    repo.supports_durable_history = False
+    mgr = SessionManager(session_repo=repo, redis_client=redis)
+    session = await mgr.create_session(user_id="u1", bot_id="b1")
+    await mgr.update_session(session.id, add_message={"role": "user", "content": "hi"})
+    await redis.delete("session:active:u1:b1")
+
+    decision = await mgr.get_or_prompt_resume(user_id="u1", bot_id="b1")
+    assert isinstance(decision, Resumable)
+    rehydrated = await mgr.get_session(session.id)
+    assert rehydrated is not None
+    assert rehydrated.conversation_history == []
+
+
+async def test_durable_read_failure_degrades_instead_of_blocking():
+    """A durable-store outage must not deny the user their session."""
+    redis = FakeRedisClient()
+    repo = FakeSessionRepository()
+    mgr = SessionManager(session_repo=repo, redis_client=redis)
+    session = await mgr.create_session(user_id="u1", bot_id="b1")
+    await mgr.update_session(session.id, add_message={"role": "user", "content": "hi"})
+    await redis.delete("session:active:u1:b1")
+
+    async def _boom(**_kwargs):
+        raise RuntimeError("postgres down")
+
+    repo.get_conversation_history = _boom  # type: ignore[method-assign]
+
+    decision = await mgr.get_or_prompt_resume(user_id="u1", bot_id="b1")
+    assert isinstance(decision, Resumable)
+    rehydrated = await mgr.get_session(session.id)
+    assert rehydrated is not None
+    assert rehydrated.conversation_history == []
+
+
+# ---------------------------------------------------------------------------
 # NewSession: cold (Redis miss + DB miss)
 # ---------------------------------------------------------------------------
 
@@ -177,9 +301,7 @@ async def test_update_session_raw_dict_pass_through():
 async def test_update_session_replace_data():
     """replace_data=True replaces entire data dict."""
     mgr, _, _ = _make_manager()
-    session = await mgr.create_session(
-        user_id="u1", bot_id="b1", initial_context={"old": "data"}
-    )
+    session = await mgr.create_session(user_id="u1", bot_id="b1", initial_context={"old": "data"})
 
     updated = await mgr.update_session(
         session.id,
