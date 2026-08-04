@@ -36,12 +36,13 @@ class SignInResource:
 
 
 class OutboundChannel(Protocol):
-    """Minimal outbound surface — text, Adaptive Card, OAuth Card, typing indicator."""
+    """Minimal outbound surface — text, Adaptive Card, OAuth Card, typing, edit-in-place."""
 
-    async def send_text(self, text: str) -> None: ...
+    async def send_text(self, text: str) -> str | None: ...
     async def send_card(self, card: dict) -> None: ...
     async def send_oauth_card(self, card: dict) -> None: ...
     async def send_typing(self) -> None: ...
+    async def update_activity(self, activity_id: str, text: str) -> bool: ...
     async def get_sign_in_resource(self, *, connection_name: str) -> SignInResource | None: ...
 
 
@@ -51,8 +52,62 @@ class BotFrameworkOutboundChannel:
     def __init__(self, turn_context: TurnContext) -> None:
         self._turn_context = turn_context
 
-    async def send_text(self, text: str) -> None:
-        await self._turn_context.send_activity(Activity(type=ActivityTypes.message, text=text))
+    async def send_text(self, text: str) -> str | None:
+        """Send a message activity; return the channel-assigned activity id.
+
+        The id is what ``update_activity`` targets (T-107). Returns ``None`` when the
+        message cannot be edited later, so a consumer's ``if not activity_id`` degrade
+        check is sufficient.
+
+        The trailing ``or None`` is load-bearing, not defensive noise: when the Connector
+        returns a falsy response, botbuilder substitutes
+        ``ResourceResponse(id=activity.id or "")`` (bot_framework_adapter.py:722-723) — and
+        ``activity.id`` was already hard-nulled by the outbound validator
+        (turn_context.py:191). That path therefore yields the EMPTY STRING, not ``None``.
+        Without ``or None`` a caller testing ``activity_id is None`` would sail past the
+        guard and edit-loop against an id that can never match.
+
+        Send failures still RAISE — T-089's ``dispatcher._safe_send`` catches them.
+        """
+        response = await self._turn_context.send_activity(
+            Activity(type=ActivityTypes.message, text=text)
+        )
+        return getattr(response, "id", None) or None
+
+    async def update_activity(self, activity_id: str, text: str) -> bool:
+        """Replace the text of a previously sent bot message. Returns True on success.
+
+        Returns ``False`` — never raises — when the id is empty or the Connector edit
+        fails (channel quirk, expired/deleted message, 4xx/5xx). The caller's degrade
+        signal is the return value, not an exception: T-107's consumer (T-109's progress
+        ticker) must fall back to a one-shot notice without killing the turn.
+
+        ``TurnContext.update_activity`` applies the conversation reference to the activity
+        before dispatching and does NOT clobber ``id`` (only ``reply_to_id``), so setting
+        type/id/text here is sufficient. The adapter resolves the SAME cached
+        ``ConnectorClient`` from ``turn_state`` that ``send_activities`` uses, so this works
+        identically on the T-089 detached-turn path.
+
+        ``CancelledError`` is a ``BaseException`` and deliberately propagates — T-109
+        cancels the progress ticker in a ``finally``.
+        """
+        if not activity_id:
+            return False
+        try:
+            await self._turn_context.update_activity(
+                Activity(type=ActivityTypes.message, id=activity_id, text=text)
+            )
+        except Exception as exc:  # noqa: BLE001 — a failed edit degrades the caller, never the turn
+            # mask_telemetry (not exc_info=True): the msrest/Connector error can embed the
+            # service URL, which carries tenant/conversation segments (T-021a precedent,
+            # same treatment as get_sign_in_resource below).
+            logger.warning(
+                "update_activity failed (%s): %s",
+                type(exc).__name__,
+                mask_telemetry(str(exc)),
+            )
+            return False
+        return True
 
     async def send_card(self, card: dict) -> None:
         attachment = Attachment(content_type=_ADAPTIVE_CARD_CONTENT_TYPE, content=card)

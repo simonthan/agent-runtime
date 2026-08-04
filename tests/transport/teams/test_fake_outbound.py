@@ -59,3 +59,25 @@ async def test_fake_get_sign_in_resource_returns_injected():
 async def test_fake_get_sign_in_resource_defaults_none():
     ch = FakeOutboundChannel()
     assert await ch.get_sign_in_resource(connection_name="c") is None
+
+
+async def test_fake_send_text_returns_incrementing_activity_ids():
+    fake = FakeOutboundChannel()
+    assert await fake.send_text("one") == "activity-1"
+    assert await fake.send_text("two") == "activity-2"
+
+
+async def test_fake_update_activity_records_and_clears():
+    fake = FakeOutboundChannel()
+    aid = await fake.send_text("working…")
+    assert await fake.update_activity(aid, "working… 12s") is True
+    assert fake.updates == [("activity-1", "working… 12s")]
+    fake.clear()
+    assert fake.updates == []
+    assert fake.supports_update is True  # capability survives clear()
+
+
+async def test_fake_update_activity_unsupported_returns_false():
+    fake = FakeOutboundChannel(supports_update=False)
+    assert await fake.update_activity("activity-1", "x") is False
+    assert fake.updates == []

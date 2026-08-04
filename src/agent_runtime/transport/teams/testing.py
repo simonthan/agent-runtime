@@ -32,9 +32,20 @@ class FakeOutboundChannel:
     sent_oauth_cards: list[dict] = field(default_factory=list)
     sent_typing_count: int = 0
     sign_in_resource: SignInResource | None = None
+    updates: list[tuple[str, str]] = field(default_factory=list)
+    supports_update: bool = True
 
-    async def send_text(self, text: str) -> None:
+    async def send_text(self, text: str) -> str | None:
         self.sent_texts.append(text)
+        return f"activity-{len(self.sent_texts)}"
+
+    async def update_activity(self, activity_id: str, text: str) -> bool:
+        """Record the edit and report success. Set ``supports_update=False`` to model a
+        channel that cannot edit (returns False, records nothing) — the degrade path."""
+        if not self.supports_update:
+            return False
+        self.updates.append((activity_id, text))
+        return True
 
     async def send_card(self, card: dict) -> None:
         self.sent_cards.append(card)
@@ -57,6 +68,7 @@ class FakeOutboundChannel:
         self.sent_cards.clear()
         self.sent_oauth_cards.clear()
         self.sent_typing_count = 0
+        self.updates.clear()
 
 
 def make_conversation_ref(**overrides: str) -> ConversationRef:
