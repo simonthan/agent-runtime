@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.19.0 — 2026-08-04
+
+### Added
+- **`OutboundChannel.update_activity(activity_id, text) -> bool`** — edit a previously sent
+  bot message in place, backed by Bot Framework's Connector `update_activity`. Returns
+  `False` (never raises) on an empty id or a failed edit, so callers degrade on a return
+  value instead of branching on channel type. Works unchanged on a detached-turn context:
+  the adapter resolves the same cached `ConnectorClient` from `turn_state` that
+  `send_activities` uses. `CancelledError` deliberately propagates.
+- **`FakeOutboundChannel.updates` / `supports_update`** — the test double records edits and
+  can model an edit-incapable channel. `clear()` resets `updates`; `supports_update` is an
+  injected capability and survives it.
+
+### Changed
+- **`OutboundChannel.send_text` now returns `str | None`** (was `None`) — the
+  channel-assigned activity id, which is what `update_activity` targets. Source-compatible
+  for every existing caller (all ignore the return). Send failures still raise, unchanged.
+  An empty id is normalised to `None` (botbuilder substitutes `ResourceResponse(id="")` on a
+  falsy Connector response), so `if not activity_id` is a complete degrade check.
+  `FakeOutboundChannel.send_text` returns stable synthetic ids (`activity-1`, …).
+
+### Fixed
+- **Version drift:** `__init__.py` still reported `0.17.0` after the v0.18.0 release bumped
+  only `pyproject.toml` (and `uv.lock`). All sites now read `0.19.0`. This also turns
+  `tests/unit/test_version.py` — the dual-source guard added after the v0.6.2/v0.6.3 drift,
+  and **red since v0.18.0 shipped** — back to green.
+
 ## v0.18.0 — 2026-08-02
 
 ### Fixed
