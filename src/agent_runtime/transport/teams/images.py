@@ -29,6 +29,32 @@ _DEFAULT_ALLOWED_HOSTS: frozenset[str] = frozenset({"smba.trafficmanager.net"})
 
 _DEFAULT_MAX_BYTES = 10 * 1024 * 1024  # phone photos are typically 1-5 MiB
 
+# T-115l -- explicit timeouts for the client this module OWNS. A bare
+# `httpx.AsyncClient()` gets httpx's `DEFAULT_TIMEOUT_CONFIG = Timeout(timeout=5.0)`
+# (httpx 0.28.1, `_config.py:246`) -- 5 s on connect, read, write AND pool. httpx's
+# `read` is re-armed for every 64 KiB socket read and for the response headers
+# (httpcore `_async/http11.py:172-176`, `:195-206`, `READ_NUM_BYTES` `:44`), so 5 s was
+# at once TOO TIGHT for time-to-first-byte on a multi-MiB attachment (the download
+# fails fast having transferred nothing) and NO BOUND at all on the transfer as a
+# whole (~160 reads at the 10 MiB cap => ~13 min of legal stalling).
+#
+# Only the owned client is configured. A caller who injects a client -- documented as
+# being for connection-pool reuse -- owns its per-phase settings; the wall-clock
+# deadline below is what applies to every caller.
+_DOWNLOAD_TIMEOUT = httpx.Timeout(10.0, read=15.0)
+
+# The bound that makes raising `read` safe, and the ONLY total-duration limit httpx can
+# express (it has no whole-request timeout). Without it, `read=15` would push the
+# pathological-stall worst case from ~13 min to ~40 min -- on a path that sits outside
+# every deadline the Teams consumer has: it downloads BEFORE the turn starts, inline
+# inside the Bot Framework inbound-activity webhook request, which the Connector retries
+# after ~15 s. So this is calibrated as low as it defensibly goes, not as high as an
+# image might want: 30 s clears the 10 MiB cap at ~340 KB/s and a typical 1-5 MiB photo
+# at ~170 KB/s. `read` is kept strictly BELOW it so a stalled socket still raises the
+# more diagnostic ReadTimeout rather than an anonymous deadline expiry.
+# Read from the module global at call time so tests can patch it.
+_DOWNLOAD_DEADLINE_SECONDS = 30.0
+
 _MAGIC_SNIFFS: tuple[tuple[bytes, str], ...] = (
     (b"\x89PNG\r\n\x1a\n", "image/png"),
     (b"\xff\xd8\xff", "image/jpeg"),
@@ -58,9 +84,13 @@ class InlineImageDownloadError(Exception):
     """An inline image could not be downloaded or failed validation.
 
     Raised for every failure mode: a non-allowlisted host, connector-token
-    acquisition failure, a non-200 HTTP response, an oversize body, or a
-    non-image response Content-Type. No partial bytes are ever returned to
-    the caller. The consumer decides retry/UX from the message.
+    acquisition failure, a non-200 HTTP response, an oversize body, a
+    non-image response Content-Type, a transport error, or the wall-clock
+    download deadline (T-115l). No partial bytes are ever returned to the
+    caller. The consumer decides retry/UX from the message -- catching this
+    one type is sufficient to degrade gracefully, which is why the httpx
+    exceptions are converted rather than allowed to escape.
+    ``asyncio.CancelledError`` is NOT converted and propagates untouched.
     """
 
 
@@ -177,7 +207,13 @@ async def download_inline_image(
     match a known image signature, raise with the partial bytes discarded.
 
     ``client`` is an injectable ``httpx.AsyncClient`` for tests / connection
-    pool reuse; when omitted, a client is created and closed for this call.
+    pool reuse; when omitted, a client is created and closed for this call,
+    carrying ``_DOWNLOAD_TIMEOUT``. An injected client keeps its own per-phase
+    timeouts, but the ``_DOWNLOAD_DEADLINE_SECONDS`` wall-clock bound applies
+    either way -- like ``max_bytes``, it is a limit this module owns for every
+    caller. Timeouts and transport errors surface as
+    ``InlineImageDownloadError`` (T-115l), so one ``except`` clause is enough
+    for a consumer to skip a failed image instead of failing the whole turn.
     """
     hosts = allowed_hosts if allowed_hosts is not None else _DEFAULT_ALLOWED_HOSTS
     if not _host_is_allowed(att.content_url, hosts):
@@ -189,9 +225,28 @@ async def download_inline_image(
     headers = {"Authorization": f"Bearer {token}"}
 
     owns_client = client is None
-    http_client = client if client is not None else httpx.AsyncClient()
+    http_client = client if client is not None else httpx.AsyncClient(timeout=_DOWNLOAD_TIMEOUT)
     try:
-        return await _stream_download(http_client, att.content_url, headers, max_bytes)
+        async with asyncio.timeout(_DOWNLOAD_DEADLINE_SECONDS):
+            result = await _stream_download(http_client, att.content_url, headers, max_bytes)
+    except TimeoutError as exc:
+        # Our own deadline. httpx's timeouts derive from httpx.HTTPError, not from
+        # builtins.TimeoutError, so this handler is unambiguous. CancelledError is a
+        # BaseException and matches neither handler -- it propagates (T-089/T-090).
+        msg = f"Inline image download exceeded the {_DOWNLOAD_DEADLINE_SECONDS}-second deadline"
+        raise InlineImageDownloadError(msg) from exc
+    except httpx.HTTPError as exc:
+        # The whole transport family (ConnectTimeout/ReadTimeout/ConnectError/...). Before
+        # T-115l these escaped raw, bypassing consumers that catch InlineImageDownloadError
+        # only -- so one slow image failed the entire turn. Type name only, never str(exc):
+        # httpx text embeds connection details (connectors/base.py:177, SEC-2/SEC-3). The
+        # original is chained, so exc_info=True logging still gets everything.
+        msg = f"Inline image download failed at the transport layer: {type(exc).__name__}"
+        raise InlineImageDownloadError(msg) from exc
+    else:
+        # `return` lives in `else`, not in `try`: with handlers present, a return in the
+        # try body trips ruff TRY300 (select = ["ALL"]). `finally` still runs first.
+        return result
     finally:
         if owns_client:
             await http_client.aclose()

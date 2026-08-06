@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.19.1 — 2026-08-06
+
+### Fixed
+- **Teams inline-image downloads ran on httpx's 5-second default and could take down the whole
+  turn.** `download_inline_image` built its owned client as a bare `httpx.AsyncClient()`, so
+  `Timeout(5.0)` governed connect, read, write and pool. httpx applies `read` per 64 KiB socket
+  read (and to the response headers), so 5 s was at once too tight for time-to-first-byte on a
+  multi-MiB phone photo — the download failed fast having transferred nothing — and no bound at
+  all on the transfer as a whole (~160 reads under the 10 MiB cap). The owned client now carries
+  `httpx.Timeout(10.0, read=15.0)`, and the streamed **download** is bounded by a 30-second
+  wall-clock deadline that applies to injected clients too (like `max_bytes`, it is a module-owned
+  limit). An injected client keeps its own per-phase timeouts. Note the scope precisely: the
+  deadline covers the HTTP transfer only — connector-token acquisition
+  (`MicrosoftAppCredentials.get_access_token`, wrapped in an uncancellable `asyncio.to_thread`)
+  runs before it and remains unbounded.
+- **Timeouts and transport errors now raise `InlineImageDownloadError`** instead of escaping as raw
+  `httpx` exceptions. Consumers catch that one type to degrade to a skipped image; a raw
+  `httpx.ReadTimeout` bypassed the handler and failed the turn. The message names the exception
+  type only — never httpx's text, which embeds connection details (SEC-2/SEC-3) — and chains the
+  original via `raise ... from`, so `exc_info=True` logging is unchanged.
+  `asyncio.CancelledError` is deliberately **not** converted and still propagates.
+
 ## v0.19.0 — 2026-08-04
 
 ### Added
