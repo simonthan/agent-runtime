@@ -26,6 +26,7 @@ from typing import Any
 from agent_runtime.llm.client import AnthropicClient, assemble_history_messages
 from agent_runtime.llm.compaction import estimate_tokens
 from agent_runtime.llm.models import LLMImage
+from agent_runtime.llm.round_context import ToolRoundContext, bind_tool_round
 from agent_runtime.logging import AuditLogger, NullAuditLogger
 
 __all__ = [
@@ -289,6 +290,9 @@ class ToolUseLoop:
         tool_uses: list[dict[str, Any]] = rnd["tool_uses"]
         pending_index: int = rnd["pending_index"]
         calls: list[ToolCall] = [self._call_from_dict(c) for c in rnd["calls"]]
+        # T-115j — `state["rounds"]` already counts the suspending round (see _suspend's
+        # docstring), so it IS this round's 1-based index; resume must not re-increment.
+        round_ctx = ToolRoundContext(round_index=rounds, max_rounds=max_rounds)
 
         # Resolve the pending block per the user's decision (D1).
         pending = tool_uses[pending_index]
@@ -296,7 +300,8 @@ class ToolUseLoop:
             tool_input = (
                 decision.tool_input if decision.tool_input is not None else pending["input"]
             )
-            outcome = await executor(pending["name"], tool_input)
+            with bind_tool_round(round_ctx):
+                outcome = await executor(pending["name"], tool_input)
             outcome = self._cap_result(
                 tool_name=pending["name"], outcome=outcome, max_result_chars=max_result_chars
             )
@@ -325,6 +330,7 @@ class ToolUseLoop:
             executor=executor,
             confirm=confirm,
             max_result_chars=max_result_chars,
+            round_ctx=round_ctx,
         )
         if isinstance(round_outcome, _RoundSuspended):
             return self._suspend(
@@ -401,6 +407,9 @@ class ToolUseLoop:
                 executor=executor,
                 confirm=confirm,
                 max_result_chars=max_result_chars,
+                # T-115j — the executor's only view of the round budget. `rounds` was
+                # incremented for THIS round on the line above, so it is the 1-based index.
+                round_ctx=ToolRoundContext(round_index=rounds, max_rounds=max_rounds),
             )
             if isinstance(outcome, _RoundSuspended):
                 return self._suspend(
@@ -445,30 +454,37 @@ class ToolUseLoop:
         executor: ToolExecutor,
         confirm: ConfirmPredicate | None,
         max_result_chars: int | None,
+        round_ctx: ToolRoundContext,
     ) -> _RoundOutcome:
         """Iterate tool_use blocks from `start_index`, executing non-confirm tools
         (D3). Returns _RoundSuspended at the first confirm-required block, else
         _RoundCompleted once every block has a call. Mutates+returns `calls`.
         Each executor result is size-capped via `_cap_result` before it is frozen
-        into a ToolCall (T-081a)."""
-        for i in range(start_index, len(tool_uses)):
-            tu = tool_uses[i]
-            if confirm is not None and confirm(tu["name"], tu["input"]):
-                return _RoundSuspended(pending_index=i, calls=calls)
-            outcome = await executor(tu["name"], tu["input"])
-            outcome = self._cap_result(
-                tool_name=tu["name"], outcome=outcome, max_result_chars=max_result_chars
-            )
-            calls.append(
-                ToolCall(
-                    id=tu["id"],
-                    name=tu["name"],
-                    input=tu["input"],
-                    result=outcome.content,
-                    is_error=outcome.is_error,
+        into a ToolCall (T-081a).
+
+        T-115j: `round_ctx` is bound for the whole body, so `current_tool_round()`
+        answers inside the executor AND inside `confirm`. Token-based, so a nested
+        ToolUseLoop restores this one on exit. Binding once around the loop rather
+        than per call keeps the hot path free of repeated set/reset."""
+        with bind_tool_round(round_ctx):
+            for i in range(start_index, len(tool_uses)):
+                tu = tool_uses[i]
+                if confirm is not None and confirm(tu["name"], tu["input"]):
+                    return _RoundSuspended(pending_index=i, calls=calls)
+                outcome = await executor(tu["name"], tu["input"])
+                outcome = self._cap_result(
+                    tool_name=tu["name"], outcome=outcome, max_result_chars=max_result_chars
                 )
-            )
-        return _RoundCompleted(calls=calls)
+                calls.append(
+                    ToolCall(
+                        id=tu["id"],
+                        name=tu["name"],
+                        input=tu["input"],
+                        result=outcome.content,
+                        is_error=outcome.is_error,
+                    )
+                )
+            return _RoundCompleted(calls=calls)
 
     def _cap_result(
         self, *, tool_name: str, outcome: ToolResult, max_result_chars: int | None
