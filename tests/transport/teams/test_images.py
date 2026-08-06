@@ -7,12 +7,14 @@ logic runs against genuine httpx machinery rather than a hand-rolled mock.
 (sync method, wrapped in ``asyncio.to_thread`` by the implementation).
 """
 
+import asyncio
 from unittest.mock import patch
 
 import httpx
 import pytest
 from botframework.connector.auth import MicrosoftAppCredentials
 
+from agent_runtime.transport.teams import images
 from agent_runtime.transport.teams.images import (
     BotFrameworkCredentials,
     DownloadedImage,
@@ -232,4 +234,108 @@ async def test_redirect_not_followed_off_allowlist():
         transport=httpx.MockTransport(_redirect_handler), follow_redirects=True
     )
     with pytest.raises(InlineImageDownloadError):
+        await download_inline_image(att, _CREDENTIALS, client=client)
+
+
+async def test_owned_client_is_built_with_explicit_timeouts():
+    """Regression on the bug itself: the owned client used to be a bare
+    `httpx.AsyncClient()`, i.e. httpx's Timeout(5.0) on every phase -- including the
+    `read` that also covers time-to-first-byte for a multi-MiB attachment."""
+    owned = _client_with_handler(_ok_handler)
+    captured: dict[str, object] = {}
+
+    def _factory(**kwargs):
+        captured.update(kwargs)
+        return owned
+
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    with patch("agent_runtime.transport.teams.images.httpx.AsyncClient", _factory):
+        result = await download_inline_image(att, _CREDENTIALS)
+
+    assert result.data == _JPEG_BYTES
+    timeout = captured["timeout"]
+    assert timeout == httpx.Timeout(10.0, read=15.0)
+    assert timeout != httpx.Timeout(5.0)  # the pre-T-115l default
+    assert timeout.read == 15.0
+    assert timeout.connect == 10.0
+    # `read` must stay strictly below the deadline, or a stalled socket loses the more
+    # diagnostic ReadTimeout to an anonymous deadline expiry (Design 1).
+    assert timeout.read < images._DOWNLOAD_DEADLINE_SECONDS
+    assert owned.is_closed  # ownership/close-out unchanged
+
+
+async def test_injected_client_keeps_its_own_per_phase_timeouts():
+    """The boundary Design 2 / Open Q4 / the docstring / the CHANGELOG all commit to:
+    `_DOWNLOAD_TIMEOUT` configures the client this module OWNS, never an injected one --
+    a consumer injecting a pooled client keeps its per-phase settings. (The wall-clock
+    deadline still applies to them; that is a module-owned limit like `max_bytes`.)"""
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_ok_handler), timeout=httpx.Timeout(1.0)
+    )
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    result = await download_inline_image(att, _CREDENTIALS, client=client)
+
+    assert result.data == _JPEG_BYTES
+    assert client.timeout == httpx.Timeout(1.0)  # untouched
+    assert not client.is_closed  # injected client is NOT closed by the callee
+    await client.aclose()
+
+
+async def test_transport_error_surfaces_as_download_error():
+    """A raw httpx error used to escape. The only production consumer
+    (teams-bot-platform dispatcher.py:963) catches InlineImageDownloadError ONLY, and
+    nothing between it and the Bot Framework adapter has a try/except -- so a single
+    slow image failed the entire turn instead of being skipped."""
+
+    def _timeout_handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("simulated read timeout")
+
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    client = _client_with_handler(_timeout_handler)
+    with pytest.raises(InlineImageDownloadError, match="transport layer") as excinfo:
+        await download_inline_image(att, _CREDENTIALS, client=client)
+    assert isinstance(excinfo.value.__cause__, httpx.ReadTimeout)  # original chained
+    assert "simulated read timeout" not in str(excinfo.value)  # SEC-2/3: no httpx text
+
+
+async def test_connect_error_also_surfaces_as_download_error():
+    """httpx.HTTPError is caught as the BASE class, so the whole transport family is
+    covered by construction -- not just the timeout subtree."""
+
+    def _connect_handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("simulated connect failure")
+
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    client = _client_with_handler(_connect_handler)
+    with pytest.raises(InlineImageDownloadError, match="transport layer"):
+        await download_inline_image(att, _CREDENTIALS, client=client)
+
+
+async def test_wall_clock_deadline_bounds_a_stalled_download(monkeypatch):
+    """httpx's `read` is re-armed per 64 KiB socket read, so it never bounds the
+    download as a whole; the deadline does. It applies to an INJECTED client too --
+    unlike `_DOWNLOAD_TIMEOUT`, this is a module-owned limit like `max_bytes`."""
+
+    async def _slow_handler(_request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.5)
+        return httpx.Response(200, content=_JPEG_BYTES, headers={"content-type": "image/jpeg"})
+
+    monkeypatch.setattr(images, "_DOWNLOAD_DEADLINE_SECONDS", 0.05)
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    client = _client_with_handler(_slow_handler)
+    with pytest.raises(InlineImageDownloadError, match="deadline"):
+        await download_inline_image(att, _CREDENTIALS, client=client)
+
+
+async def test_cancellation_is_not_converted_to_download_error():
+    """CancelledError is a BaseException in 3.12 and must propagate untouched -- the new
+    handlers name TimeoutError and httpx.HTTPError only. T-089/T-090 precedent: a
+    swallowed CancelledError bypasses audit and the user reply."""
+
+    async def _cancel_handler(_request: httpx.Request) -> httpx.Response:
+        raise asyncio.CancelledError
+
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    client = _client_with_handler(_cancel_handler)
+    with pytest.raises(asyncio.CancelledError):
         await download_inline_image(att, _CREDENTIALS, client=client)
