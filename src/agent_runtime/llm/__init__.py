@@ -14,6 +14,8 @@ Public surface:
 - ``ToolResult``, ``ToolCall``, ``ToolLoopStep``, ``ToolLoopResult``, ``ToolExecutor`` — loop types
 - ``PendingConfirmation``, ``ExecuteDecision``, ``InjectResultDecision``,
   ``ResumeDecision``, ``ConfirmPredicate`` — confirm-before-dispatch (T-025a)
+- ``ToolRoundContext``, ``current_tool_round``, ``bind_tool_round`` — the executing round's
+  index / remaining tool-round budget, readable by an executor with no signature change (T-115j)
 
 See ``agent_runtime.llm.client.AnthropicClient.complete`` docstring for the
 two-breakpoint cache contract (static system prefix + per-turn retrieval block).
@@ -41,6 +43,11 @@ from agent_runtime.llm.models import (
     LLMImage,
     Message,
     ToolUseBlock,
+)
+from agent_runtime.llm.round_context import (
+    ToolRoundContext,
+    bind_tool_round,
+    current_tool_round,
 )
 from agent_runtime.llm.tool_loop import (
     ConfirmPredicate,
@@ -80,9 +87,12 @@ __all__ = [
     "ToolLoopResult",
     "ToolLoopStep",
     "ToolResult",
+    "ToolRoundContext",
     "ToolUseBlock",
     "ToolUseLoop",
     "WorkingMemory",
+    "bind_tool_round",
     "build_anthropic_sdk_client",
+    "current_tool_round",
     "estimate_tokens",
 ]
