@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.20.0 — 2026-08-06
+
+### Added
+- **`ToolRoundContext` / `current_tool_round()` / `bind_tool_round()`
+  (`agent_runtime.llm`)** — an executor can now read which `ToolUseLoop` round it is
+  in (`round_index`, 1-based), the cap the consumer supplied (`max_rounds`), and how
+  many tool rounds remain after this one (`rounds_remaining`, clamped at 0;
+  `is_final_round`). `ToolUseLoop` binds it around every executor invocation on both
+  the `run()` and `resume()` paths.
+  **Backward-compatible by construction:** `ToolExecutor` is unchanged — still
+  `Callable[[str, dict[str, Any]], Awaitable[ToolResult]]`. Delivery is via a
+  contextvar defaulting to `None`, so an executor that never reads it behaves
+  byte-for-byte as before and needs no edit. A reader outside a loop round gets
+  `None`. `bind_tool_round` restores the previous value on exit (token-based), so a
+  nested loop does not clear the outer round's budget, and contextvars are
+  per-asyncio-task so sibling turns cannot cross-talk.
+  The loop stays policy-free: this publishes NUMBERS only — no advisory text, no
+  proximity threshold. The consumer decides what, if anything, to tell the model
+  (see teams-bot-platform T-115j-b).
+
 ## v0.19.0 — 2026-08-04
 
 ### Added
