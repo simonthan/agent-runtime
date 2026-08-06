@@ -12,7 +12,7 @@ import pytest
 
 pytest.importorskip("anthropic")
 
-from agent_runtime.llm import AnthropicClient, ToolUseLoop
+from agent_runtime.llm import AnthropicClient, ToolUseLoop, current_tool_round
 from agent_runtime.llm.tool_loop import ExecuteDecision, InjectResultDecision, ToolResult
 
 from .fakes import (
@@ -992,3 +992,125 @@ async def test_resume_execute_decision_truncates() -> None:
     write_call = next(c for c in all_calls if c.name == "write")
     assert write_call.result.startswith("D" * 100)
     assert "TRUNCATED" in write_call.result
+
+
+# --- T-115j: round context visible to the executor -------------------------------
+
+
+@pytest.mark.asyncio
+async def test_executor_sees_round_index_and_remaining() -> None:
+    """T-115j: each round binds a 1-based index and the remaining tool-round budget."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    for i in range(3):
+        sdk.messages.responses.append(make_tool_use(tool_id=f"tu_{i}", name="search"))
+    sdk.messages.responses.append(make_ok(text="done"))
+    seen: list[tuple[int, int, int]] = []
+
+    async def recording(_name: str, _inp: dict) -> ToolResult:
+        ctx = current_tool_round()
+        assert ctx is not None
+        seen.append((ctx.round_index, ctx.max_rounds, ctx.rounds_remaining))
+        return ToolResult("hit")
+
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=recording,
+        max_rounds=5,
+    )
+
+    assert seen == [(1, 5, 4), (2, 5, 3), (3, 5, 2)]
+    assert current_tool_round() is None  # unbound once the loop returns
+
+
+@pytest.mark.asyncio
+async def test_executor_sees_final_round_on_cap_exhaustion() -> None:
+    """rounds_remaining==0 on the LAST round — the round after which tools=None."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(name="search"))
+    sdk.messages.responses.append(make_ok(text="forced"))  # the tools=None final call
+    seen: list[bool] = []
+
+    async def recording(_name: str, _inp: dict) -> ToolResult:
+        ctx = current_tool_round()
+        assert ctx is not None
+        seen.append(ctx.is_final_round)
+        return ToolResult("hit")
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=recording,
+        max_rounds=1,
+    )
+
+    assert seen == [True]
+    assert result.cap_exhausted is True
+
+
+@pytest.mark.asyncio
+async def test_resume_binds_the_suspending_round_index() -> None:
+    """The resumed round is the SUSPENDING round — state['rounds'] already counts it,
+    so resume must not re-increment (tool_loop `_suspend` docstring)."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(name="write", tool_input={"x": 1}))
+    sdk.messages.responses.append(make_ok(text="done"))
+    seen: list[tuple[int, int]] = []
+
+    async def recording(_name: str, _inp: dict) -> ToolResult:
+        ctx = current_tool_round()
+        assert ctx is not None
+        seen.append((ctx.round_index, ctx.rounds_remaining))
+        return ToolResult("written")
+
+    tools = [{"name": "write", "input_schema": {}}]
+    suspended = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=tools,
+        executor=recording,
+        max_rounds=4,
+        confirm=lambda n, _i: n == "write",
+    )
+    assert suspended.pending_confirmation is not None
+    assert seen == []  # suspended BEFORE dispatch
+
+    await loop.resume(
+        state=suspended.pending_confirmation.state,
+        decision=ExecuteDecision(),
+        tools=tools,
+        executor=recording,
+        confirm=lambda _n, _i: False,
+        static_system_prefix="SYS",
+        max_rounds=4,
+    )
+    assert seen == [(1, 3)]
+    assert current_tool_round() is None
+
+
+@pytest.mark.asyncio
+async def test_two_arg_executor_that_ignores_the_context_is_unchanged() -> None:
+    """D1 compat contract, pinned: an executor written before T-115j takes exactly two
+    positional args, never reads the contextvar, and behaves byte-for-byte as before."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(name="search"))
+    sdk.messages.responses.append(make_ok(text="done"))
+
+    async def legacy(name: str, tool_input: dict) -> ToolResult:
+        return ToolResult(f"legacy:{name}:{sorted(tool_input)}")
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=legacy,
+        max_rounds=3,
+    )
+    assert result.final_text == "done"
+    assert result.steps[0].tool_calls[0].result == "legacy:search:[]"
