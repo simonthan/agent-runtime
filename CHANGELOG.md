@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.21.1 — 2026-08-07
+
+### Fixed
+- **The Bot Framework adapter minted its connector token on the event loop.** T-115m bounded that
+  acquisition (~60 s ceiling) but left it synchronous: `msrest`'s `AsyncRequestsCredentialsPolicy.send`
+  calls `signed_session` without awaiting (`msrest/pipeline/async_requests.py:99`), and MSAL reaches
+  the network more often than once per process — it stops serving a cached token 5 minutes before
+  expiry (`msal/application.py:1652`) and refreshes proactively once AAD's `refresh_in` elapses
+  (`:1662-1665`, typically half the token lifetime). `TeamsAdapter.process_activity` and
+  `send_proactive` now pre-warm the token on a worker thread first, so the SDK's on-loop call is an
+  in-memory cache lookup. The warm never raises: on failure the send still mints inline. One case is
+  knowingly not covered — when AAD is failing but a valid-but-aging token is cached, msal swallows
+  the refresh error and returns the cached token (`application.py:1721-1727`), so the on-loop call
+  repeats the failing request; loop-blocking there is unchanged from before this release.
+- **`images.py` no longer interpolates the MSAL exception text into its error message.** A `requests`
+  timeout string embeds the tenant id and the token endpoint, and a `PermissionError` carries AAD's
+  `error_description`; the message now carries the exception *type* only, matching the transport
+  handler below it (T-115l). The original is still chained, so `exc_info=True` logging is unchanged.
+
+### Added
+- `TeamsAdapter.warm_connector_token()` — public so a consumer may also prime the token from its
+  startup lifespan. Not required: the two entry points above already cover every outbound path,
+  because `BotFrameworkAdapter` returns caller-supplied credentials for every connector client it
+  builds (`bot_framework_adapter.py:1359-1367`).
+
+
 ## v0.21.0 — 2026-08-07
 
 ### Added

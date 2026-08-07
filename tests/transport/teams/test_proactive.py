@@ -1,8 +1,9 @@
 """TeamsAdapter.send_proactive + ConversationRef (de)serialization."""
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from botframework.connector.auth import MicrosoftAppCredentials
 
 from agent_runtime.transport.teams import (
     TeamsAdapter,
@@ -10,6 +11,7 @@ from agent_runtime.transport.teams import (
     conversation_ref_from_dict,
     conversation_ref_to_dict,
 )
+from agent_runtime.transport.teams import _msal as _msal_module
 from agent_runtime.transport.teams.testing import make_conversation_ref
 
 
@@ -20,6 +22,24 @@ class _NoOpHandler:
 
 def _adapter() -> TeamsAdapter:
     return TeamsAdapter(TeamsAdapterConfig("app-123", "pwd", "tid"), _NoOpHandler())
+
+
+@pytest.fixture(autouse=True)
+def _mock_token():
+    """Keep the T-119 pre-warm off the network (mirrors test_images.py's fixture).
+
+    `_build_msal_app` must be patched or the warm makes a real discovery GET — MSAL's
+    constructor does network I/O (`authority.py:96-99`). Patching the PARENT's
+    `get_access_token` still intercepts: `BoundedAppCredentials` overrides it but
+    delegates via `super()`, which resolves through the MRO to this patch.
+    """
+    with (
+        patch.object(
+            MicrosoftAppCredentials, "get_access_token", return_value="test-token"
+        ) as mock,
+        patch.object(_msal_module, "_build_msal_app", return_value=object()),
+    ):
+        yield mock
 
 
 def test_conversation_ref_round_trips():
@@ -110,3 +130,23 @@ async def test_send_proactive_sends_text_then_card_order():
     assert fake_ctx.send_activity.call_args_list[1].args[0].attachments[0].content == {
         "type": "AdaptiveCard"
     }
+
+
+async def test_send_proactive_warms_the_connector_token():
+    """`continue_conversation` mints the connector token through the same on-loop
+    `signed_session` call as an inbound reply (T-119)."""
+    calls: list[str] = []
+
+    def _record_warm(_self=None, *_args, **_kwargs):
+        calls.append("warm")
+        return "test-token"
+
+    async def _record_continue(*_args, **_kwargs):
+        calls.append("continue")
+
+    adapter = _adapter()
+    adapter._adapter.continue_conversation = _record_continue
+    with patch.object(MicrosoftAppCredentials, "get_access_token", _record_warm):
+        await adapter.send_proactive(make_conversation_ref(), bot_app_id="app-123", text="hi")
+
+    assert calls == ["warm", "continue"]

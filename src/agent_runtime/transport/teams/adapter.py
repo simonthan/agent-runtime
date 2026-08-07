@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from botbuilder.schema import (
     ConversationReference,
     InvokeResponse,
 )
+from botframework.connector.auth import AuthenticationConstants
 
 from agent_runtime.transport.teams._msal import BoundedAppCredentials
 from agent_runtime.transport.teams.events import (
@@ -207,23 +209,26 @@ class TeamsAdapter:
     """Wraps BotFrameworkAdapter; exposes a HTTP-framework-agnostic entry point."""
 
     def __init__(self, config: TeamsAdapterConfig, handler: TeamsHandler) -> None:
+        # T-115m -- without this the SDK builds its own timeout-less
+        # MicrosoftAppCredentials (`bot_framework_adapter.py:1352-1380`) and
+        # mints the connector token synchronously inside msrest's async
+        # pipeline (`msrest/pipeline/async_requests.py:99`) -- i.e. on the
+        # event loop, unbounded, on EVERY outbound activity. A caller-supplied
+        # AppCredentials is returned verbatim ahead of that build path (`:1364`).
+        # Construction stays network-free; the MSAL app is built on first send.
+        # T-119 -- held on the instance so `warm_connector_token` can prime the very
+        # object every outbound path mints from (`bot_framework_adapter.py:199`, `:1365`).
+        self._credentials = BoundedAppCredentials(
+            config.app_id,
+            config.app_password,
+            channel_auth_tenant=config.tenant_id,
+        )
         self._adapter = BotFrameworkAdapter(
             BotFrameworkAdapterSettings(
                 app_id=config.app_id,
                 app_password=config.app_password,
                 channel_auth_tenant=config.tenant_id,
-                # T-115m -- without this the SDK builds its own timeout-less
-                # MicrosoftAppCredentials (`bot_framework_adapter.py:1352-1380`) and
-                # mints the connector token synchronously inside msrest's async
-                # pipeline (`msrest/pipeline/async_requests.py:99`) -- i.e. on the
-                # event loop, unbounded, on EVERY outbound activity. A caller-supplied
-                # AppCredentials is returned verbatim ahead of that build path (`:1364`).
-                # Construction stays network-free; the MSAL app is built on first send.
-                app_credentials=BoundedAppCredentials(
-                    config.app_id,
-                    config.app_password,
-                    channel_auth_tenant=config.tenant_id,
-                ),
+                app_credentials=self._credentials,
             )
         )
         self._adapter.on_turn_error = config.on_turn_error or self._default_on_turn_error
@@ -232,6 +237,53 @@ class TeamsAdapter:
     @staticmethod
     async def _default_on_turn_error(_context: TurnContext, error: Exception) -> None:
         logger.exception("Unhandled error in Teams handler", exc_info=error)
+
+    async def warm_connector_token(self) -> bool:
+        """Mint or refresh the outbound connector token on a worker thread (T-119).
+
+        T-115m bounded this token acquisition; it did NOT move it off the event loop.
+        ``msrest``'s ``AsyncRequestsCredentialsPolicy.send`` calls
+        ``signed_session`` synchronously inside an ``async def``
+        (``msrest/pipeline/async_requests.py:99``), so every outbound activity can
+        block the loop for as long as MSAL's HTTP timeout allows. MSAL reaches the
+        network more often than "once per process": it stops serving a cached token
+        5 minutes before expiry (``msal/application.py:1652``) and refreshes
+        proactively once AAD's ``refresh_in`` elapses (``:1662-1665``, typically half
+        the token lifetime).
+
+        Calling this first makes the SDK's on-loop call an in-memory cache lookup.
+        It is a cache-priming optimisation with a fallback, NOT a gate: on failure the
+        send still mints inline (bounded by T-115m), so a warm failure must never fail
+        the turn. Returns True when the token call completed without raising.
+
+        KNOWN RESIDUAL: when AAD is failing but a valid-but-aging token is still cached,
+        msal swallows the refresh error and returns the cached token
+        (``msal/application.py:1721-1727``) without clearing ``refresh_on``. This method
+        then returns True having logged nothing, and the SDK's on-loop call repeats the
+        same failing request. Loop-blocking is no worse than before this change, but it
+        is not fixed either — see the T-119 plan, Design section 2.
+
+        Public so a consumer may additionally call it from its startup lifespan; the
+        two entry points below already cover every outbound path, because
+        ``BotFrameworkAdapter`` returns caller-supplied credentials for every connector
+        client it builds (``bot_framework_adapter.py:1359-1367``).
+        """
+        app_id = self._credentials.microsoft_app_id
+        if not app_id or app_id == AuthenticationConstants.ANONYMOUS_SKILL_APP_ID:
+            # Mirrors the SDK's own gate LITERALLY (`AppCredentials._should_set_token`,
+            # `app_credentials.py:95-102`) -- note it does NOT consult the password.
+            # Gating on the password too would silently skip the warm for a blank-secret
+            # misconfiguration, suppressing the one warning that would diagnose it.
+            return False
+        try:
+            await asyncio.to_thread(self._credentials.get_access_token)
+        except Exception:  # noqa: BLE001 -- a pre-warm failure must never fail the turn
+            logger.warning(
+                "Connector token pre-warm failed; the outbound send will mint inline",
+                exc_info=True,
+            )
+            return False
+        return True
 
     async def process_activity(
         self,
@@ -248,6 +300,10 @@ class TeamsAdapter:
         header; a whitespace-only header (`" "`) is truthy but effectively empty
         downstream, so we strip-check too (SEC-5). We fail loudly to catch consumer
         HTTP routes that forget to forward the inbound ``Authorization`` header.
+
+        Pre-warms the outbound connector token on a worker thread first (T-119);
+        the warm never raises, so a token failure degrades to an inline mint rather
+        than failing the turn.
         """
         if not auth_header or not auth_header.strip():
             msg = (
@@ -255,6 +311,9 @@ class TeamsAdapter:
                 "(including the 'Bearer ' prefix). An empty header would bypass JWT validation."
             )
             raise ValueError(msg)
+        # T-119 -- prime the MSAL cache on a worker thread BEFORE the SDK's outbound
+        # send calls `signed_session` on the event loop. Never raises.
+        await self.warm_connector_token()
         activity = Activity().deserialize(activity_body)
         response = await self._adapter.process_activity(
             activity, auth_header, self._handler.on_turn
@@ -299,6 +358,10 @@ class TeamsAdapter:
         if text is None and card is None:
             msg = "send_proactive requires text and/or card"
             raise ValueError(msg)
+
+        # T-119 -- same reason as `process_activity`: `continue_conversation` mints the
+        # connector token on the event loop via msrest's sync `signed_session` call.
+        await self.warm_connector_token()
 
         reference = ConversationReference(
             channel_id=ref.channel_id or "msteams",
