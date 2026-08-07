@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.21.0 — 2026-08-07
+
+### Added
+- **`ToolResult.images` / `ToolCall.images` (`agent_runtime.llm.tool_loop`)** — the
+  outbound half of the T-067d/T-095a images seam: images can now ride back OUT of a
+  tool call, not just into the first user turn. An executor that returns
+  `ToolResult(content=..., images=(LLMImage(...), ...))` produces a **list-of-content-
+  blocks** `tool_result` (`[{"type":"text",...}, {"type":"image",...}, ...]`) instead of
+  a bare string, so an MCP tool that renders a document page becomes visible to the
+  model instead of collapsing to a caption. Both fields default to `()` — the
+  byte-for-byte regression guarantee: a `ToolResult`/`ToolCall` with no images produces
+  the identical bare-string `tool_result.content` as every prior release.
+  - **Empty-text rule:** when `content` is falsy and images are present, the text block
+    is omitted (the Anthropic API rejects an empty text block) — the list contains only
+    image blocks.
+  - **`max_result_chars` truncation caps TEXT only** — images pass through `_cap_result`
+    untouched. The char cap bounds prose; counting base64 against it would let one
+    rendered page evict the tool's actual text answer. Image budgeting (count, decoded
+    bytes) is the consumer's policy.
+  - **Suspend-state serialization is back-compat and non-duplicating.** `_call_to_dict`
+    emits an `"images"` key only when a call actually has images, so pre-release
+    suspended approval-card states resume unchanged after upgrade (`.get("images", ())`
+    on read). A committed round's images live once, in `state["messages"]`'s
+    `tool_result` blocks — `state["steps"]` never stores a second copy.
+  - No change to `LLMImage` itself (already validates `media_type` and emits the
+    correct Anthropic block from T-067d) — only its splice site is new.
+  - Consumer half is teams-bot-platform T-118b: byte/count budgeting per turn and a
+    provenance note telling the model tool-returned images are untrusted content.
+
 ## v0.20.1 — 2026-08-06
 
 ### Fixed
