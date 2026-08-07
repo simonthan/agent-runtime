@@ -177,7 +177,14 @@ async def _acquire_token(credentials: BotFrameworkCredentials) -> str:
     try:
         return await asyncio.to_thread(app_credentials.get_access_token)
     except Exception as exc:
-        msg = f"Failed to acquire Bot Framework connector token: {exc}"
+        # T-119 -- type name only, never str(exc). Now that T-115m gives MSAL a real
+        # timeout, a `requests` ConnectTimeout/ReadTimeout reaches here and its text is
+        # `HTTPSConnectionPool(host='login.microsoftonline.com', ...): ... url:
+        # /<tenant>/oauth2/v2.0/token`; the PermissionError path carries AAD's
+        # `error_description` verbatim (`microsoft_app_credentials.py:56-63`). Same call
+        # as the transport handler below (T-115l). The original is chained, so
+        # `exc_info=True` logging still gets everything.
+        msg = f"Failed to acquire Bot Framework connector token: {type(exc).__name__}"
         raise InlineImageDownloadError(msg) from exc
 
 
