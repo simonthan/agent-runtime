@@ -64,11 +64,14 @@ class BoundedAppCredentials(MicrosoftAppCredentials):
         channel_auth_tenant: str | None = None,
         oauth_scope: str | None = None,
     ) -> None:
+        # The vendored SDK's stub types these params `str` with a `None` default
+        # (`microsoft_app_credentials.py:20-21`), so ty flags the accurate `str | None`
+        # signature above as a mismatch against the SDK's own inaccurate one below.
         super().__init__(
             app_id,
             password,
-            channel_auth_tenant=channel_auth_tenant,
-            oauth_scope=oauth_scope,
+            channel_auth_tenant=channel_auth_tenant,  # ty: ignore[invalid-argument-type]
+            oauth_scope=oauth_scope,  # ty: ignore[invalid-argument-type]
         )
         self._app_lock = threading.Lock()
 

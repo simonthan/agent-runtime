@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.20.1 — 2026-08-06
+
+### Fixed
+- **Every MSAL token acquisition was unbounded.** Neither the Bot Framework SDK nor this package
+  passed a timeout to MSAL, so `requests` used `timeout=None` and a hung socket blocked token
+  acquisition forever. Two distinct blast radii: the inline-image path burned an uncancellable
+  `asyncio.to_thread` worker from the process-wide pool (no caller-side deadline can recover it),
+  and the **adapter path mints the connector token synchronously inside msrest's async pipeline —
+  i.e. on the event loop — on every outbound activity**. New `BoundedAppCredentials` seeds an MSAL
+  app carrying `timeout=(5.0, 10.0)` before the SDK can build its own; `TeamsAdapter` now supplies
+  it via `BotFrameworkAdapterSettings(app_credentials=…)`. Note the ceiling honestly: MSAL issues up
+  to two requests per cold acquisition and mounts `HTTPAdapter(max_retries=1)`, so the arithmetic
+  bound is ~60 s — finite rather than infinite is the property gained.
+- **Connector credentials are now cached process-wide, keyed by the credentials value.** A fresh
+  `MicrosoftAppCredentials` per call meant a fresh MSAL token cache per call, so every inline image
+  paid a full tenant-discovery GET plus token POST. A warm entry now serves subsequent images and
+  turns with no network at all. Keying on the frozen `BotFrameworkCredentials` means a secret
+  rotation lands on a new key with no invalidation logic.
+- **MSAL construction no longer runs on the event loop on the inline-image path**, and is guarded by
+  double-checked locking now that credentials are shared across worker threads.
+- `msal>=1.31,<2` is now a declared dependency of the `teams` extra (previously transitive only).
+
 ## 0.20.0 — 2026-08-06
 
 ### Added
