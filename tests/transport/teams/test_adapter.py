@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from agent_runtime.transport.teams import TeamsAdapter, TeamsAdapterConfig
+from agent_runtime.transport.teams._msal import BoundedAppCredentials
 
 
 class _NoOpHandler:
@@ -45,3 +46,16 @@ async def test_process_activity_raises_on_whitespace_auth_header(header):
     adapter = TeamsAdapter(TeamsAdapterConfig("a", "p", "t"), _NoOpHandler())
     with pytest.raises(ValueError, match="auth_header is required"):
         await adapter.process_activity({"type": "message"}, auth_header=header)
+
+
+def test_adapter_supplies_bounded_credentials_to_the_sdk():
+    """T-115m: without app_credentials the SDK builds its own timeout-less
+    MicrosoftAppCredentials and mints connector tokens on the event loop, unbounded, on
+    every outbound activity. Construction must stay network-free — tbp builds this inside
+    an @lru_cache'd provider (deps.py:488)."""
+    adapter = TeamsAdapter(TeamsAdapterConfig("a", "p", "t"), _NoOpHandler())
+    creds = adapter._adapter.settings.app_credentials
+
+    assert isinstance(creds, BoundedAppCredentials)
+    assert creds.app is None  # nothing built, no network touched
+    assert creds.microsoft_app_id == "a"
