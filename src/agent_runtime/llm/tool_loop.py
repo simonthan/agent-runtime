@@ -57,10 +57,19 @@ _TRUNCATION_MARKER = (
 @dataclass(frozen=True, slots=True)
 class ToolResult:
     """Outcome of executing one tool call. `is_error=True` is fed back to the model
-    as a tool_result error block (the model may recover); it is NOT an exception."""
+    as a tool_result error block (the model may recover); it is NOT an exception.
+
+    `images` (T-118a) are carried back to the model as image content blocks inside
+    the tool_result. Empty (the default) reproduces the pre-T-118a string-content
+    block byte-for-byte. The loop applies NO policy to them: it does not cap their
+    count or size and does not sanitize them (`max_result_chars` bounds TEXT only,
+    see `_cap_result`). The consumer owns those decisions — and owns telling the
+    model that image bytes from a tool are untrusted external data.
+    """
 
     content: str
     is_error: bool = False
+    images: tuple[LLMImage, ...] = ()
 
 
 # (tool_name, tool_input) -> ToolResult. Must not raise for expected failures.
@@ -78,6 +87,7 @@ class ToolCall:
     input: dict[str, Any]
     result: str
     is_error: bool
+    images: tuple[LLMImage, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +167,24 @@ class _RoundSuspended:
 
 
 _RoundOutcome = _RoundCompleted | _RoundSuspended
+
+
+def _tool_result_content(call: ToolCall) -> str | list[dict[str, Any]]:
+    """The `content` value for one tool_result block.
+
+    No images -> the bare string, byte-for-byte identical to pre-T-118a.
+    With images -> [text block?] + image blocks, matching the T-067d user-turn
+    order (text first, then images). The text block is OMITTED when `result` is
+    falsy: the Anthropic API rejects an empty text block (same rule as
+    ToolUseLoop.run's images-with-empty-user_message case).
+    """
+    if not call.images:
+        return call.result
+    parts: list[dict[str, Any]] = []
+    if call.result:
+        parts.append({"type": "text", "text": call.result})
+    parts.extend(img.to_block() for img in call.images)
+    return parts
 
 
 class ToolUseLoop:
@@ -306,12 +334,14 @@ class ToolUseLoop:
                 tool_name=pending["name"], outcome=outcome, max_result_chars=max_result_chars
             )
             call_input, call_result, call_is_error = tool_input, outcome.content, outcome.is_error
-        else:  # InjectResultDecision — no executor call (D2)
+            call_images = outcome.images
+        else:  # InjectResultDecision — no executor call (D2); first-party text, never images
             call_input, call_result, call_is_error = (
                 pending["input"],
                 decision.content,
                 decision.is_error,
             )
+            call_images = ()
         calls.append(
             ToolCall(
                 id=pending["id"],
@@ -319,6 +349,7 @@ class ToolUseLoop:
                 input=call_input,
                 result=call_result,
                 is_error=call_is_error,
+                images=call_images,
             )
         )
 
@@ -482,6 +513,7 @@ class ToolUseLoop:
                         input=tu["input"],
                         result=outcome.content,
                         is_error=outcome.is_error,
+                        images=outcome.images,
                     )
                 )
             return _RoundCompleted(calls=calls)
@@ -497,7 +529,11 @@ class ToolUseLoop:
         EXPLICIT truncation marker (silent clipping misleads the model). `is_error`
         is preserved: truncation is not a tool failure. Measurement is on characters
         (exact, zero-cost, deterministic — see plan §2); the marker reports an
-        estimated token figure via `estimate_tokens` for readability only."""
+        estimated token figure via `estimate_tokens` for readability only.
+
+        Only `content` is measured and clipped — `images` pass through untouched. The cap
+        bounds prose; counting base64 against it would let one rendered page evict the
+        tool's actual text answer. Image budgeting is the consumer's policy (T-118a D4)."""
         if max_result_chars is None:
             return outcome
         original = len(outcome.content)
@@ -518,7 +554,7 @@ class ToolUseLoop:
             cap_chars=max_result_chars,
             removed_chars=removed,
         )
-        return ToolResult(content=kept + marker, is_error=outcome.is_error)
+        return ToolResult(content=kept + marker, is_error=outcome.is_error, images=outcome.images)
 
     @staticmethod
     def _commit_round(
@@ -544,7 +580,7 @@ class ToolUseLoop:
             {
                 "type": "tool_result",
                 "tool_use_id": c.id,
-                "content": c.result,
+                "content": _tool_result_content(c),
                 "is_error": c.is_error,
             }
             for c in calls
@@ -619,26 +655,44 @@ class ToolUseLoop:
         agg["cr"] += resp.cache_read_input_tokens
 
     @staticmethod
-    def _call_to_dict(c: ToolCall) -> dict[str, Any]:
-        return {
+    def _call_to_dict(c: ToolCall, *, include_images: bool = True) -> dict[str, Any]:
+        d: dict[str, Any] = {
             "id": c.id,
             "name": c.name,
             "input": c.input,
             "result": c.result,
             "is_error": c.is_error,
         }
+        # T-118a — key emitted ONLY when images exist, so suspend states for image-free
+        # turns (every turn today) serialize byte-for-byte as before.
+        if include_images and c.images:
+            d["images"] = [{"media_type": i.media_type, "data_b64": i.data_b64} for i in c.images]
+        return d
 
     @staticmethod
     def _call_from_dict(d: dict[str, Any]) -> ToolCall:
+        # `.get` is load-bearing for DEPLOY SAFETY: a turn suspended on an approval card
+        # BEFORE this release resumes AFTER it with no "images" key in its stored state.
         return ToolCall(
-            id=d["id"], name=d["name"], input=d["input"], result=d["result"], is_error=d["is_error"]
+            id=d["id"],
+            name=d["name"],
+            input=d["input"],
+            result=d["result"],
+            is_error=d["is_error"],
+            images=tuple(
+                LLMImage(media_type=i["media_type"], data_b64=i["data_b64"])
+                for i in d.get("images", ())
+            ),
         )
 
     @classmethod
     def _step_to_dict(cls, s: ToolLoopStep) -> dict[str, Any]:
         return {
             "assistant_text": s.assistant_text,
-            "tool_calls": [cls._call_to_dict(c) for c in s.tool_calls],
+            # include_images=False — a committed round's images already live in
+            # state["messages"] as tool_result image blocks; a second copy here would
+            # double the suspend-state size and is read by nobody (D6-bis).
+            "tool_calls": [cls._call_to_dict(c, include_images=False) for c in s.tool_calls],
         }
 
     @classmethod
