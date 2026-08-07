@@ -1114,3 +1114,216 @@ async def test_two_arg_executor_that_ignores_the_context_is_unchanged() -> None:
     )
     assert result.final_text == "done"
     assert result.steps[0].tool_calls[0].result == "legacy:search:[]"
+
+
+# ── T-118a: tool_result image carry-back ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_tool_result_without_images_is_byte_identical() -> None:
+    """No images -> committed tool_result content is the bare str, byte-for-byte
+    identical to pre-T-118a. This is the regression guarantee."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_1", name="search"))
+    sdk.messages.responses.append(make_ok(text="done"))
+
+    async def ex(_name: str, _inp: dict) -> ToolResult:
+        return ToolResult("ok")
+
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=ex,
+        max_rounds=3,
+    )
+    block = sdk.messages.captured_requests[1]["messages"][-1]["content"][0]
+    assert block == {
+        "type": "tool_result",
+        "tool_use_id": "tu_1",
+        "content": "ok",
+        "is_error": False,
+    }
+    assert isinstance(block["content"], str)
+
+
+@pytest.mark.asyncio
+async def test_tool_result_with_images_emits_text_then_image_blocks() -> None:
+    """With images -> content becomes [text, image...], text-then-images order (D2)."""
+    from agent_runtime.llm.models import LLMImage
+
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_1", name="render"))
+    sdk.messages.responses.append(make_ok(text="done"))
+    img = LLMImage(media_type="image/png", data_b64="aGk=")
+
+    async def ex(_name: str, _inp: dict) -> ToolResult:
+        return ToolResult("caption", images=(img,))
+
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="render it",
+        tools=[{"name": "render", "input_schema": {}}],
+        executor=ex,
+        max_rounds=3,
+    )
+    block = sdk.messages.captured_requests[1]["messages"][-1]["content"][0]
+    assert block["content"] == [
+        {"type": "text", "text": "caption"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tool_result_with_images_and_empty_text_omits_text_block() -> None:
+    """Empty text + images -> content is an image-only list; the empty text block is
+    OMITTED because the Anthropic API rejects an empty text block (D3)."""
+    from agent_runtime.llm.models import LLMImage
+
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_1", name="render"))
+    sdk.messages.responses.append(make_ok(text="done"))
+    img = LLMImage(media_type="image/png", data_b64="aGk=")
+
+    async def ex(_name: str, _inp: dict) -> ToolResult:
+        return ToolResult("", images=(img,))
+
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="render it",
+        tools=[{"name": "render", "input_schema": {}}],
+        executor=ex,
+        max_rounds=3,
+    )
+    content = sdk.messages.captured_requests[1]["messages"][-1]["content"][0]["content"]
+    assert len(content) == 1
+    assert content[0]["type"] == "image"
+
+
+@pytest.mark.asyncio
+async def test_cap_preserves_images_and_truncates_only_text() -> None:
+    """max_result_chars caps TEXT only; images pass through untouched (D4)."""
+    from agent_runtime.llm.models import LLMImage
+
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_1", name="render"))
+    sdk.messages.responses.append(make_ok(text="done"))
+    img = LLMImage(media_type="image/png", data_b64="aGk=")
+
+    async def ex(_name: str, _inp: dict) -> ToolResult:
+        return ToolResult("x" * 100, images=(img,))
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="render it",
+        tools=[{"name": "render", "input_schema": {}}],
+        executor=ex,
+        max_rounds=3,
+        max_result_chars=10,
+    )
+    tc = result.steps[0].tool_calls[0]
+    assert tc.images == (img,)
+    assert tc.result.startswith("x" * 10)
+    assert "TRUNCATED BY agent-runtime" in tc.result
+
+
+def test_call_dict_round_trip_preserves_images() -> None:
+    """_call_to_dict -> json.dumps -> json.loads -> _call_from_dict yields an equal
+    ToolCall including images (proves JSON-safety of PendingConfirmation.state)."""
+    import json
+
+    from agent_runtime.llm.models import LLMImage
+    from agent_runtime.llm.tool_loop import ToolCall, ToolUseLoop
+
+    img = LLMImage(media_type="image/png", data_b64="aGk=")
+    call = ToolCall(
+        id="tu_1", name="render", input={"q": "x"}, result="caption", is_error=False, images=(img,)
+    )
+    d = ToolUseLoop._call_to_dict(call)
+    round_tripped = json.loads(json.dumps(d))
+    restored = ToolUseLoop._call_from_dict(round_tripped)
+    assert restored == call
+
+
+def test_call_from_dict_without_images_key_defaults_empty() -> None:
+    """Deploy safety (D5): a dict with NO 'images' key (pre-T-118a suspended state)
+    loads with images == () and does not raise. An image-free ToolCall's
+    _call_to_dict emits no 'images' key at all."""
+    from agent_runtime.llm.tool_loop import ToolCall, ToolUseLoop
+
+    d = {"id": "tu_1", "name": "search", "input": {}, "result": "ok", "is_error": False}
+    restored = ToolUseLoop._call_from_dict(d)
+    assert restored.images == ()
+
+    call_no_images = ToolCall(id="tu_1", name="search", input={}, result="ok", is_error=False)
+    assert "images" not in ToolUseLoop._call_to_dict(call_no_images)
+
+
+@pytest.mark.asyncio
+async def test_suspend_state_stores_image_bytes_once() -> None:
+    """D6-bis: round 1 returns a tool result WITH images and commits; round 2 suspends
+    on a confirm-required tool. The base64 payload must appear exactly once in the
+    JSON-dumped suspend state (it lives in state['messages']) — state['steps'][0]'s
+    tool_calls must carry NO 'images' key. Guards against 2x suspend-state
+    amplification."""
+    import json
+
+    from agent_runtime.llm.models import LLMImage
+
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    img = LLMImage(media_type="image/png", data_b64="aGk=")
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_r", name="render"))
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_w", name="send_email"))
+
+    async def ex(name: str, _inp: dict) -> ToolResult:
+        if name == "render":
+            return ToolResult("caption", images=(img,))
+        return ToolResult("sent")
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[
+            {"name": "render", "input_schema": {}},
+            {"name": "send_email", "input_schema": {}},
+        ],
+        executor=ex,
+        max_rounds=3,
+        confirm=_CONFIRM_WRITES,
+    )
+    assert result.pending_confirmation is not None
+    state = result.pending_confirmation.state
+    dumped = json.dumps(state)
+    assert dumped.count("aGk=") == 1
+    assert "images" not in state["steps"][0]["tool_calls"][0]
+
+
+def test_compaction_does_not_leak_tool_result_image_base64() -> None:
+    """`_content_to_text` collapses a tool_result block (whose nested content may
+    include image base64) to '[tool_result]' — it never inspects nested content, so
+    image bytes never reach the compaction merge prompt (guards the compaction.py
+    behaviour T-118a depends on)."""
+    from agent_runtime.llm.compaction import _content_to_text
+
+    content = [
+        {
+            "type": "tool_result",
+            "tool_use_id": "tu_1",
+            "content": [
+                {"type": "text", "text": "caption"},
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+                },
+            ],
+            "is_error": False,
+        }
+    ]
+    text = _content_to_text(content)
+    assert "aGk=" not in text
+    assert text == "[tool_result]"
