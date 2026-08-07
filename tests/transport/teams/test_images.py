@@ -8,12 +8,14 @@ logic runs against genuine httpx machinery rather than a hand-rolled mock.
 """
 
 import asyncio
+import threading
 from unittest.mock import patch
 
 import httpx
 import pytest
 from botframework.connector.auth import MicrosoftAppCredentials
 
+from agent_runtime.transport.teams import _msal as _msal_module
 from agent_runtime.transport.teams import images
 from agent_runtime.transport.teams.images import (
     BotFrameworkCredentials,
@@ -38,10 +40,22 @@ def _ok_handler(request: httpx.Request) -> httpx.Response:
 
 @pytest.fixture(autouse=True)
 def _mock_token():
-    with patch.object(
-        MicrosoftAppCredentials, "get_access_token", return_value="test-token"
-    ) as mock:
+    """Patch the token call AND the MSAL app construction (T-115m).
+
+    `_build_msal_app` must be patched or every test in this file makes a real
+    tenant-discovery GET to login.microsoftonline.com — MSAL's constructor does
+    network I/O (`authority.py:96-99`). Patching the PARENT's `get_access_token`
+    still works: `BoundedAppCredentials` overrides it but delegates via `super()`,
+    which resolves through the MRO to this patch. The process-wide credentials
+    cache is cleared around each test so cache assertions stay independent.
+    """
+    images._credentials_cache.clear()
+    with (
+        patch.object(MicrosoftAppCredentials, "get_access_token", return_value="test-token") as mock,
+        patch.object(_msal_module, "_build_msal_app", return_value=object()),
+    ):
         yield mock
+    images._credentials_cache.clear()
 
 
 async def test_happy_path_returns_bytes_and_mime():
@@ -339,3 +353,42 @@ async def test_cancellation_is_not_converted_to_download_error():
     client = _client_with_handler(_cancel_handler)
     with pytest.raises(asyncio.CancelledError):
         await download_inline_image(att, _CREDENTIALS, client=client)
+
+
+async def test_connector_credentials_are_cached_across_calls():
+    """MSAL's token cache lives on the credentials' app. Building fresh credentials per
+    call meant acquire_token_silent ALWAYS missed — a full discovery + token round trip
+    per inline image."""
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    await download_inline_image(att, _CREDENTIALS, client=_client_with_handler(_ok_handler))
+    first = images._credentials_cache[_CREDENTIALS]
+    await download_inline_image(att, _CREDENTIALS, client=_client_with_handler(_ok_handler))
+
+    assert images._credentials_cache[_CREDENTIALS] is first
+    assert len(images._credentials_cache) == 1
+
+
+async def test_credentials_cache_is_keyed_by_credentials():
+    """A rotated secret must land on a new key rather than reuse stale credentials."""
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    rotated = BotFrameworkCredentials(app_id="aid", app_password="new-pwd", tenant_id="tid")
+    await download_inline_image(att, _CREDENTIALS, client=_client_with_handler(_ok_handler))
+    await download_inline_image(att, rotated, client=_client_with_handler(_ok_handler))
+
+    assert images._credentials_cache[_CREDENTIALS] is not images._credentials_cache[rotated]
+
+
+async def test_token_acquisition_runs_off_the_event_loop():
+    """MSAL's constructor does a tenant-discovery GET, so the token call must not run on
+    the loop — an unbounded GET there blocks the whole process, not just a worker."""
+    threads: list[str] = []
+
+    def _record(_self=None, *_args, **_kwargs):
+        threads.append(threading.current_thread().name)
+        return "test-token"
+
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    with patch.object(MicrosoftAppCredentials, "get_access_token", _record):
+        await download_inline_image(att, _CREDENTIALS, client=_client_with_handler(_ok_handler))
+
+    assert threads and all(name != threading.main_thread().name for name in threads)
