@@ -394,3 +394,31 @@ async def test_token_acquisition_runs_off_the_event_loop():
         await download_inline_image(att, _CREDENTIALS, client=_client_with_handler(_ok_handler))
 
     assert threads and all(name != threading.main_thread().name for name in threads)
+
+
+async def test_token_failure_message_carries_the_type_not_the_exception_text():
+    """T-119: newly reachable now that T-115m makes MSAL time out. A `requests` timeout
+    string embeds the tenant id and the token endpoint; a PermissionError carries AAD's
+    error_description. The chained original still reaches `exc_info=True` logging."""
+
+    class ConnectTimeout(OSError):  # noqa: N818 -- mirrors requests' real class name
+        """Stand-in for requests.exceptions.ConnectTimeout — same str() shape."""
+
+    def _boom(_self=None, *_args, **_kwargs):
+        msg = (
+            "HTTPSConnectionPool(host='login.microsoftonline.com', port=443): Max retries "
+            "exceeded with url: /tid-guid/oauth2/v2.0/token"
+        )
+        raise ConnectTimeout(msg)
+
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    client = _client_with_handler(lambda _r: pytest.fail("must not reach HTTP"))
+    with (
+        patch.object(MicrosoftAppCredentials, "get_access_token", _boom),
+        pytest.raises(InlineImageDownloadError) as excinfo,
+    ):
+        await download_inline_image(att, _CREDENTIALS, client=client)
+
+    # Exact equality, not a substring check: it proves nothing ELSE leaked into the message.
+    assert str(excinfo.value) == "Failed to acquire Bot Framework connector token: ConnectTimeout"
+    assert isinstance(excinfo.value.__cause__, ConnectTimeout)
