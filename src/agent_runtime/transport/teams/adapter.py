@@ -21,6 +21,7 @@ from botbuilder.schema import (
     InvokeResponse,
 )
 
+from agent_runtime.transport.teams._msal import BoundedAppCredentials
 from agent_runtime.transport.teams.events import (
     ConversationRef,
     FileAttachment,
@@ -211,6 +212,18 @@ class TeamsAdapter:
                 app_id=config.app_id,
                 app_password=config.app_password,
                 channel_auth_tenant=config.tenant_id,
+                # T-115m -- without this the SDK builds its own timeout-less
+                # MicrosoftAppCredentials (`bot_framework_adapter.py:1352-1380`) and
+                # mints the connector token synchronously inside msrest's async
+                # pipeline (`msrest/pipeline/async_requests.py:99`) -- i.e. on the
+                # event loop, unbounded, on EVERY outbound activity. A caller-supplied
+                # AppCredentials is returned verbatim ahead of that build path (`:1364`).
+                # Construction stays network-free; the MSAL app is built on first send.
+                app_credentials=BoundedAppCredentials(
+                    config.app_id,
+                    config.app_password,
+                    channel_auth_tenant=config.tenant_id,
+                ),
             )
         )
         self._adapter.on_turn_error = config.on_turn_error or self._default_on_turn_error

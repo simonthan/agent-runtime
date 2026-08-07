@@ -12,12 +12,14 @@ so the host allowlist below is a security boundary, not a convenience check.
 from __future__ import annotations
 
 import asyncio
+import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 import httpx
-from botframework.connector.auth import MicrosoftAppCredentials
+
+from agent_runtime.transport.teams._msal import BoundedAppCredentials
 
 if TYPE_CHECKING:
     from agent_runtime.transport.teams.events import InlineImageAttachment
@@ -125,19 +127,53 @@ def _host_is_allowed(url: str, allowed_hosts: frozenset[str]) -> bool:
     return any(host == allowed or host.endswith(f".{allowed}") for allowed in allowed_hosts)
 
 
+# T-115m -- credentials live for the process, keyed by the (frozen, hashable) value.
+# The SDK builds its MSAL app lazily INSIDE the credentials object and discards it with
+# them, so the previous fresh-per-call construction meant MSAL's token cache ALWAYS
+# missed: every inline image paid a full discovery GET + token POST, up to 3 a turn. A
+# warm entry now serves subsequent images and turns with no network at all until the
+# ~1 h expiry. Keying on the credentials means a secret rotation lands on a new key --
+# no invalidation logic, no stale-credential window. The cached object is shared across
+# worker threads, which is safe: MSAL guards its token cache with an RLock and documents
+# the app as a process-lifetime singleton.
+_credentials_cache: dict[BotFrameworkCredentials, BoundedAppCredentials] = {}
+_cache_lock = threading.Lock()
+
+
+def _cached_credentials(credentials: BotFrameworkCredentials) -> BoundedAppCredentials:
+    """Return the process-wide ``BoundedAppCredentials`` for ``credentials``.
+
+    Construction is network-free (MSAL is built lazily on first token request), so
+    this is safe to call from anywhere; the lock only serialises the miss path.
+    """
+    cached = _credentials_cache.get(credentials)
+    if cached is not None:
+        return cached
+    with _cache_lock:
+        cached = _credentials_cache.get(credentials)
+        if cached is None:
+            cached = BoundedAppCredentials(
+                credentials.app_id,
+                credentials.app_password,
+                channel_auth_tenant=credentials.tenant_id,
+            )
+            _credentials_cache[credentials] = cached
+        return cached
+
+
 async def _acquire_token(credentials: BotFrameworkCredentials) -> str:
     """Fetch a Bot Framework connector token, wrapping the blocking SDK call.
 
-    ``MicrosoftAppCredentials.get_access_token`` is synchronous and raises
-    ``PermissionError`` on failure (also catches any other SDK/MSAL exception
-    broadly, since the underlying library exposes no single narrow type) —
-    both surface here as ``InlineImageDownloadError``.
+    ``get_access_token`` is synchronous and raises ``PermissionError`` on failure
+    (any other SDK/MSAL exception is also caught broadly, since the underlying
+    library exposes no single narrow type) — both surface here as
+    ``InlineImageDownloadError``.
+
+    The credentials carry a bounded MSAL app (T-115m), and the whole call runs in
+    one ``to_thread``: the MSAL constructor does network I/O on first use, so
+    building it on the event loop would block the process on an unbounded GET.
     """
-    app_credentials = MicrosoftAppCredentials(
-        credentials.app_id,
-        credentials.app_password,
-        channel_auth_tenant=credentials.tenant_id,
-    )
+    app_credentials = _cached_credentials(credentials)
     try:
         return await asyncio.to_thread(app_credentials.get_access_token)
     except Exception as exc:
