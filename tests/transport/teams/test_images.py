@@ -51,7 +51,9 @@ def _mock_token():
     """
     images._credentials_cache.clear()
     with (
-        patch.object(MicrosoftAppCredentials, "get_access_token", return_value="test-token") as mock,
+        patch.object(
+            MicrosoftAppCredentials, "get_access_token", return_value="test-token"
+        ) as mock,
         patch.object(_msal_module, "_build_msal_app", return_value=object()),
     ):
         yield mock
