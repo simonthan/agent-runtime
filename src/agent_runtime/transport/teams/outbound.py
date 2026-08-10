@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
@@ -136,7 +137,11 @@ class BotFrameworkOutboundChannel:
         ``None`` instead of raising. The live token-service call is wrapped so a
         transient failure (5xx/network) ALSO yields ``None`` — the caller must be free to
         skip the card and still answer the turn (the eager SSO prompt runs before
-        ``process_turn`` in the dispatcher, so a raise here would strand the user)."""
+        ``process_turn`` in the dispatcher, so a raise here would strand the user).
+
+        The awaited SDK call is a coroutine whose sign-in-resource round trip is a synchronous
+        msrest request (``TokenApiClient`` is ``SDKClient``); it is driven on a worker thread
+        (T-119c) so the token-service GET never blocks the event loop."""
         if not connection_name:
             return None
         activity = self._turn_context.activity
@@ -146,7 +151,18 @@ class BotFrameworkOutboundChannel:
         if not user_id or get is None:
             return None
         try:
-            resp = await get(self._turn_context, connection_name, user_id)
+            # T-119c -- get_sign_in_resource_from_user is a coroutine, but the sign-in-resource
+            # HTTP round trip inside it is SYNCHRONOUS: TokenApiClient is msrest's SDKClient and
+            # `client.bot_sign_in.get_sign_in_resource(...)` is NOT awaited
+            # (bot_framework_adapter.py:1219). Awaiting the coroutine on this loop therefore blocks
+            # the whole event loop for the round trip. Drive it to completion on a worker thread
+            # (its own throwaway loop) so only that thread blocks. T-119's turn-boundary pre-warm
+            # already makes the connector-token mint inside this call a cache hit; this moves the
+            # remaining sync HTTP call off-loop. Return value + None-on-failure contract unchanged:
+            # a raise still surfaces through the future to the except below.
+            resp = await asyncio.to_thread(
+                asyncio.run, get(self._turn_context, connection_name, user_id)
+            )
         except Exception as exc:  # noqa: BLE001 — token-service blip must not strand the turn (fail-safe)
             # mask_telemetry (not exc_info=True): the underlying msrest/Graph HTTP error can
             # embed the token-service request URL, which may carry an Entra OID or tenant
