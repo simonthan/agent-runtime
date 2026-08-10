@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.21.3 — 2026-08-09
+
+### Fixed
+- **The eager-SSO sign-in-resource round trip ran synchronously on the event loop.** T-119 pre-warmed
+  the connector-token *mint* off-loop, but `BotFrameworkOutboundChannel.get_sign_in_resource` awaits
+  the SDK coroutine `BotFrameworkAdapter.get_sign_in_resource_from_user`, whose actual HTTP call is a
+  **synchronous** msrest request — `TokenApiClient` is `SDKClient` and
+  `client.bot_sign_in.get_sign_in_resource(...)` is not awaited (`bot_framework_adapter.py:1219`). On a
+  single-worker deployment that blocked the whole loop for the token-service GET. The coroutine is now
+  driven to completion on a worker thread (`asyncio.to_thread(asyncio.run, …)`), so only that thread
+  blocks. Return value and the `None`-on-failure / no-raise contract are unchanged.
+
 ## v0.21.2 — 2026-08-09
 
 ### Security

@@ -1,5 +1,7 @@
 """OutboundChannel impl tests — assert correct Activity wire format."""
 
+import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -144,3 +146,60 @@ async def test_update_activity_returns_false_on_empty_id(turn_context):
     channel = BotFrameworkOutboundChannel(turn_context)
     assert await channel.update_activity("", "edited") is False
     assert turn_context.update_activity.await_count == 0
+
+
+async def test_get_sign_in_resource_runs_off_the_event_loop(turn_context):
+    """T-119c: the SDK coroutine's sign-in-resource round trip is a SYNCHRONOUS msrest call
+    (bot_framework_adapter.py:1219, TokenApiClient is SDKClient). It must run on a worker
+    thread, not the loop thread, so a single-worker uvicorn process is not blocked for the
+    whole token-service GET. Assert the coroutine BODY executes off the main thread."""
+    body_thread: dict[str, str] = {}
+
+    async def _record(*_args, **_kwargs):
+        body_thread["name"] = threading.current_thread().name
+        resp = MagicMock()
+        resp.sign_in_link = "https://token.botframework.com/api/oauth/signin?signature=xyz"
+        resp.token_exchange_resource = MagicMock(uri="api://obo-client-id")
+        return resp
+
+    turn_context.activity.from_property.id = "29:user-abc"
+    turn_context.adapter.get_sign_in_resource_from_user = _record
+    channel = BotFrameworkOutboundChannel(turn_context)
+
+    out = await channel.get_sign_in_resource(connection_name="c")
+
+    assert out is not None
+    assert out.sign_in_link.endswith("signature=xyz")
+    assert body_thread["name"] != threading.main_thread().name
+
+
+async def test_get_sign_in_resource_does_not_block_the_event_loop(turn_context):
+    """Negative control (probe-verified: True with the fix, False with a plain `await get(...)`).
+    The SDK body blocks on a threading.Event that is only released by a coroutine scheduled on
+    the main loop. If the sign-in call blocked the loop, that releaser could never run, the
+    body would time out, and `concurrent_ran_first` would be False. Off-loop => the loop stays
+    free, the releaser runs, the worker wakes, `concurrent_ran_first` is True."""
+    proceed = threading.Event()
+    observed: dict[str, bool] = {}
+
+    async def _blocking(*_args, **_kwargs):
+        # Runs on the worker thread under the fix; the synchronous wait models the msrest GET.
+        observed["concurrent_ran_first"] = proceed.wait(timeout=5)
+        resp = MagicMock()
+        resp.sign_in_link = "link"
+        resp.token_exchange_resource = MagicMock(uri="api://x")
+        return resp
+
+    async def _releaser():
+        proceed.set()  # only reachable if the loop was NOT blocked by the sign-in call
+
+    turn_context.activity.from_property.id = "29:user-abc"
+    turn_context.adapter.get_sign_in_resource_from_user = _blocking
+    channel = BotFrameworkOutboundChannel(turn_context)
+
+    task = asyncio.create_task(_releaser())
+    out = await channel.get_sign_in_resource(connection_name="c")
+    await task
+
+    assert out is not None
+    assert observed["concurrent_ran_first"] is True
