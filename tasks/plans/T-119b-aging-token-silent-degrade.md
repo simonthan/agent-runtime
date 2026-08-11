@@ -1,7 +1,13 @@
 ---
 task: T-119b
 title: Aging-token silent-degrade residual — vet the T-119 stub (signed_session override vs. warm-failure telemetry vs. close)
-planStatus: needs-decision
+planStatus: closed-without-code
+resolution: >
+  Simon-ratified 2026-08-11 (Option A: accept as documented limitation). No agent-runtime change
+  owed. signed_session override stays rejected (converts bounded-latency into candidate
+  total-outage); warm-failure-streak telemetry is mis-targeted (msal swallows the refresh error
+  in the real residual, warm returns True silently). Re-open only via Option C — a real observed
+  AAD-degraded-aging incident in the field. Tracked in tbp status.md under T-119b (umbrella owner).
 impact: infrastructure
 blockedBy: []
 ---
