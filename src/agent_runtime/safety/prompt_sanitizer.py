@@ -56,8 +56,9 @@ _PLATFORM_PROVENANCE_PREFIX = "[platform]"
 #   \[\s*platform   a bracket that OPENS with the token
 #   \b              …as a whole word, so "[platformer review]" / "[platforms]" are untouched
 # "[the platform]" and ordinary prose ("the platform is down") never match — the token must
-# follow the bracket. Residual accepted deliberately (plan T-132 §D4/R1): the Cyrillic/Greek
-# homoglyph `[plаtform]` survives NFKC — the module-wide SEC-7 residual documented above.
+# follow the bracket. Residual accepted deliberately (plan T-132 §D4/R1): a Cyrillic/Greek
+# homoglyph "platform" (e.g. U+0430 replacing ASCII 'a') survives NFKC — the module-wide
+# SEC-7 residual documented above.
 _PLATFORM_PROVENANCE_PATTERN = r"\[\s*platform\b"
 
 # Case-INSENSITIVE so a lowercase user-turn injection ("please system: do x") cannot
