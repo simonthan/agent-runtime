@@ -400,11 +400,16 @@ class SessionManager:
 
         Best-effort by design: a durable-store outage must not deny the user their
         session, so a read failure degrades to the old empty-history behaviour.
+
+        The returned list is trimmed to ``max_history`` (T-133) so every path that
+        populates ``conversation_history`` honours the cap. The durable transcript is
+        chronological oldest→newest (repo contract: ordered by insertion), so the tail
+        slice keeps the most recent turns.
         """
         if self._durable is None:
             return []
         try:
-            return await self._durable.get_conversation_history(
+            history = await self._durable.get_conversation_history(
                 session_id=session_id,
                 user_id=user_id,
                 bot_id=bot_id,
@@ -416,6 +421,15 @@ class SessionManager:
                 error=mask_telemetry(str(e)),
             )
             return []
+        # T-133: apply the SEC-6 cap on the rebuild paths too. Both callers feed this
+        # list straight into `_save_session`, so without the trim a rehydration wrote
+        # the ENTIRE durable transcript back into Redis and the next turn assembled all
+        # of it into the prompt — `max_history` silently did not hold on the one path
+        # where the list is largest. Same expression as `create_session` (seeded fork
+        # history) and `update_session` (append), so `None` stays unbounded.
+        if self._max_history is not None and len(history) > self._max_history:
+            return history[-self._max_history :]
+        return history
 
     async def _rearm_active_index(self, user_id: str, bot_id: str, session_id: str) -> None:
         """Extend the (user, bot) reverse-index lease alongside the session lease.
