@@ -7,7 +7,7 @@ import pytest
 
 from agent_runtime.session.events import Active, NewSession, Resumable
 from agent_runtime.session.manager import SessionManager
-from agent_runtime.session.testing import FakeRedisClient, FakeSessionRepository
+from agent_runtime.session.testing import FakeRedisClient, FakeSessionRepository, make_session_data
 
 
 def _make_manager(
@@ -493,3 +493,122 @@ async def test_resume_from_db_exception_returns_none():
     # resume_session with a token will call _resume_from_db on Redis miss
     result = await mgr.resume_session("any-token", user_id="u1", bot_id="b1")
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# T-133: the cold-path index write is an atomic NX claim
+# ---------------------------------------------------------------------------
+
+
+async def test_cold_rehydration_defers_to_concurrent_create_winner():
+    """T-133 (2): the plain SET stomped an index a concurrent create_session had just
+    claimed for a NEWER session, orphaning it. The NX claim must lose, and the loser must
+    surface the WINNER — never resurrect its own older row."""
+    mgr, redis, _repo = _make_manager()
+    session = await mgr.create_session(user_id="u1", bot_id="b1")
+    index_key = "session:active:u1:b1"
+    await redis.delete(index_key)
+    await redis.delete(f"session:{session.id}")
+
+    winner_sid = "winner-session-id"
+    redis._store[f"session:{winner_sid}"] = mgr._serialize_session(
+        make_session_data(user_id="u1", bot_id="b1", id=winner_sid)
+    )
+    original_set = redis.set
+
+    async def patched_set(key, value, ex=None, px=None, nx=False, xx=False):
+        if nx and key == index_key:
+            redis._store[key] = winner_sid  # a concurrent create_session claimed it first
+            return None
+        return await original_set(key, value, ex=ex, px=px, nx=nx, xx=xx)
+
+    redis.set = patched_set  # type: ignore[method-assign]
+
+    decision = await mgr.get_or_prompt_resume(user_id="u1", bot_id="b1")
+
+    assert isinstance(decision, Active)
+    assert decision.session_id == winner_sid
+    assert await redis.get(index_key) == winner_sid, "index was stomped with the older id"
+
+
+async def test_cold_rehydration_lost_claim_to_same_session_is_still_resumable():
+    """Losing the NX claim to our OWN id (a concurrent rehydration of the same row) is
+    indistinguishable from winning."""
+    mgr, redis, _repo = _make_manager()
+    session = await mgr.create_session(user_id="u1", bot_id="b1")
+    index_key = "session:active:u1:b1"
+    await redis.delete(index_key)
+    await redis.delete(f"session:{session.id}")
+
+    original_set = redis.set
+
+    async def patched_set(key, value, ex=None, px=None, nx=False, xx=False):
+        if nx and key == index_key:
+            redis._store[key] = value  # another rehydration wrote the SAME id
+            return None
+        return await original_set(key, value, ex=ex, px=px, nx=nx, xx=xx)
+
+    redis.set = patched_set  # type: ignore[method-assign]
+
+    decision = await mgr.get_or_prompt_resume(user_id="u1", bot_id="b1")
+
+    assert isinstance(decision, Resumable)
+    assert decision.session_id == session.id
+
+
+async def test_cold_rehydration_winner_not_yet_persisted_is_resumable_not_active():
+    """The winner claimed the index but has not written its blob yet (create_session
+    claims at :177, saves at :198). Active would be a dead end — `_select`'s Active arm
+    skips resume(), and a turn on an unreadable session drops its messages from Redis AND
+    from the durable transcript. Resumable gives the consumer a retry."""
+    mgr, redis, _repo = _make_manager()
+    session = await mgr.create_session(user_id="u1", bot_id="b1")
+    index_key = "session:active:u1:b1"
+    await redis.delete(index_key)
+    await redis.delete(f"session:{session.id}")
+
+    winner_sid = "unsaved-winner"
+    original_set = redis.set
+
+    async def patched_set(key, value, ex=None, px=None, nx=False, xx=False):
+        if nx and key == index_key:
+            redis._store[key] = winner_sid  # claimed, but no session:<id> blob yet
+            return None
+        return await original_set(key, value, ex=ex, px=px, nx=nx, xx=xx)
+
+    redis.set = patched_set  # type: ignore[method-assign]
+
+    decision = await mgr.get_or_prompt_resume(user_id="u1", bot_id="b1")
+
+    assert isinstance(decision, Resumable)
+    assert decision.session_id == winner_sid
+
+
+async def test_cold_rehydration_non_active_winner_is_resumable():
+    """Winner blob exists but is not active → Resumable carrying the winner's own
+    last-activity timestamp (pins the compound guard against a 'simplification' that
+    would AttributeError on the None case above)."""
+    mgr, redis, _repo = _make_manager()
+    session = await mgr.create_session(user_id="u1", bot_id="b1")
+    index_key = "session:active:u1:b1"
+    await redis.delete(index_key)
+    await redis.delete(f"session:{session.id}")
+
+    winner_sid = "ended-winner"
+    winner = make_session_data(user_id="u1", bot_id="b1", id=winner_sid, status="ended")
+    redis._store[f"session:{winner_sid}"] = mgr._serialize_session(winner)
+    original_set = redis.set
+
+    async def patched_set(key, value, ex=None, px=None, nx=False, xx=False):
+        if nx and key == index_key:
+            redis._store[key] = winner_sid
+            return None
+        return await original_set(key, value, ex=ex, px=px, nx=nx, xx=xx)
+
+    redis.set = patched_set  # type: ignore[method-assign]
+
+    decision = await mgr.get_or_prompt_resume(user_id="u1", bot_id="b1")
+
+    assert isinstance(decision, Resumable)
+    assert decision.session_id == winner_sid
+    assert decision.last_activity_ts == winner.updated_at

@@ -4,7 +4,7 @@ requires-python = ">=3.12"
 
 [[package]]
 name = "agent-runtime"
-version = "0.21.4"
+version = "0.21.5"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },

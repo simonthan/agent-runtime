@@ -239,3 +239,61 @@ async def test_persist_message_failure_logs_error_with_exc_type(monkeypatch):
     _, kw = recorder.errors[0]
     assert kw["exc_type"] == "RuntimeError"
     assert kw["exc_info"] is True
+
+
+# ---------------------------------------------------------------------------
+# T-133: rehydration honours the SEC-6 max_history cap
+# ---------------------------------------------------------------------------
+
+
+async def test_cold_rehydration_trims_to_max_history():
+    """T-133 (1): the cold-cache rebuild must not re-inflate Redis with the FULL durable
+    transcript — max_history is a prompt-budget guarantee, not a Redis-append-only cap."""
+    repo = FakeSessionRepository()
+    mgr = _make_manager(repo=repo, max_history=2)
+    s = await mgr.create_session(user_id="u1", bot_id="b1")
+    for i in range(5):
+        await mgr.update_session(s.id, add_message={"role": "user", "content": str(i)})
+    await mgr.redis.delete("session:active:u1:b1")
+    await mgr.redis.delete(f"session:{s.id}")
+
+    await mgr.get_or_prompt_resume(user_id="u1", bot_id="b1")
+
+    rehydrated = await mgr.get_session(s.id)
+    assert rehydrated is not None
+    assert [m["content"] for m in rehydrated.conversation_history] == ["3", "4"]
+
+
+async def test_resume_from_db_trims_to_max_history():
+    """T-133 (1): the other rebuild path (_resume_from_db, reached on a Redis miss during
+    resume_session) gets the same cap."""
+    repo = FakeSessionRepository()
+    mgr = _make_manager(repo=repo, max_history=2)
+    s = await mgr.create_session(user_id="u1", bot_id="b1")
+    for i in range(5):
+        await mgr.update_session(s.id, add_message={"role": "user", "content": str(i)})
+    token = next(iter(repo._by_token))
+    await mgr.redis.delete(f"session:{s.id}")
+
+    resumed = await mgr.resume_session(token, user_id="u1", bot_id="b1")
+
+    assert resumed is not None
+    assert [m["content"] for m in resumed.conversation_history] == ["3", "4"]
+
+
+async def test_rehydration_unbounded_when_no_max_history():
+    """max_history=None keeps the full transcript — the T-133 trim must not change
+    behaviour for consumers that never set a cap (tbp runs the default)."""
+    repo = FakeSessionRepository()
+    mgr = _make_manager(repo=repo)
+    s = await mgr.create_session(user_id="u1", bot_id="b1")
+    for i in range(5):
+        await mgr.update_session(s.id, add_message={"role": "user", "content": str(i)})
+    await mgr.redis.delete("session:active:u1:b1")
+    await mgr.redis.delete(f"session:{s.id}")
+
+    await mgr.get_or_prompt_resume(user_id="u1", bot_id="b1")
+
+    rehydrated = await mgr.get_session(s.id)
+    assert rehydrated is not None
+    assert [m["content"] for m in rehydrated.conversation_history] == ["0", "1", "2", "3", "4"]

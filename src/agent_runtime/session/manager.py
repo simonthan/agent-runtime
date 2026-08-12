@@ -361,10 +361,12 @@ class SessionManager:
             xx=True,
         )
         if not extended:
-            # Key evicted between get_session and SET; rehydrate from DB
-            session = await self._resume_from_db(session_id_or_token, user_id, bot_id)
-            if session:
-                await self._save_session(session)
+            session = await self._recover_evicted_lease(
+                session,
+                token_or_id=session_id_or_token,
+                user_id=user_id,
+                bot_id=bot_id,
+            )
 
         return session
 
@@ -400,11 +402,16 @@ class SessionManager:
 
         Best-effort by design: a durable-store outage must not deny the user their
         session, so a read failure degrades to the old empty-history behaviour.
+
+        The returned list is trimmed to ``max_history`` (T-133) so every path that
+        populates ``conversation_history`` honours the cap. The durable transcript is
+        chronological oldest→newest (repo contract: ordered by insertion), so the tail
+        slice keeps the most recent turns.
         """
         if self._durable is None:
             return []
         try:
-            return await self._durable.get_conversation_history(
+            history = await self._durable.get_conversation_history(
                 session_id=session_id,
                 user_id=user_id,
                 bot_id=bot_id,
@@ -416,6 +423,15 @@ class SessionManager:
                 error=mask_telemetry(str(e)),
             )
             return []
+        # T-133: apply the SEC-6 cap on the rebuild paths too. Both callers feed this
+        # list straight into `_save_session`, so without the trim a rehydration wrote
+        # the ENTIRE durable transcript back into Redis and the next turn assembled all
+        # of it into the prompt — `max_history` silently did not hold on the one path
+        # where the list is largest. Same expression as `create_session` (seeded fork
+        # history) and `update_session` (append), so `None` stays unbounded.
+        if self._max_history is not None and len(history) > self._max_history:
+            return history[-self._max_history :]
+        return history
 
     async def _rearm_active_index(self, user_id: str, bot_id: str, session_id: str) -> None:
         """Extend the (user, bot) reverse-index lease alongside the session lease.
@@ -433,6 +449,89 @@ class SessionManager:
             session_id,
             ex=self._ttl_seconds,
             xx=True,
+        )
+
+    async def _rehydrate_cold_session(
+        self, row: ResumeRow, *, user_id: str, bot_id: str
+    ) -> ResumeDecision:
+        """Rebuild a Redis session from a durable row, then claim the (user, bot) index.
+
+        Extracted out of ``get_or_prompt_resume`` in T-133: that function sits at
+        complexity 9 / 5 returns against this repo's ``select = ["ALL"]`` ceilings of
+        10 / 6, so the race handling below could not be added inline.
+
+        The session blob is written BEFORE the index claim on purpose — an index that
+        points at a session key which does not exist yet reads as a dangling pointer to
+        the next caller, which deletes it (see ``get_or_prompt_resume`` step 1).
+        """
+        last = _ensure_utc(row.last_message_at or row.created_at)
+        # T-093 Fix B — see _load_durable_history for why this is load-bearing.
+        history = await self._load_durable_history(str(row.id), user_id, bot_id)
+        session = SessionData(
+            id=str(row.id),
+            user_id=row.user_id,
+            bot_id=row.bot_id,
+            created_at=_ensure_utc(row.created_at),
+            updated_at=last,
+            status="active",
+            conversation_history=history,
+            client_context=row.client_context,
+        )
+        await self._save_session(session)
+        # T-133: atomic NX claim, mirroring create_session's (D4b). The plain SET this
+        # replaces would overwrite an index a concurrent create_session had just claimed
+        # for a NEWER session, pointing (user, bot) back at this older row and orphaning
+        # the fresh session for the rest of its life.
+        claimed = await self.redis.set(
+            self._active_index_key(user_id, bot_id),
+            str(row.id),
+            ex=self._ttl_seconds,
+            nx=True,
+        )
+        if not claimed:
+            return await self._resolve_cold_claim_loss(
+                user_id=user_id,
+                bot_id=bot_id,
+                own_session_id=str(row.id),
+                own_last=last,
+            )
+        return Resumable(session_id=str(row.id), last_activity_ts=last)
+
+    async def _resolve_cold_claim_loss(
+        self, *, user_id: str, bot_id: str, own_session_id: str, own_last: datetime
+    ) -> ResumeDecision:
+        """Decide what to surface when the cold-path NX index claim is lost (T-133).
+
+        - Index now holds OUR id (a concurrent rehydration of the same row, or the key
+          expired between the SET and this GET): indistinguishable from winning.
+        - Index holds a DIFFERENT id: a concurrent ``create_session`` owns (user, bot)
+          now. Surface THAT session — resurrecting ours would split the conversation
+          across two ids. ``Active`` when its blob is live, because there is nothing
+          left to rehydrate and a session created seconds ago must not get a
+          "continuing your conversation" notice.
+        - Index holds a different id whose blob is NOT readable or not active — most
+          likely ``create_session``'s narrow claim→save window (it claims at :177 and
+          saves at :198): ``Resumable``, never ``Active``. ``Resumable`` is the only
+          decision that routes a consumer back through a second resume attempt once
+          the winner's blob lands; ``Active`` would have the consumer act on a session
+          id it cannot read, dropping that turn's messages from Redis AND from the
+          durable transcript (``update_session`` returns early on a missing session,
+          before the durable write).
+        """
+        current = await self.redis.get(self._active_index_key(user_id, bot_id))
+        if not current or current == own_session_id:
+            return Resumable(session_id=own_session_id, last_activity_ts=own_last)
+        self._log.info(
+            "Cold rehydration lost the active-index claim; deferring to the winner",
+            session_id=current,
+            user_id=user_id,
+        )
+        winner = await self.get_session(current)
+        if winner is not None and winner.status == "active":
+            return Active(session_id=current)
+        return Resumable(
+            session_id=current,
+            last_activity_ts=winner.updated_at if winner is not None else _utc_now(),
         )
 
     async def get_or_prompt_resume(
@@ -502,27 +601,7 @@ class SessionManager:
         row = await self._session_repo.get_active_session(user_id=user_id, bot_id=bot_id)
         if row is None:
             return NewSession()
-
-        last = _ensure_utc(row.last_message_at or row.created_at)
-        # T-093 Fix B — see _load_durable_history for why this is load-bearing.
-        history = await self._load_durable_history(str(row.id), user_id, bot_id)
-        session = SessionData(
-            id=str(row.id),
-            user_id=row.user_id,
-            bot_id=row.bot_id,
-            created_at=_ensure_utc(row.created_at),
-            updated_at=last,
-            status="active",
-            conversation_history=history,
-            client_context=row.client_context,
-        )
-        await self._save_session(session)
-        await self.redis.set(
-            self._active_index_key(user_id, bot_id),
-            str(row.id),
-            ex=self._ttl_seconds,
-        )
-        return Resumable(session_id=str(row.id), last_activity_ts=last)
+        return await self._rehydrate_cold_session(row, user_id=user_id, bot_id=bot_id)
 
     async def get_active_sessions_count(self, user_id: str) -> int:
         """Get count of active sessions for a user via O(1) counter key."""
@@ -698,6 +777,56 @@ class SessionManager:
         except Exception as e:  # noqa: BLE001
             self._log.warning("Failed to resume from DB", error=mask_telemetry(str(e)))
             return None
+
+    async def _recover_evicted_lease(
+        self,
+        session: SessionData,
+        *,
+        token_or_id: str,
+        user_id: str,
+        bot_id: str,
+    ) -> SessionData | None:
+        """Recover a session whose key was evicted between ``get_session`` and the XX SET.
+
+        ``get_session_for_resume`` interprets its argument STRICTLY as a resume token
+        (see the Protocol docstring), so an id-addressed ``resume_session`` — which the
+        public API explicitly supports — always missed here and returned ``None``: the
+        caller reported "session expired" for a session whose ownership- and
+        idle-window-checked ``SessionData`` this method is holding in its hand (T-133).
+
+        The DB lookup is used as a LIVENESS CHECK, not as the returned value. The
+        in-hand ``session`` is strictly richer than anything the repo can rebuild:
+        ``_resume_from_db`` hardcodes ``data={}``, dropping every key consumers keep
+        there (pending-action gates, working memory), and the caller has already marked
+        it ``active`` with a fresh ``updated_at``.
+
+        A DB miss has two very different causes and they MUST NOT be conflated:
+        (a) ``token_or_id`` is a session id and the seam accepts only tokens — the T-133
+        bug, the session is perfectly fine; (b) the session is genuinely gone — a
+        production repo filters ``status='active'`` inside ``get_session_for_resume``
+        precisely so an ended session cannot be resurrected from a stale token
+        (teams-bot-platform's ``SessionRepository`` does exactly this). They are told
+        apart with the OTHER Protocol seam, ``get_active_session``, whose documented
+        contract is ``status='active'`` AND inside the idle window. No Protocol change.
+        Fail closed: any doubt returns ``None`` (the pre-T-133 outcome) rather than
+        re-saving a session the durable store has retired.
+        """
+        if await self._resume_from_db(token_or_id, user_id, bot_id) is not None:
+            await self._save_session(session)
+            return session
+        try:
+            row = await self._session_repo.get_active_session(user_id=user_id, bot_id=bot_id)
+        except Exception as e:  # noqa: BLE001 - fail closed; never resurrect on a blip
+            self._log.warning(
+                "Liveness check failed during lease recovery; denying resume",
+                session_id=session.id,
+                error=mask_telemetry(str(e)),
+            )
+            return None
+        if row is None or str(row.id) != session.id:
+            return None
+        await self._save_session(session)
+        return session
 
     async def _save_session(self, session: SessionData) -> None:
         """Save session to Redis."""

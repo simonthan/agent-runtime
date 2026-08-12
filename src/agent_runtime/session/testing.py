@@ -127,6 +127,12 @@ class FakeSessionRepository:
         row = self._by_id.get(sid)
         if row is None or row.user_id != user_id or row.bot_id != bot_id:
             return None
+        # Mirrors every production implementation (e.g. teams-bot-platform's
+        # SessionRepository filters `status = 'active'` in SQL) so an ended session
+        # cannot be resurrected from a stale token. Without this the fake is more
+        # permissive than the contract and hides resurrection bugs (T-133).
+        if row.status != "active":
+            return None
         return row
 
     async def get_active_session(

@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.21.5 — 2026-08-12
+
+### Fixed
+- **`max_history` now holds on the two session-rebuild paths (T-133).**
+  `_load_durable_history` returned the FULL durable transcript and both callers —
+  cold-cache rehydration in `get_or_prompt_resume` and `_resume_from_db` — wrote it
+  straight back into Redis via `_save_session`. `create_session` (seeded fork history)
+  and `update_session` (append) have always trimmed, so the cap silently did not hold on
+  the one path where the list is largest: a Redis eviction on a long session re-inflated
+  the blob with the entire transcript, and the next turn assembled all of it into the
+  prompt. The same trim expression now runs in `_load_durable_history`. `max_history=None`
+  (the default) stays unbounded — regression-tested.
+- **The cold-rehydration write of the `(user, bot)` reverse index is an atomic NX claim.**
+  It was a plain `SET`, where `create_session` has used `SET NX` for this exact race
+  since D4b. A concurrent `create_session` could claim the index for a NEW session and
+  have the cold path stomp it back to the OLDER session id microseconds later, orphaning
+  the fresh session for its whole life — every later lifecycle call (`restart`, `fork`,
+  `ensure_active`) then acted on the wrong id. On a lost claim the manager now surfaces
+  the WINNING session instead of resurrecting its own older row.
+  **Consumer-visible:** `get_or_prompt_resume` can therefore return `Active` on a path
+  that previously always returned `Resumable` (only when the claim is lost to a live
+  session — the winner needs no rehydration, so consumers that call a resume/rehydrate
+  step on `Resumable` correctly skip it). A winner whose blob is not yet written stays
+  `Resumable`, which is the only decision type that gives a consumer a retry.
+- **An id-addressed `resume_session` survives a lease eviction.** When the XX lease
+  extension failed (key evicted between the `get_session` and the `SET`), the recovery
+  path fed the raw argument to `get_session_for_resume`, a seam that interprets it
+  STRICTLY as a resume token — so a resume addressed by session id, which the public API
+  explicitly supports, always missed and returned `None` ("session expired") even though
+  a valid, ownership- and window-checked `SessionData` was in hand. That lookup is now a
+  liveness check rather than the returned value: on a miss the manager confirms via
+  `get_active_session` that the session is still durably active and re-saves the in-hand
+  copy, which also stops the recovery path from downgrading a session to the repo's
+  rebuild (`_resume_from_db` hardcodes `data={}`, dropping consumer state). It fails
+  closed — an ended session, an unknown session, or a repo error all yield `None`.
+- **`FakeSessionRepository.get_session_for_resume` now filters `status == "active"`,**
+  matching every production implementation. The fake was more permissive than the
+  contract, which is what let a resurrection bug on the path above look tested.
+
+### Internal
+- `get_or_prompt_resume`'s cold tail is extracted into `_rehydrate_cold_session` /
+  `_resolve_cold_claim_loss`, and `resume_session`'s eviction branch into
+  `_recover_evicted_lease`. Behaviour-preserving extraction — both public functions sat
+  at this repo's `C901`/`PLR0911` ceilings (10 and 6) with no room for inline branches.
+
 ## v0.21.4 — 2026-08-11
 
 ### Security
