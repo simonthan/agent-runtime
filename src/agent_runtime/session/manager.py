@@ -361,10 +361,12 @@ class SessionManager:
             xx=True,
         )
         if not extended:
-            # Key evicted between get_session and SET; rehydrate from DB
-            session = await self._resume_from_db(session_id_or_token, user_id, bot_id)
-            if session:
-                await self._save_session(session)
+            session = await self._recover_evicted_lease(
+                session,
+                token_or_id=session_id_or_token,
+                user_id=user_id,
+                bot_id=bot_id,
+            )
 
         return session
 
@@ -775,6 +777,56 @@ class SessionManager:
         except Exception as e:  # noqa: BLE001
             self._log.warning("Failed to resume from DB", error=mask_telemetry(str(e)))
             return None
+
+    async def _recover_evicted_lease(
+        self,
+        session: SessionData,
+        *,
+        token_or_id: str,
+        user_id: str,
+        bot_id: str,
+    ) -> SessionData | None:
+        """Recover a session whose key was evicted between ``get_session`` and the XX SET.
+
+        ``get_session_for_resume`` interprets its argument STRICTLY as a resume token
+        (see the Protocol docstring), so an id-addressed ``resume_session`` — which the
+        public API explicitly supports — always missed here and returned ``None``: the
+        caller reported "session expired" for a session whose ownership- and
+        idle-window-checked ``SessionData`` this method is holding in its hand (T-133).
+
+        The DB lookup is used as a LIVENESS CHECK, not as the returned value. The
+        in-hand ``session`` is strictly richer than anything the repo can rebuild:
+        ``_resume_from_db`` hardcodes ``data={}``, dropping every key consumers keep
+        there (pending-action gates, working memory), and the caller has already marked
+        it ``active`` with a fresh ``updated_at``.
+
+        A DB miss has two very different causes and they MUST NOT be conflated:
+        (a) ``token_or_id`` is a session id and the seam accepts only tokens — the T-133
+        bug, the session is perfectly fine; (b) the session is genuinely gone — a
+        production repo filters ``status='active'`` inside ``get_session_for_resume``
+        precisely so an ended session cannot be resurrected from a stale token
+        (teams-bot-platform's ``SessionRepository`` does exactly this). They are told
+        apart with the OTHER Protocol seam, ``get_active_session``, whose documented
+        contract is ``status='active'`` AND inside the idle window. No Protocol change.
+        Fail closed: any doubt returns ``None`` (the pre-T-133 outcome) rather than
+        re-saving a session the durable store has retired.
+        """
+        if await self._resume_from_db(token_or_id, user_id, bot_id) is not None:
+            await self._save_session(session)
+            return session
+        try:
+            row = await self._session_repo.get_active_session(user_id=user_id, bot_id=bot_id)
+        except Exception as e:  # noqa: BLE001 - fail closed; never resurrect on a blip
+            self._log.warning(
+                "Liveness check failed during lease recovery; denying resume",
+                session_id=session.id,
+                error=mask_telemetry(str(e)),
+            )
+            return None
+        if row is None or str(row.id) != session.id:
+            return None
+        await self._save_session(session)
+        return session
 
     async def _save_session(self, session: SessionData) -> None:
         """Save session to Redis."""

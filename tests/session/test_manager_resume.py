@@ -177,10 +177,72 @@ async def test_resume_session_eviction_during_resume_falls_through_to_db():
 
     redis.set = patched_set  # type: ignore[method-assign]
 
-    # resume_session should fall back to DB and return a session
     resumed = await mgr.resume_session(token, user_id="u1", bot_id="b1")
-    # After XX failure + DB fallback, session is returned (DB has it)
-    # DB row exists so it should succeed
-    assert resumed is not None or resumed is None  # graceful — DB row has no history
-    # Regardless of the returned value, we verify no crash occurred
     assert set_call_count >= 1
+    # T-133: `assert x is not None or x is None` asserted nothing. The token DOES resolve
+    # in the repo, so the DB fallback must produce the same session, marked active.
+    assert resumed is not None
+    assert resumed.id == session.id
+    assert resumed.status == "active"
+
+
+# ---------------------------------------------------------------------------
+# T-133: id-addressed resume survives a lease eviction
+# ---------------------------------------------------------------------------
+
+
+async def test_resume_by_session_id_survives_lease_eviction():
+    """T-133 (3): the XX-failure path fed the raw argument to a repo seam that treats it
+    STRICTLY as a resume token, so an id-addressed resume was denied ("session expired")
+    even though a valid, ownership-checked SessionData was in hand."""
+    mgr, redis, _repo = _make_manager()
+    session = await mgr.create_session(user_id="u1", bot_id="b1")
+    await mgr.update_session(session.id, add_message={"role": "user", "content": "keep me"})
+
+    original_set = redis.set
+    evicted = False
+
+    async def patched_set(key, value, ex=None, px=None, nx=False, xx=False):
+        nonlocal evicted
+        if xx and key == f"session:{session.id}" and not evicted:
+            evicted = True
+            redis._store.pop(key, None)
+            return None
+        return await original_set(key, value, ex=ex, px=px, nx=nx, xx=xx)
+
+    redis.set = patched_set  # type: ignore[method-assign]
+
+    resumed = await mgr.resume_session(session.id, user_id="u1", bot_id="b1")
+
+    assert evicted
+    assert resumed is not None, "id-addressed resume denied after a lease eviction"
+    assert resumed.id == session.id
+    assert resumed.status == "active"
+    assert [m["content"] for m in resumed.conversation_history] == ["keep me"]
+    assert await redis.get(f"session:{session.id}") is not None  # re-saved
+
+
+async def test_resume_eviction_does_not_resurrect_an_ended_durable_session():
+    """The recovery path must not re-save a session the durable store has retired.
+
+    This is the test that only means something with C3b: a production repo filters
+    `status='active'` inside get_session_for_resume, so BOTH the id-addressed case and
+    the genuinely-ended case return None from _resume_from_db. The recovery path must
+    therefore not treat "DB said no" as "must be the id-addressed bug" — it confirms
+    liveness via get_active_session, which also returns None here."""
+    mgr, redis, repo = _make_manager()
+    session = await mgr.create_session(user_id="u1", bot_id="b1")
+    token = next(iter(repo._by_token))
+    repo._by_id[session.id].status = "ended"  # ended durably; the Redis blob still says active
+
+    original_set = redis.set
+
+    async def patched_set(key, value, ex=None, px=None, nx=False, xx=False):
+        if xx and key == f"session:{session.id}":
+            redis._store.pop(key, None)
+            return None
+        return await original_set(key, value, ex=ex, px=px, nx=nx, xx=xx)
+
+    redis.set = patched_set  # type: ignore[method-assign]
+
+    assert await mgr.resume_session(token, user_id="u1", bot_id="b1") is None
