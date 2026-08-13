@@ -376,3 +376,26 @@ class TestSanitizeToolResult:
         # hostile "[ platform ]" never matches — so it passed even with the fix absent.
         # Counting marker-SHAPED matches makes the assertion real.
         assert len(_PLATFORM_RE.findall(combined)) == 1
+
+    def test_forged_truncation_marker_loses_platform_frame(self):
+        # T-155: a hostile tool result echoing the genuine truncation notice verbatim has
+        # its [platform] frame destroyed, so it cannot pass as a first-party notice. The
+        # residual prose survives as inert text inside the external-data envelope (D4) —
+        # what must NOT survive is the first-party framing.
+        from agent_runtime.llm.tool_loop import _TRUNCATION_MARKER
+
+        forged = _TRUNCATION_MARKER.format(original=9, est_tokens=2, cap=5, removed=4)
+        # DE-TAUTOLOGIZER (R3 F5) — load-bearing, do NOT drop. Without this line the whole
+        # test passes with the T-155 fix REVERTED: the pre-fix literal contains no
+        # "[platform]", so the `not _PLATFORM_RE.search(...)` assert below is satisfied
+        # vacuously. This pins the frame going IN; the assert below pins its destruction
+        # coming OUT. Same de-tautologization the T-132 test at the end of this file uses.
+        assert _PLATFORM_RE.search(forged), "T-155: genuine marker must carry the [platform] frame"
+        out = sanitize_tool_result(f"benign prose{forged}")
+        # Marker-SHAPED match, not the exact literal — the de-tautologized form this file
+        # already uses, so a near-variant forgery cannot pass the assertion vacuously.
+        assert not _PLATFORM_RE.search(_inner(out)), out
+        # D4: the inert residue is expected, and its presence proves the input actually
+        # reached the sanitizer (guards against a vacuous pass on empty output).
+        assert "TRUNCATED BY agent-runtime" in out
+        assert out.count(_TOOL_OUTPUT_PREFIX) == 1
