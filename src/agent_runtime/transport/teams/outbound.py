@@ -166,6 +166,13 @@ class BotFrameworkOutboundChannel:
         get = getattr(adapter, "get_sign_in_resource_from_user", None)
         if not user_id or get is None:
             return None
+        # ty (static analysis) cannot prove `async with … as deadline` always binds `deadline`
+        # before the `except` block reads it -- only that it binds when `__aenter__` succeeds,
+        # which is the only case that can occur in practice (`asyncio.timeout.__aenter__` does
+        # no I/O and cannot itself raise). Pre-declaring keeps the except clause's single
+        # `isinstance(exc, TimeoutError) and deadline.expired()` check unchanged (T-134 — do not
+        # split into a type-only `except TimeoutError` arm).
+        deadline: asyncio.Timeout | None = None
         try:
             # T-119c -- get_sign_in_resource_from_user is a coroutine, but the sign-in-resource
             # HTTP round trip inside it is SYNCHRONOUS: TokenApiClient is msrest's SDKClient and
@@ -191,7 +198,7 @@ class BotFrameworkOutboundChannel:
             # `TimeoutError` (aliased since 3.10) -- a type-only arm would file that under the
             # trip-wire below and corrupt the very signal T-134-a is promoted on. `expired()`
             # is true only when OUR ceiling fired.
-            if isinstance(exc, TimeoutError) and deadline.expired():
+            if isinstance(exc, TimeoutError) and deadline is not None and deadline.expired():
                 # RESIDUAL (accepted, T-134): `asyncio.to_thread` cannot be cancelled. Two
                 # shapes, depending on whether the work item had started:
                 #   * started (normal): the worker stays parked on the msrest socket until ITS
