@@ -19,6 +19,19 @@ logger = logging.getLogger(__name__)
 _ADAPTIVE_CARD_CONTENT_TYPE = "application/vnd.microsoft.card.adaptive"
 _OAUTH_CARD_CONTENT_TYPE = "application/vnd.microsoft.card.oauth"
 
+# T-134 -- ceiling on the sign-in-resource round trip. The SDK path below is msrest's
+# `TokenApiClient` (an `SDKClient`), whose only bound is `ClientConnection.timeout = 100`
+# (`msrest/universal_http/__init__.py:427`). msrest hands that to `requests` as its
+# `timeout=`, which is PER-PHASE -- a connect-then-stall costs ~200s, and msrest's retry
+# policy can repeat it. Every SSO-prompting turn pays that, inline inside the Bot Framework
+# inbound-activity webhook, which the Connector re-delivers after ~15s when it sees no ack
+# (same constraint images.py:48-58 was calibrated against, T-115l) -- so an unbounded stall
+# manufactures duplicate turns, not merely latency. 10s sits comfortably above a healthy
+# round trip (tens of ms -- T-119's pre-warm already makes the connector-token mint INSIDE
+# this call a cache hit) and well under the redelivery window. Read from the module global
+# at call time so tests can patch it.
+_SIGN_IN_RESOURCE_TIMEOUT_SECONDS = 10.0
+
 
 @dataclass(frozen=True)
 class SignInResource:
@@ -140,8 +153,11 @@ class BotFrameworkOutboundChannel:
         ``process_turn`` in the dispatcher, so a raise here would strand the user).
 
         The awaited SDK call is a coroutine whose sign-in-resource round trip is a synchronous
-        msrest request (``TokenApiClient`` is ``SDKClient``); it is driven on a worker thread
-        (T-119c) so the token-service GET never blocks the event loop."""
+        msrest request (``TokenApiClient`` is ``SDKClient``); it is driven on a worker
+        thread (T-119c) so the token-service GET never blocks the event loop. That thread is
+        NOT cancellable, so the call carries its own ``_SIGN_IN_RESOURCE_TIMEOUT_SECONDS``
+        ceiling (T-134); on expiry it returns ``None`` like every other failure and leaves the
+        worker parked until msrest's own timeout fires."""
         if not connection_name:
             return None
         activity = self._turn_context.activity
@@ -150,6 +166,13 @@ class BotFrameworkOutboundChannel:
         get = getattr(adapter, "get_sign_in_resource_from_user", None)
         if not user_id or get is None:
             return None
+        # ty (static analysis) cannot prove `async with … as deadline` always binds `deadline`
+        # before the `except` block reads it -- only that it binds when `__aenter__` succeeds,
+        # which is the only case that can occur in practice (`asyncio.timeout.__aenter__` does
+        # no I/O and cannot itself raise). Pre-declaring keeps the except clause's single
+        # `isinstance(exc, TimeoutError) and deadline.expired()` check unchanged (T-134 — do not
+        # split into a type-only `except TimeoutError` arm).
+        deadline: asyncio.Timeout | None = None
         try:
             # T-119c -- get_sign_in_resource_from_user is a coroutine, but the sign-in-resource
             # HTTP round trip inside it is SYNCHRONOUS: TokenApiClient is msrest's SDKClient and
@@ -160,10 +183,44 @@ class BotFrameworkOutboundChannel:
             # already makes the connector-token mint inside this call a cache hit; this moves the
             # remaining sync HTTP call off-loop. Return value + None-on-failure contract unchanged:
             # a raise still surfaces through the future to the except below.
-            resp = await asyncio.to_thread(
-                asyncio.run, get(self._turn_context, connection_name, user_id)
-            )
+            # T-134 -- the `to_thread` hop is what makes an outer deadline useless here (a thread
+            # is not cancellable), so this call needs a ceiling of its own. It goes OUTSIDE the
+            # to_thread so it bounds the await; it cannot bound the thread. See the handler
+            # below for the residual.
+            async with asyncio.timeout(_SIGN_IN_RESOURCE_TIMEOUT_SECONDS) as deadline:
+                resp = await asyncio.to_thread(
+                    asyncio.run, get(self._turn_context, connection_name, user_id)
+                )
         except Exception as exc:  # noqa: BLE001 — token-service blip must not strand the turn (fail-safe)
+            # ONE handler, discriminating on `deadline.expired()`, rather than an
+            # `except TimeoutError` arm before this one. Both shapes must return None to keep
+            # the fail-safe contract, and a bare `socket.timeout` escaping msrest IS a
+            # `TimeoutError` (aliased since 3.10) -- a type-only arm would file that under the
+            # trip-wire below and corrupt the very signal T-134-a is promoted on. `expired()`
+            # is true only when OUR ceiling fired.
+            if isinstance(exc, TimeoutError) and deadline is not None and deadline.expired():
+                # RESIDUAL (accepted, T-134): `asyncio.to_thread` cannot be cancelled. Two
+                # shapes, depending on whether the work item had started:
+                #   * started (normal): the worker stays parked on the msrest socket until ITS
+                #     timeout fires, then exits. Only the TURN is freed here.
+                #   * still queued (default executor saturated): the item is cancelled and
+                #     never runs, so the eagerly-created `get(...)` coroutine is collected
+                #     un-awaited and Python emits a `RuntimeWarning: coroutine ... was never
+                #     awaited`. Harmless, but it is the saturation tell.
+                # Because the turn is freed, a user retrying during a token-service outage can
+                # have several threads parked at once, in the loop's DEFAULT executor -- which
+                # `TeamsAdapter.warm_connector_token` and `images._acquire_token` also use.
+                # Bounding that needs a dedicated executor and was judged not worth its
+                # cancellation semantics. This WARNING is the trip-wire that turns the residual
+                # into DATA: a burst of these lines is the signal to bound the pool (T-134-a).
+                logger.warning(
+                    "sign_in_resource_timeout connection=%s seconds=%s "
+                    "(worker thread orphaned, or queued call dropped, until msrest's own "
+                    "timeout fires)",
+                    connection_name,
+                    _SIGN_IN_RESOURCE_TIMEOUT_SECONDS,
+                )
+                return None
             # mask_telemetry (not exc_info=True): the underlying msrest/Graph HTTP error can
             # embed the token-service request URL, which may carry an Entra OID or tenant
             # GUID segment (T-021a telemetry-leak precedent — see identity.py, connectors/base.py).

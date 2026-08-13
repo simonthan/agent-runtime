@@ -301,9 +301,10 @@ class TeamsAdapter:
         downstream, so we strip-check too (SEC-5). We fail loudly to catch consumer
         HTTP routes that forget to forward the inbound ``Authorization`` header.
 
-        Pre-warms the outbound connector token on a worker thread first (T-119);
-        the warm never raises, so a token failure degrades to an inline mint rather
-        than failing the turn.
+        Pre-warms the outbound connector token on a worker thread (T-119) from INSIDE the
+        SDK callback, which runs only after JWT validation has accepted ``auth_header``
+        (T-134). The warm never raises, so a token failure degrades to an inline mint
+        rather than failing the turn.
         """
         if not auth_header or not auth_header.strip():
             msg = (
@@ -311,13 +312,24 @@ class TeamsAdapter:
                 "(including the 'Bearer ' prefix). An empty header would bypass JWT validation."
             )
             raise ValueError(msg)
-        # T-119 -- prime the MSAL cache on a worker thread BEFORE the SDK's outbound
-        # send calls `signed_session` on the event loop. Never raises.
-        await self.warm_connector_token()
         activity = Activity().deserialize(activity_body)
-        response = await self._adapter.process_activity(
-            activity, auth_header, self._handler.on_turn
-        )
+
+        async def _warm_then_turn(turn_context: TurnContext) -> Any:
+            # T-134 -- the warm lives INSIDE the callback, which the SDK invokes only after
+            # `JwtTokenValidation.authenticate_request` has accepted `auth_header`. It used
+            # to run before both the deserialize and that validation, gated on nothing but a
+            # non-empty header string -- so any POST carrying `Authorization: Bearer
+            # <garbage>` spent a worker thread and, on a cold or aging MSAL cache, a real
+            # round trip to login.microsoftonline.com, entirely unauthenticated.
+            # T-119's property is preserved: the SDK sends no activity before invoking this
+            # callback, so the token is still cached before msrest's on-loop `signed_session`
+            # call. Never raises. The callback's return value is passed straight through --
+            # the SDK reads the invoke response off turn_state, but returning it costs
+            # nothing and keeps this a pure interposition.
+            await self.warm_connector_token()
+            return await self._handler.on_turn(turn_context)
+
+        response = await self._adapter.process_activity(activity, auth_header, _warm_then_turn)
         if response is None:
             return (201, None)
         return (response.status, response.body)
