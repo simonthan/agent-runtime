@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from agent_runtime.image_sniff import sniff_image_mime
 from agent_runtime.transport.teams._msal import BoundedAppCredentials
 
 if TYPE_CHECKING:
@@ -56,31 +57,6 @@ _DOWNLOAD_TIMEOUT = httpx.Timeout(10.0, read=15.0)
 # more diagnostic ReadTimeout rather than an anonymous deadline expiry.
 # Read from the module global at call time so tests can patch it.
 _DOWNLOAD_DEADLINE_SECONDS = 30.0
-
-_MAGIC_SNIFFS: tuple[tuple[bytes, str], ...] = (
-    (b"\x89PNG\r\n\x1a\n", "image/png"),
-    (b"\xff\xd8\xff", "image/jpeg"),
-    (b"GIF87a", "image/gif"),
-    (b"GIF89a", "image/gif"),
-)
-
-
-def _sniff_image_mime(data: bytes) -> str | None:
-    """Return the image MIME type from magic bytes, or None if not a known image.
-
-    Teams' attachment CDN serves inline images as ``application/octet-stream``
-    (TBP T-084 Issue 4 — live receipt rejected), so the declared Content-Type
-    cannot be trusted to say "not an image". The four types here are exactly
-    Anthropic's supported image media types. WebP is RIFF-framed
-    (``RIFF<size>WEBP``), hence the offset check.
-    """
-    for magic, mime in _MAGIC_SNIFFS:
-        if data.startswith(magic):
-            return mime
-    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":  # noqa: PLR2004
-        return "image/webp"
-    return None
-
 
 class InlineImageDownloadError(Exception):
     """An inline image could not be downloaded or failed validation.
@@ -225,14 +201,14 @@ async def _stream_download(
         #     passed `LLMImage` unchallenged and 400'd at the Anthropic API mid-turn, with
         #     no local handler -- one mislabelled photo failed the whole turn.
         # There is deliberately NO fallback to a parameter-stripped declared type.
-        # `_MAGIC_SNIFFS` plus the WebP check cover EXACTLY Anthropic's four supported
+        # `sniff_image_mime` covers EXACTLY Anthropic's four supported
         # types, and each has a mandatory fixed-position signature, so `sniffed is None`
         # means no `LLMImage` could ever be built from these bytes -- falling back to an
         # "allowed" declared type there would rebuild the API-400 payload this check
         # exists to eliminate. Raising converts a mid-turn API failure into this module's
         # ordinary skip-one-image contract. Parameterised types need no stripping: the
         # sniffed value replaces the header string outright.
-        sniffed = _sniff_image_mime(data)
+        sniffed = sniff_image_mime(data)
         if sniffed is None:
             msg = (
                 "Inline image download returned a non-image payload "

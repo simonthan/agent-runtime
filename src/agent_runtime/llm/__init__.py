@@ -8,6 +8,9 @@ Public surface:
 - ``Message`` / ``History`` — conversation history types
 - ``LLMImage`` / ``ANTHROPIC_IMAGE_MEDIA_TYPES`` — base64 image content blocks for the
   first user message (T-067d vision passthrough)
+- ``sniff_image_mime`` — magic-byte image type detection; the ONLY authority on an image's
+  media type. Re-exported from ``agent_runtime.image_sniff`` (dependency-free) so consumers
+  needn't import a transport module to validate bytes before building an ``LLMImage``.
 - ``LLMError``, ``LLMRateLimitError``, ``LLMAPIError``, ``LLMResponseError`` — exception hierarchy
 - ``ToolUseBlock`` — one tool call the model requested (parsed from content blocks)
 - ``ToolUseLoop`` — generic fenced tool-use loop primitive
@@ -21,6 +24,7 @@ See ``agent_runtime.llm.client.AnthropicClient.complete`` docstring for the
 two-breakpoint cache contract (static system prefix + per-turn retrieval block).
 """
 
+from agent_runtime.image_sniff import sniff_image_mime
 from agent_runtime.llm.client import AnthropicClient
 from agent_runtime.llm.compaction import (
     CompactionConfig,
@@ -95,4 +99,5 @@ __all__ = [
     "build_anthropic_sdk_client",
     "current_tool_round",
     "estimate_tokens",
+    "sniff_image_mime",
 ]
