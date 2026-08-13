@@ -46,8 +46,14 @@ __all__ = [
 # Appended to a tool result that exceeded `max_result_chars`. EXPLICIT by design:
 # a knowledge bot handed a silently-clipped corpus will summarise a fragment as if it
 # were whole (a correctness bug, not just a cost bug). See TBP T-081.
+# Carries the `[platform]` provenance prefix (T-155), exactly like _IMAGES_DROPPED_MARKER:
+# nothing else distinguishes a first-party platform notice from tool-supplied data, so a
+# hostile server echoing this literal could otherwise fake a platform truncation. Forged
+# copies lose the prefix at the sanitizer boundary (safety/prompt_sanitizer.py
+# _PLATFORM_PROVENANCE_PATTERN, alternated into BOTH _SENTINEL_RE and _NEUTRALIZE_RE);
+# genuine ones are appended AFTER the consumer sanitizes and never pass through it.
 _TRUNCATION_MARKER = (
-    "\n\n[TRUNCATED BY agent-runtime: this tool result was {original} characters "
+    "\n\n[platform] [TRUNCATED BY agent-runtime: this tool result was {original} characters "
     "(~{est_tokens} tokens) and exceeded the {cap}-character limit; {removed} "
     "characters were removed from the end. This is a PARTIAL result — do not assume "
     "it is complete, and do not treat the omitted content as unimportant.]"

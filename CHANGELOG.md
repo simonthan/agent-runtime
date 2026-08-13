@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- `_TRUNCATION_MARKER` (`llm/tool_loop.py`) now carries the `[platform]` provenance prefix,
+  matching `_IMAGES_DROPPED_MARKER`. Without it the marker was forgeable: a hostile MCP
+  server could emit the literal text and fake a platform truncation notice, since nothing
+  else distinguishes a first-party notice from tool-supplied data. Forged copies now lose
+  the prefix at the sanitizer boundary (`_PLATFORM_PROVENANCE_PATTERN` is already alternated
+  into both `_SENTINEL_RE` and `_NEUTRALIZE_RE`); genuine notices are appended *after* the
+  consumer sanitizes and are unaffected. **Consumer-visible string change** — the emitted
+  text gains an `11`-character prefix; substring assertions on `TRUNCATED BY agent-runtime`
+  are unaffected. No API change. (T-155)
+
 ## v0.22.0 — 2026-08-13
 
 ### Added
