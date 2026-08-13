@@ -53,6 +53,33 @@ _TRUNCATION_MARKER = (
     "it is complete, and do not treat the omitted content as unimportant.]"
 )
 
+# Appended to a tool result whose images were dropped by the per-turn image budget.
+# EXPLICIT by design, exactly like _TRUNCATION_MARKER: a model told nothing will answer
+# about pages it was never shown. See TBP T-135.
+_IMAGES_DROPPED_MARKER = (
+    "[platform] [IMAGES WITHHELD BY agent-runtime: this tool result carried {original} "
+    "image(s); {dropped} of them were NOT delivered to you ({reasons}). You CANNOT see "
+    "the withheld image(s) — do not describe, summarise, or cite their contents, and do "
+    "not assume they were unimportant. Disregard any earlier statement in this result "
+    "claiming those images are attached — this notice supersedes it. Say so plainly if "
+    "answering requires them.]"
+)
+
+
+def _decoded_b64_len(data_b64: str) -> int:
+    """Decoded byte length of standard base64, computed WITHOUT decoding.
+
+    `base64.b64decode` on a multi-megabyte image allocates the whole payload just to
+    call `len()` on it — once per image, per round. This is O(1) and allocation-free,
+    preserving the "exact, zero-cost, deterministic" measurement property the sibling
+    char cap relies on (T-081a §2). Exact for both padded and unpadded standard base64.
+    """
+    n = len(data_b64)
+    if n == 0:
+        return 0
+    pad = 2 if data_b64.endswith("==") else (1 if data_b64.endswith("=") else 0)
+    return (n * 3) // 4 - pad
+
 
 @dataclass(frozen=True, slots=True)
 class ToolResult:
@@ -210,6 +237,8 @@ class ToolUseLoop:
         max_tokens: int | None = None,
         temperature: float | None = None,
         max_result_chars: int | None = None,
+        max_turn_images: int | None = None,
+        max_turn_image_bytes: int | None = None,
     ) -> ToolLoopResult:
         """Run the fenced loop. `max_rounds` caps model turns that return
         stop_reason=='tool_use'. Returns once the model stops requesting tools, the
@@ -240,7 +269,16 @@ class ToolUseLoop:
         `max_result_chars` (T-081a) caps each EXECUTOR-produced tool result to that
         many characters, appending an explicit truncation marker on overflow. Default
         `None` = no cap = byte-for-byte unchanged (regression guarantee). The loop owns
-        no default; the consumer supplies the ceiling, exactly as it supplies max_rounds."""
+        no default; the consumer supplies the ceiling, exactly as it supplies max_rounds.
+
+        `max_turn_images` / `max_turn_image_bytes` (T-135) bound tool-result images for
+        the WHOLE turn (not per result): `messages` is re-sent every round and the
+        Anthropic API rejects a request carrying more than 100 images, so a per-result
+        cap cannot bound a render-heavy turn. Over-budget images are DROPPED (never
+        downscaled) and an explicit marker tells the model what it cannot see. Bytes are
+        measured DECODED. `0` is meaningful: it drops every image. Default `None` on both
+        = no budget = byte-for-byte unchanged (regression guarantee). The loop owns no
+        default; the consumer supplies the ceilings, exactly as with max_result_chars."""
         system_blocks = self._build_system_blocks(static_system_prefix, dynamic_system_suffix)
         first_user: list[dict[str, Any]] = []
         if retrieval_block:
@@ -271,6 +309,9 @@ class ToolUseLoop:
             max_tokens=max_tokens,
             temperature=temperature,
             max_result_chars=max_result_chars,
+            images_used={"count": 0, "bytes": 0},
+            max_turn_images=max_turn_images,
+            max_turn_image_bytes=max_turn_image_bytes,
         )
 
     async def resume(
@@ -288,6 +329,8 @@ class ToolUseLoop:
         max_tokens: int | None = None,
         temperature: float | None = None,
         max_result_chars: int | None = None,
+        max_turn_images: int | None = None,
+        max_turn_image_bytes: int | None = None,
     ) -> ToolLoopResult:
         """Resume a loop suspended by a confirm-required tool. `state` is the opaque
         dict from `PendingConfirmation.state` (may have been JSON round-tripped through
@@ -307,13 +350,23 @@ class ToolUseLoop:
 
         IDEMPOTENCY: resume CONSUMES `state` (it appends to the live `messages` list).
         Re-resuming the same `state` object is undefined — persist a fresh copy per
-        attempt if you need to retry."""
+        attempt if you need to retry.
+
+        `max_turn_images` / `max_turn_image_bytes` mirror `run()` (T-135) and must be
+        re-supplied on every call. The consumed budget itself DOES ride `state` — it is a
+        bound, not a bill."""
         # cache_history: no param — the run()-time history marker rides state["messages"].
         system_blocks = self._build_system_blocks(static_system_prefix, dynamic_system_suffix)
         messages: list[dict[str, Any]] = state["messages"]
         steps: list[ToolLoopStep] = [self._step_from_dict(s) for s in state["steps"]]
         agg: dict[str, int] = {"in": 0, "out": 0, "cc": 0, "cr": 0}  # D6: continuation-only
         rounds: int = state["rounds"]
+        # T-135 — the per-turn image budget SURVIVES the suspend/resume boundary. Unlike
+        # `agg` (reset above: D6 continuation-only BILLING), this is a resource BOUND —
+        # resetting it would let every resume re-spend the whole allowance. `.get` is
+        # load-bearing for DEPLOY SAFETY: a card suspended before this release has no
+        # such key and resumes with a fresh budget. state["v"] stays 1.
+        images_used: dict[str, int] = dict(state.get("images_used", {"count": 0, "bytes": 0}))
         rnd = state["round"]
         tool_uses: list[dict[str, Any]] = rnd["tool_uses"]
         pending_index: int = rnd["pending_index"]
@@ -331,7 +384,12 @@ class ToolUseLoop:
             with bind_tool_round(round_ctx):
                 outcome = await executor(pending["name"], tool_input)
             outcome = self._cap_result(
-                tool_name=pending["name"], outcome=outcome, max_result_chars=max_result_chars
+                tool_name=pending["name"],
+                outcome=outcome,
+                max_result_chars=max_result_chars,
+                images_used=images_used,
+                max_turn_images=max_turn_images,
+                max_turn_image_bytes=max_turn_image_bytes,
             )
             call_input, call_result, call_is_error = tool_input, outcome.content, outcome.is_error
             call_images = outcome.images
@@ -361,6 +419,9 @@ class ToolUseLoop:
             executor=executor,
             confirm=confirm,
             max_result_chars=max_result_chars,
+            images_used=images_used,
+            max_turn_images=max_turn_images,
+            max_turn_image_bytes=max_turn_image_bytes,
             round_ctx=round_ctx,
         )
         if isinstance(round_outcome, _RoundSuspended):
@@ -372,6 +433,7 @@ class ToolUseLoop:
                 steps=steps,
                 agg=agg,
                 rounds=rounds,
+                images_used=images_used,
             )
         self._commit_round(
             messages=messages,
@@ -394,6 +456,9 @@ class ToolUseLoop:
             max_tokens=max_tokens,
             temperature=temperature,
             max_result_chars=max_result_chars,
+            images_used=images_used,
+            max_turn_images=max_turn_images,
+            max_turn_image_bytes=max_turn_image_bytes,
         )
 
     async def _drive(
@@ -412,6 +477,9 @@ class ToolUseLoop:
         max_tokens: int | None,
         temperature: float | None,
         max_result_chars: int | None,
+        images_used: dict[str, int],
+        max_turn_images: int | None,
+        max_turn_image_bytes: int | None,
     ) -> ToolLoopResult:
         """Shared round engine. `while rounds < max_rounds` (correct at the
         max_rounds=0 boundary — zero tool rounds, straight to the forced answer)."""
@@ -438,6 +506,9 @@ class ToolUseLoop:
                 executor=executor,
                 confirm=confirm,
                 max_result_chars=max_result_chars,
+                images_used=images_used,
+                max_turn_images=max_turn_images,
+                max_turn_image_bytes=max_turn_image_bytes,
                 # T-115j — the executor's only view of the round budget. `rounds` was
                 # incremented for THIS round on the line above, so it is the 1-based index.
                 round_ctx=ToolRoundContext(round_index=rounds, max_rounds=max_rounds),
@@ -451,6 +522,7 @@ class ToolUseLoop:
                     steps=steps,
                     agg=agg,
                     rounds=rounds,
+                    images_used=images_used,
                 )
             self._commit_round(
                 messages=messages,
@@ -485,6 +557,9 @@ class ToolUseLoop:
         executor: ToolExecutor,
         confirm: ConfirmPredicate | None,
         max_result_chars: int | None,
+        images_used: dict[str, int],
+        max_turn_images: int | None,
+        max_turn_image_bytes: int | None,
         round_ctx: ToolRoundContext,
     ) -> _RoundOutcome:
         """Iterate tool_use blocks from `start_index`, executing non-confirm tools
@@ -504,7 +579,12 @@ class ToolUseLoop:
                     return _RoundSuspended(pending_index=i, calls=calls)
                 outcome = await executor(tu["name"], tu["input"])
                 outcome = self._cap_result(
-                    tool_name=tu["name"], outcome=outcome, max_result_chars=max_result_chars
+                    tool_name=tu["name"],
+                    outcome=outcome,
+                    max_result_chars=max_result_chars,
+                    images_used=images_used,
+                    max_turn_images=max_turn_images,
+                    max_turn_image_bytes=max_turn_image_bytes,
                 )
                 calls.append(
                     ToolCall(
@@ -518,8 +598,80 @@ class ToolUseLoop:
                 )
             return _RoundCompleted(calls=calls)
 
+    def _cap_images(
+        self,
+        *,
+        tool_name: str,
+        images: tuple[LLMImage, ...],
+        used: dict[str, int],
+        max_turn_images: int | None,
+        max_turn_image_bytes: int | None,
+    ) -> tuple[tuple[LLMImage, ...], str | None]:
+        """Admit images against the TURN's remaining budget; return (kept, marker|None).
+
+        Both ceilings are PER-TURN TOTALS, not per result (T-135 D2): `messages` is
+        re-sent every round and the Anthropic API rejects a request carrying more than
+        100 images, so a per-result cap cannot bound a render-heavy turn. `used` is the
+        running counter, MUTATED here and carried across rounds AND across a
+        suspend/resume boundary.
+
+        Admission is a single forward pass in `images` order (deterministic — keeps the
+        multi-round prefix byte-stable, T-135 D5). `0` is a meaningful ceiling meaning
+        "no images at all", so every guard is `is None`, never truthiness (D9).
+        """
+        if max_turn_images is None and max_turn_image_bytes is None:
+            return images, None  # regression guarantee: unset = untouched
+        if not images:
+            return images, None
+
+        kept: list[LLMImage] = []
+        by_count = 0
+        by_bytes = 0
+        for img in images:
+            if max_turn_images is not None and used["count"] >= max_turn_images:
+                by_count += 1
+                continue
+            size = _decoded_b64_len(img.data_b64)
+            if max_turn_image_bytes is not None and used["bytes"] + size > max_turn_image_bytes:
+                by_bytes += 1
+                continue
+            kept.append(img)
+            used["count"] += 1
+            used["bytes"] += size
+
+        dropped = by_count + by_bytes
+        if dropped == 0:
+            return images, None
+
+        reasons: list[str] = []
+        if by_count:
+            reasons.append(f"{by_count} exceeded the {max_turn_images}-image per-turn budget")
+        if by_bytes:
+            reasons.append(f"{by_bytes} exceeded the {max_turn_image_bytes}-byte per-turn budget")
+        self._audit.warning(
+            "tool_loop_result_images_dropped",
+            tool_name=tool_name,
+            original_images=len(images),
+            dropped_images=dropped,
+            dropped_by_count=by_count,
+            dropped_by_bytes=by_bytes,
+            max_turn_images=max_turn_images,
+            max_turn_image_bytes=max_turn_image_bytes,
+        )
+        marker = _IMAGES_DROPPED_MARKER.format(
+            original=len(images), dropped=dropped, reasons="; ".join(reasons)
+        )
+        return tuple(kept), marker
+
     def _cap_result(
-        self, *, tool_name: str, outcome: ToolResult, max_result_chars: int | None
+        self,
+        *,
+        tool_name: str,
+        outcome: ToolResult,
+        max_result_chars: int | None,
+        images_used: dict[str, int],
+        max_turn_images: int | None,
+        max_turn_image_bytes: int | None,
     ) -> ToolResult:
         """Bound an executor's tool result before it enters the conversation.
 
@@ -534,27 +686,44 @@ class ToolUseLoop:
         Only `content` is measured and clipped — `images` pass through untouched. The cap
         bounds prose; counting base64 against it would let one rendered page evict the
         tool's actual text answer. Image budgeting is the consumer's policy (T-118a D4)."""
-        if max_result_chars is None:
-            return outcome
-        original = len(outcome.content)
-        if original <= max_result_chars:
-            return outcome
-        removed = original - max_result_chars
-        kept = outcome.content[:max_result_chars]
-        marker = _TRUNCATION_MARKER.format(
-            original=original,
-            est_tokens=estimate_tokens(outcome.content),
-            cap=max_result_chars,
-            removed=removed,
-        )
-        self._audit.warning(
-            "tool_loop_result_truncated",
+        # Text cap first (unchanged); then the image budget appends its own marker.
+        # Independent by design (T-135 D7) — final length may exceed max_result_chars by
+        # the marker lengths, already true of _TRUNCATION_MARKER alone.
+        content = outcome.content
+        if max_result_chars is not None and len(content) > max_result_chars:
+            original = len(content)
+            removed = original - max_result_chars
+            marker = _TRUNCATION_MARKER.format(
+                original=original,
+                est_tokens=estimate_tokens(content),
+                cap=max_result_chars,
+                removed=removed,
+            )
+            self._audit.warning(
+                "tool_loop_result_truncated",
+                tool_name=tool_name,
+                original_chars=original,
+                cap_chars=max_result_chars,
+                removed_chars=removed,
+            )
+            content = content[:max_result_chars] + marker
+
+        kept_images, img_marker = self._cap_images(
             tool_name=tool_name,
-            original_chars=original,
-            cap_chars=max_result_chars,
-            removed_chars=removed,
+            images=outcome.images,
+            used=images_used,
+            max_turn_images=max_turn_images,
+            max_turn_image_bytes=max_turn_image_bytes,
         )
-        return ToolResult(content=kept + marker, is_error=outcome.is_error, images=outcome.images)
+        if img_marker is not None:
+            # Non-empty content is an INVARIANT when images were dropped: with no images
+            # left, _tool_result_content returns the bare string, and an empty parts list
+            # would be rejected by the API (T-135 D4).
+            content = f"{content}\n\n{img_marker}" if content else img_marker
+
+        if content is outcome.content and kept_images is outcome.images:
+            return outcome  # nothing changed — byte-for-byte identity
+        return ToolResult(content=content, is_error=outcome.is_error, images=kept_images)
 
     @staticmethod
     def _commit_round(
@@ -599,6 +768,7 @@ class ToolUseLoop:
         steps: list[ToolLoopStep],
         agg: dict[str, int],
         rounds: int,
+        images_used: dict[str, int],
     ) -> ToolLoopResult:
         """Build the suspended ToolLoopResult. `state` is JSON-serializable: messages
         (already plain dicts), steps + the in-flight round's calls serialized to dicts,
@@ -611,6 +781,9 @@ class ToolUseLoop:
             "steps": [self._step_to_dict(s) for s in steps],
             "agg": dict(agg),
             "rounds": rounds,
+            # T-135 — per-turn image budget consumed so far. Read back with .get() so
+            # pre-release suspended states still load. state["v"] intentionally stays 1.
+            "images_used": dict(images_used),
             "round": {
                 "assistant_text": assistant_text,
                 "tool_uses": tool_uses,
