@@ -87,11 +87,12 @@ class InlineImageDownloadError(Exception):
 
     Raised for every failure mode: a non-allowlisted host, connector-token
     acquisition failure, a non-200 HTTP response, an oversize body, a
-    non-image response Content-Type, a transport error, or the wall-clock
-    download deadline (T-115l). No partial bytes are ever returned to the
-    caller. The consumer decides retry/UX from the message -- catching this
-    one type is sufficient to degrade gracefully, which is why the httpx
-    exceptions are converted rather than allowed to escape.
+    payload whose bytes match no supported image signature, a transport
+    error, or the wall-clock download deadline (T-115l). No partial bytes
+    are ever returned to the caller. The consumer decides retry/UX from the
+    message -- catching this one type is sufficient to degrade gracefully,
+    which is why the httpx exceptions are converted rather than allowed to
+    escape.
     ``asyncio.CancelledError`` is NOT converted and propagates untouched.
     """
 
@@ -115,7 +116,7 @@ class DownloadedImage:
     """The downloaded bytes and the response-declared mime type."""
 
     data: bytes
-    mime: str  # from the response Content-Type, e.g. "image/jpeg"
+    mime: str  # magic-byte-sniffed; always one of ANTHROPIC_IMAGE_MEDIA_TYPES (T-134)
 
 
 def _host_is_allowed(url: str, allowed_hosts: frozenset[str]) -> bool:
@@ -194,7 +195,7 @@ async def _stream_download(
     headers: dict[str, str],
     max_bytes: int,
 ) -> DownloadedImage:
-    """Stream the GET response, enforcing the size cap and image Content-Type."""
+    """Stream the GET response, enforcing the size cap and magic-byte image validation."""
     # follow_redirects pinned False even if an injected client enables it: a
     # redirect must never carry the fetch off the allowlisted host.
     async with client.stream("GET", url, headers=headers, follow_redirects=False) as response:
@@ -203,7 +204,6 @@ async def _stream_download(
             msg = f"Inline image download failed with HTTP status {status}"
             raise InlineImageDownloadError(msg)
         content_type = response.headers.get("content-type", "")
-        declared_image = content_type.startswith("image/")
         chunks: list[bytes] = []
         total = 0
         async for chunk in response.aiter_bytes():
@@ -213,15 +213,31 @@ async def _stream_download(
                 raise InlineImageDownloadError(msg)
             chunks.append(chunk)
         data = b"".join(chunks)
-        if declared_image:
-            return DownloadedImage(data=data, mime=content_type)
-        # T-084b: a non-image Content-Type no longer rejects up front — Teams'
-        # CDN serves real images as application/octet-stream. The magic bytes
-        # decide; the max_bytes cap above still bounds the speculative read,
-        # and a genuinely non-image payload still raises the same error.
+        # T-134 -- the magic bytes are the ONLY authority for `mime`; the declared
+        # Content-Type is now diagnostic only. Trusting the header failed in both
+        # directions:
+        #   * a declared type Anthropic does not accept -- `image/heic` (iPhone), or a
+        #     perfectly valid `image/jpeg; charset=utf-8` whose PARAMETERS made the string
+        #     unequal to `"image/jpeg"` -- reached `LLMImage.__post_init__`
+        #     (llm/models.py:44-49) and raised `ValueError`, so the consumer dropped an
+        #     image it could have shown the model.
+        #   * the inverse, and worse: a declared `image/png` over HEIC or other bytes
+        #     passed `LLMImage` unchallenged and 400'd at the Anthropic API mid-turn, with
+        #     no local handler -- one mislabelled photo failed the whole turn.
+        # There is deliberately NO fallback to a parameter-stripped declared type.
+        # `_MAGIC_SNIFFS` plus the WebP check cover EXACTLY Anthropic's four supported
+        # types, and each has a mandatory fixed-position signature, so `sniffed is None`
+        # means no `LLMImage` could ever be built from these bytes -- falling back to an
+        # "allowed" declared type there would rebuild the API-400 payload this check
+        # exists to eliminate. Raising converts a mid-turn API failure into this module's
+        # ordinary skip-one-image contract. Parameterised types need no stripping: the
+        # sniffed value replaces the header string outright.
         sniffed = _sniff_image_mime(data)
         if sniffed is None:
-            msg = f"Inline image download returned a non-image Content-Type: {content_type!r}"
+            msg = (
+                "Inline image download returned a non-image payload "
+                f"(declared Content-Type: {content_type!r})"
+            )
             raise InlineImageDownloadError(msg)
         return DownloadedImage(data=data, mime=sniffed)
 
@@ -241,13 +257,13 @@ async def download_inline_image(
     module default — a consumer may widen it from the session's own
     ``ConversationRef.service_url`` host); this check runs before any token
     acquisition or HTTP call. The response is streamed with a hard
-    ``max_bytes`` cap. A declared ``Content-Type`` starting with ``"image/"``
-    is trusted as-is (byte-identical path). Any other declared type (Teams'
-    CDN serves real images as ``application/octet-stream`` — T-084b) is still
-    streamed under the same ``max_bytes`` cap, then sniffed by magic bytes
-    (PNG/JPEG/GIF/WebP); ``DownloadedImage.mime`` carries the sniffed type in
-    that case. Oversize responses, or non-image responses whose bytes don't
-    match a known image signature, raise with the partial bytes discarded.
+    ``max_bytes`` cap. The response ``Content-Type`` is diagnostic only: the
+    magic bytes decide ``DownloadedImage.mime``, which is therefore always one
+    of Anthropic's four supported types (T-134). Teams' CDN serves real images
+    as ``application/octet-stream`` (T-084b) and mislabels others outright, so
+    neither a declared type nor its absence is trusted. Oversize responses, and
+    responses whose bytes match no known image signature, raise with the partial
+    bytes discarded.
 
     ``client`` is an injectable ``httpx.AsyncClient`` for tests / connection
     pool reuse; when omitted, a client is created and closed for this call,
