@@ -1,6 +1,21 @@
 # Changelog
 
-## Unreleased
+## v0.23.0 — 2026-08-13
+
+### Added
+- `sniff_image_mime(data: bytes) -> str | None` — public magic-byte image type detection,
+  re-exported from `agent_runtime.llm` alongside `ANTHROPIC_IMAGE_MEDIA_TYPES`. A non-`None`
+  return is always a member of that frozenset, so an `LLMImage` built from a sniffed type
+  cannot raise. This is the promotion of the previously-private
+  `transport.teams.images._sniff_image_mime` (T-134) into a shared surface: the identical
+  trust-the-bytes-not-the-declaration bug exists on every path that builds an `LLMImage`
+  from a media type someone else supplied, and a consumer must not have to import a Teams
+  transport module to defend against it. The implementation lives in the dependency-free
+  leaf module `agent_runtime.image_sniff` rather than under `agent_runtime.llm`, because
+  importing any `agent_runtime.llm` submodule pulls the `anthropic` SDK (`[llm]` extra) and
+  `transport.teams` — a `[teams]`-only install — is itself a caller. **New public API, hence
+  the minor bump.** No behaviour change for existing callers: `transport.teams.images` now
+  imports the shared function and its T-134 regression tests are unchanged. (T-134-c)
 
 ### Changed
 - `_TRUNCATION_MARKER` (`llm/tool_loop.py`) now carries the `[platform]` provenance prefix,
