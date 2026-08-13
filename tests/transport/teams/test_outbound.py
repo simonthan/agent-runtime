@@ -1,12 +1,15 @@
 """OutboundChannel impl tests — assert correct Activity wire format."""
 
 import asyncio
+import logging
 import threading
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from botbuilder.schema import ActivityTypes, ResourceResponse
 
+from agent_runtime.transport.teams import outbound
 from agent_runtime.transport.teams.outbound import BotFrameworkOutboundChannel
 
 
@@ -203,3 +206,29 @@ async def test_get_sign_in_resource_does_not_block_the_event_loop(turn_context):
 
     assert out is not None
     assert observed["concurrent_ran_first"] is True
+
+
+async def test_get_sign_in_resource_times_out_instead_of_hanging(turn_context, monkeypatch, caplog):
+    """T-134: msrest's only bound on this round trip is a per-phase `timeout=100`, and
+    `to_thread` is uncancellable, so a stalled token service hung EVERY SSO-prompting turn
+    past the ~15s Connector redelivery window. The ceiling must return None (no OAuth card)
+    rather than wait, and must log the orphan trip-wire."""
+    monkeypatch.setattr(outbound, "_SIGN_IN_RESOURCE_TIMEOUT_SECONDS", 0.05)
+    turn_context.activity.from_property.id = "29:user-abc"
+
+    async def _stalled(*_args, **_kwargs):
+        # Bounded so the orphaned worker cannot slow the session's interpreter shutdown,
+        # which joins default-executor threads.
+        await asyncio.sleep(1.0)
+
+    turn_context.adapter.get_sign_in_resource_from_user = _stalled
+    channel = BotFrameworkOutboundChannel(turn_context)
+
+    caplog.set_level(logging.WARNING)
+    started = time.monotonic()
+    out = await channel.get_sign_in_resource(connection_name="tbp-sso-conn")
+    elapsed = time.monotonic() - started
+
+    assert out is None
+    assert elapsed < 0.5
+    assert any("sign_in_resource_timeout" in r.getMessage() for r in caplog.records)

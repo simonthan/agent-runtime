@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from agent_runtime.transport.teams import identity
 from agent_runtime.transport.teams.identity import _extract_tenant_id, resolve_identity
 
 
@@ -188,3 +189,83 @@ async def test_get_member_double_failure_falls_back_and_drops(mock_get_member, c
     assert ref is None
     assert mock_get_member.await_count == 2
     assert any("Dropping inbound activity" in r.message for r in caplog.records)
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_delay(monkeypatch):
+    """T-134: null the retry pause so the suite stays fast. The pause itself is asserted in
+    `test_transient_retry_pauses_before_the_second_call`, which sets it back."""
+    monkeypatch.setattr(identity, "_RETRY_BASE_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(identity, "_RETRY_JITTER_SECONDS", 0.0)
+
+
+def _graph_error(status, *, aiohttp_shaped=False):
+    """Stand-in for botbuilder's ErrorResponseException: msrest's HttpOperationError stores
+    the underlying response on `.response` (msrest/exceptions.py:150-158), which is
+    requests-shaped (.status_code) or aiohttp-shaped (.status) depending on the sender."""
+    exc = RuntimeError(f"graph error {status}")
+    exc.response = (
+        SimpleNamespace(status=status) if aiohttp_shaped else SimpleNamespace(status_code=status)
+    )
+    return exc
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_graph_throttle_is_not_retried(mock_get_member):
+    """T-134: a 429 means the tenant is AT the ~10k/10min cap the module header warns about.
+    The old instant retry spent the last of that budget and doubled the offending rate."""
+    mock_get_member.side_effect = _graph_error(429)
+    assert await resolve_identity(_turn_context()) is None  # fail closed, as before
+    assert mock_get_member.await_count == 1
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_permanent_graph_error_is_not_retried(mock_get_member):
+    """T-134: 403 is missing admin consent — deterministic. The second call never helped."""
+    mock_get_member.side_effect = _graph_error(403)
+    assert await resolve_identity(_turn_context()) is None
+    assert mock_get_member.await_count == 1
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_server_error_still_gets_its_one_retry(mock_get_member):
+    """T-134 must not regress T-084b: a 5xx is transient and keeps the single retry."""
+    mock_get_member.side_effect = [
+        _graph_error(503),
+        SimpleNamespace(aad_object_id="aad-1", email="u@example.com", name="User One"),
+    ]
+    ref = await resolve_identity(_turn_context())
+    assert ref is not None
+    assert ref.user_email == "u@example.com"
+    assert mock_get_member.await_count == 2
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_aiohttp_shaped_status_is_also_honoured(mock_get_member):
+    """T-134: msrest picks the sender, so `.response` may expose `.status` rather than
+    `.status_code`. Probing only one shape would silently retry every throttle."""
+    mock_get_member.side_effect = _graph_error(429, aiohttp_shaped=True)
+    assert await resolve_identity(_turn_context()) is None
+    assert mock_get_member.await_count == 1
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_transient_retry_pauses_before_the_second_call(mock_get_member, monkeypatch):
+    """T-134: the retry must not be instant. Patches `asyncio.sleep` on the identity module's
+    reference rather than sleeping for real."""
+    monkeypatch.setattr(identity, "_RETRY_BASE_DELAY_SECONDS", 0.25)
+    monkeypatch.setattr(identity, "_RETRY_JITTER_SECONDS", 0.25)
+    slept: list[float] = []
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(identity.asyncio, "sleep", _fake_sleep)
+    mock_get_member.side_effect = [
+        RuntimeError("connection reset"),  # no .response -> status None -> retryable
+        SimpleNamespace(aad_object_id="aad-1", email="u@example.com", name="User One"),
+    ]
+    ref = await resolve_identity(_turn_context())
+    assert ref is not None
+    assert len(slept) == 1
+    assert 0.25 <= slept[0] <= 0.5
