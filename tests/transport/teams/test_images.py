@@ -209,12 +209,15 @@ async def test_octet_stream_non_image_still_rejected():
 
     att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
     client = _client_with_handler(_octet_handler)
-    with pytest.raises(InlineImageDownloadError, match="non-image Content-Type"):
+    with pytest.raises(InlineImageDownloadError, match="non-image payload"):
         await download_inline_image(att, _CREDENTIALS, client=client)
 
 
-async def test_declared_image_content_type_unchanged():
-    """A declared image/* type is trusted as-is — no sniff, byte-identical path."""
+async def test_declared_image_type_over_unsniffable_bytes_is_rejected():
+    """T-134 (replaces `test_declared_image_content_type_unchanged`, which asserted the
+    bug): a declared `image/png` over HEIC or other bytes used to sail through as a valid
+    `LLMImage` and 400 at the Anthropic API mid-turn, failing the whole turn. It must fail
+    HERE, as an ordinary skip-one-image download error."""
     arbitrary_bytes = b"not-actually-a-jpeg-but-declared-as-one"
 
     def _declared_handler(_request: httpx.Request) -> httpx.Response:
@@ -222,9 +225,54 @@ async def test_declared_image_content_type_unchanged():
 
     att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
     client = _client_with_handler(_declared_handler)
+    with pytest.raises(InlineImageDownloadError, match="non-image payload"):
+        await download_inline_image(att, _CREDENTIALS, client=client)
+
+
+async def test_content_type_parameters_do_not_lose_a_valid_image():
+    """T-134: `image/jpeg; charset=utf-8` is a legal header. Returned verbatim it did not
+    equal `"image/jpeg"`, so `LLMImage.__post_init__` raised and the consumer dropped a
+    perfectly good photo. The sniffed type replaces the header outright."""
+
+    def _param_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=_JPEG_BYTES, headers={"content-type": "image/jpeg; charset=utf-8"}
+        )
+
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    client = _client_with_handler(_param_handler)
     result = await download_inline_image(att, _CREDENTIALS, client=client)
-    assert result.data == arbitrary_bytes
     assert result.mime == "image/jpeg"
+    assert result.data == _JPEG_BYTES
+
+
+async def test_mislabelled_image_gets_the_sniffed_type_not_the_declared_one():
+    """T-134: Teams mislabels. Declared `image/png` over real JPEG bytes previously became
+    an `LLMImage(media_type="image/png")` carrying JPEG data — an API 400. The bytes win,
+    and the image survives."""
+
+    def _mislabel_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_JPEG_BYTES, headers={"content-type": "image/png"})
+
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    client = _client_with_handler(_mislabel_handler)
+    result = await download_inline_image(att, _CREDENTIALS, client=client)
+    assert result.mime == "image/jpeg"
+
+
+async def test_heic_is_rejected_at_the_transport_not_at_the_llm():
+    """T-134: iPhone HEIC is genuinely unsupported by Anthropic, so skipping is correct —
+    but it must surface as an image-download failure the consumer already handles, not as a
+    media-type ValueError three layers later."""
+    heic_bytes = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00heicmif1"
+
+    def _heic_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=heic_bytes, headers={"content-type": "image/heic"})
+
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    client = _client_with_handler(_heic_handler)
+    with pytest.raises(InlineImageDownloadError, match="non-image payload"):
+        await download_inline_image(att, _CREDENTIALS, client=client)
 
 
 async def test_octet_stream_still_respects_size_cap():
