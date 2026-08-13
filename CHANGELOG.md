@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.21.6 — 2026-08-13
+
+### Changed
+- **`DownloadedImage.mime` is now always magic-byte-sniffed (T-134).** `download_inline_image`
+  previously returned a declared `image/*` Content-Type verbatim and sniffed only when the
+  header said something else. The header is now diagnostic only. **Contract change:** a
+  response declaring `image/*` whose bytes match no supported signature now raises
+  `InlineImageDownloadError` where it previously returned a `DownloadedImage`. Consumers
+  already catching that exception need no change.
+
+### Fixed
+- **The sign-in-resource fetch is bounded (T-134).** `BotFrameworkOutboundChannel.
+  get_sign_in_resource` drove a synchronous msrest round trip through `asyncio.to_thread`
+  with no ceiling of its own; msrest's only default is a per-phase `timeout=100`, so a
+  stalled token service hung every SSO-prompting turn for ~100-200s — long past the ~15s
+  after which the Bot Framework Connector re-delivers the activity, turning a stall into
+  duplicate turns. A 10s `asyncio.timeout` now frees the turn and returns `None` (no OAuth
+  card), the same fail-safe every other failure on this path takes. Residual, logged as
+  `sign_in_resource_timeout`: `to_thread` is uncancellable, so the worker thread stays
+  parked until msrest's own timeout fires.
+- **Mislabelled Teams inline images no longer fail the turn (T-134).** A declared
+  `image/png` over HEIC or other bytes produced a valid-looking `LLMImage` that 400'd at the
+  Anthropic API mid-turn; conversely `image/jpeg; charset=utf-8` (parameters) and
+  `image/heic` (iPhone) raised `ValueError` on bytes the model could have seen. The magic
+  bytes are now the sole authority, so parameterised and mislabelled-but-valid images are
+  recovered and genuinely unsupported ones are rejected as an ordinary download failure.
+  **Scope:** this covers the `transport.teams.images` download path only. Images arriving as
+  MCP tool-result blocks are still constructed from the server-declared `mimeType` and are
+  not sniffed — see T-134-c.
+- **The connector-token pre-warm runs only on authenticated requests (T-134).**
+  `TeamsAdapter.process_activity` warmed before `Activity().deserialize` and before the
+  SDK's JWT validation, gated on nothing but a non-empty `Authorization` header — so any
+  forged-token POST to the consumer's webhook dispatched a worker-thread AAD token
+  operation. The warm moved inside the SDK callback, which runs only after
+  `authenticate_request` succeeds. T-119's cache-priming property is unchanged: the SDK
+  sends no activity before invoking the callback.
+- **The Graph identity retry discriminates on status (T-134).** `_get_member_with_retry`
+  retried instantly on every exception, so a 429 fired a second call exactly when the
+  tenant had hit Graph's ~10k req / 10 min cap on `/teams/{id}/members/{userId}`, and
+  permanent 403s were retried pointlessly. 4xx now re-raises immediately (same fallback and
+  drop behaviour, one call instead of two); 5xx and status-less transport errors keep their
+  single retry, now after a ~0.25-0.5s jittered pause.
+
 ## v0.21.5 — 2026-08-12
 
 ### Fixed
