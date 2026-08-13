@@ -1,7 +1,7 @@
 """TeamsAdapter — construction + invoke return value + on_turn_error wiring."""
 
 import threading
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from botframework.connector.auth import AuthenticationConstants, MicrosoftAppCredentials
@@ -82,28 +82,57 @@ def test_adapter_supplies_bounded_credentials_to_the_sdk():
     assert creds.microsoft_app_id == "a"
 
 
-async def test_process_activity_warms_the_connector_token_before_dispatch():
+async def test_process_activity_warms_the_connector_token_inside_the_callback():
     """T-119: msrest calls `signed_session` synchronously inside its async pipeline
-    (`async_requests.py:99`), so the token must already be cached before the SDK runs."""
+    (`async_requests.py:99`), so the token must already be cached before the SDK sends.
+    T-134: the warm moved into the SDK callback -- which runs only after JWT validation --
+    so it must still land BEFORE the handler's turn, just not before authentication."""
     calls: list[str] = []
 
     def _record_warm(_self=None, *_args, **_kwargs):
         calls.append("warm")
         return "test-token"
 
-    async def _record_dispatch(*_args, **_kwargs):
-        # No `return None` -- ruff RET501/PLR1711 fire on it and are NOT in the
-        # `tests/**` per-file-ignore list. `process_activity` maps a None response
-        # to (201, None), which is what the assertion below checks.
+    async def _record_turn(_turn_context):
+        calls.append("turn")
+
+    async def _record_dispatch(_activity, _auth_header, callback):
+        # Stands in for the SDK: authenticate, THEN invoke the callback. No `return None`
+        # -- ruff RET501/PLR1711 fire on it and are NOT in the `tests/**` ignore list.
         calls.append("dispatch")
+        await callback(MagicMock())
 
     adapter = TeamsAdapter(TeamsAdapterConfig("a", "p", "t"), _NoOpHandler())
     adapter._adapter.process_activity = _record_dispatch
+    adapter._handler.on_turn = _record_turn
     with patch.object(MicrosoftAppCredentials, "get_access_token", _record_warm):
         result = await adapter.process_activity({"type": "message"}, auth_header="Bearer x")
 
-    assert calls == ["warm", "dispatch"]
+    assert calls == ["dispatch", "warm", "turn"]
     assert result == (201, None)
+
+
+async def test_warm_does_not_run_when_authentication_rejects_the_request():
+    """T-134: the warm used to run before `Activity().deserialize` and before the SDK's JWT
+    validation, gated on nothing but a non-empty header -- so a forged-token POST to the
+    consumer's webhook dispatched a worker-thread AAD token operation. A request the SDK
+    never authenticates must cost no token work at all."""
+    calls: list[str] = []
+
+    def _record_warm(_self=None, *_args, **_kwargs):
+        calls.append("warm")
+        return "test-token"
+
+    async def _reject(_activity, _auth_header, _callback):
+        # The SDK raises/returns without invoking the callback when auth fails.
+        calls.append("auth-rejected")
+
+    adapter = TeamsAdapter(TeamsAdapterConfig("a", "p", "t"), _NoOpHandler())
+    adapter._adapter.process_activity = _reject
+    with patch.object(MicrosoftAppCredentials, "get_access_token", _record_warm):
+        await adapter.process_activity({"type": "message"}, auth_header="Bearer forged")
+
+    assert calls == ["auth-rejected"]
 
 
 async def test_connector_token_warm_runs_off_the_event_loop():
@@ -115,8 +144,12 @@ async def test_connector_token_warm_runs_off_the_event_loop():
         threads.append(threading.current_thread().name)
         return "test-token"
 
+    async def _dispatch(_activity, _auth_header, callback):
+        await callback(MagicMock())
+
     adapter = TeamsAdapter(TeamsAdapterConfig("a", "p", "t"), _NoOpHandler())
-    adapter._adapter.process_activity = AsyncMock(return_value=None)
+    adapter._adapter.process_activity = _dispatch
+    adapter._handler.on_turn = AsyncMock()
     with patch.object(MicrosoftAppCredentials, "get_access_token", _record):
         await adapter.process_activity({"type": "message"}, auth_header="Bearer x")
 
@@ -125,20 +158,26 @@ async def test_connector_token_warm_runs_off_the_event_loop():
 
 async def test_warm_failure_does_not_fail_the_turn():
     """The warm is a cache-priming optimisation with a fallback, not a gate — the send
-    still mints inline (bounded by T-115m)."""
+    still mints inline (bounded by T-115m). T-134: now asserted through the callback, so
+    the PermissionError is raised on the path that actually runs it."""
 
     def _boom(_self=None, *_args, **_kwargs):
         msg = "Failed to get access token with error: invalid_client"
         raise PermissionError(msg)
 
+    turned = AsyncMock()
+
+    async def _dispatch(_activity, _auth_header, callback):
+        await callback(MagicMock())
+
     adapter = TeamsAdapter(TeamsAdapterConfig("a", "p", "t"), _NoOpHandler())
-    dispatched = AsyncMock(return_value=None)
-    adapter._adapter.process_activity = dispatched
+    adapter._adapter.process_activity = _dispatch
+    adapter._handler.on_turn = turned
     with patch.object(MicrosoftAppCredentials, "get_access_token", _boom):
         result = await adapter.process_activity({"type": "message"}, auth_header="Bearer x")
 
     assert result == (201, None)
-    dispatched.assert_awaited_once()
+    turned.assert_awaited_once()
 
 
 async def test_warm_gate_mirrors_the_sdk_gate_literally(_mock_token):  # noqa: PT019
