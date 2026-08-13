@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.22.0 — 2026-08-13
+
+### Added
+- `max_turn_images: int | None = None` and `max_turn_image_bytes: int | None = None`
+  keywords on `ToolUseLoop.run` AND `ToolUseLoop.resume` (`llm/tool_loop.py`) — the
+  loop-side image budget that v0.21.0 explicitly deferred to consumers. Both ceilings are
+  **per-turn totals, not per result**: `messages` is re-sent every round and the Anthropic
+  API rejects a request carrying more than 100 images, so a per-result cap cannot bound a
+  render-heavy turn. Over-budget images are **dropped** (never downscaled — no codec
+  dependency enters the loop) and an explicit `_IMAGES_DROPPED_MARKER` is appended to the
+  result text so the model is told what it cannot see; content is guaranteed non-empty
+  whenever images were dropped, so the tool_result never becomes an empty block list. The
+  marker carries the `[platform]` provenance prefix (so a hostile tool that echoes the
+  literal text has its copy neutralized at the sanitizer boundary) and explicitly
+  supersedes any earlier "N images attached" note the executor may already have written
+  into the same result — otherwise the model receives a flat contradiction.
+  Bytes are measured **decoded**, by arithmetic on the base64 length — exact, O(1), and
+  allocation-free (decoding a multi-MiB image just to `len()` it would cost a full copy
+  per image per round). `0` is a meaningful ceiling meaning "no images at all". A
+  `tool_loop_result_images_dropped` warning is emitted to the consumer's `AuditLogger`.
+  Default `None` on both = no budget = byte-for-byte identical to v0.21.6 (regression
+  guarantee for every existing caller). The loop owns no default ceiling;
+  the consumer supplies it, exactly as with `max_rounds` and `max_result_chars`.
+
+### Notes
+- The consumed budget **rides the suspend `state`** and is deliberately NOT reset by
+  `resume()` — unlike the token aggregates, which are continuation-only by design (D6).
+  The image budget is a resource bound, not a bill: resetting it would let each resume
+  re-spend the whole allowance, which is precisely the hole this closes (a consumer whose
+  own budget object is rebuilt per loop entry gets a fresh allowance on every approval-card
+  resume). Read back with `state.get("images_used", ...)`, so `state["v"]` stays **1** and
+  approval cards suspended before this release resume unchanged after upgrade.
+- `InjectResultDecision` content is not image-budgeted (it never carries images) — the same
+  carve-out `max_result_chars` makes.
+- Images remain uncounted against `max_result_chars`: that cap bounds prose, and counting
+  base64 against it would let one rendered page evict the tool's actual text answer.
+
 ## v0.21.6 — 2026-08-13
 
 ### Changed
