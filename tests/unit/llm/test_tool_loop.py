@@ -904,6 +904,31 @@ async def test_result_over_cap_truncated_with_marker() -> None:
 
 
 @pytest.mark.asyncio
+async def test_truncation_marker_carries_platform_provenance_prefix() -> None:
+    """T-155: the genuine truncation notice is `[platform]`-framed, so a hostile server
+    echoing the literal cannot pass its forged copy off as a first-party notice — the
+    forged one loses the prefix at the sanitizer boundary (see the sibling sanitizer
+    test), the genuine one is appended post-sanitization and keeps it."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(name="search", tool_input={"q": "x"}))
+    sdk.messages.responses.append(make_ok(text="done"))
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="find x",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_big_executor("A" * 500),
+        max_rounds=3,
+        max_result_chars=100,
+    )
+    tc = result.steps[0].tool_calls[0]
+    # D2: the prefix sits AFTER the \n\n separator, not before it.
+    assert tc.result.startswith("A" * 100)
+    assert "\n\n[platform] [TRUNCATED BY agent-runtime:" in tc.result
+    assert "\n\n[TRUNCATED BY agent-runtime:" not in tc.result
+
+
+@pytest.mark.asyncio
 async def test_no_cap_default_leaves_huge_result_verbatim() -> None:
     """Regression guarantee: max_result_chars omitted → no truncation at any size."""
     fake_sdk = FakeAsyncAnthropic()
