@@ -1327,3 +1327,207 @@ def test_compaction_does_not_leak_tool_result_image_base64() -> None:
     text = _content_to_text(content)
     assert "aGk=" not in text
     assert text == "[tool_result]"
+
+
+# ── T-135: per-turn tool-result image budget ────────────────────────────────
+
+
+def _img(nbytes: int, media_type: str = "image/png"):
+    from agent_runtime.llm.models import LLMImage  # local — this file's convention
+
+    return LLMImage.from_bytes(b"x" * nbytes, media_type)
+
+
+@pytest.mark.asyncio
+async def test_no_image_budget_default_leaves_images_verbatim() -> None:
+    """Regression guarantee: neither ceiling supplied -> images pass through untouched
+    no matter how large, and no marker is appended."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(name="search", tool_input={"q": "x"}))
+    sdk.messages.responses.append(make_ok(text="done"))
+    img = _img(9_000_000)
+
+    async def ex(_name: str, _inp: dict) -> ToolResult:
+        return ToolResult("ok", images=(img,))
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="find x",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=ex,
+        max_rounds=3,
+    )
+    tc = result.steps[0].tool_calls[0]
+    assert tc.images == (img,)
+    assert "IMAGES WITHHELD" not in tc.result
+
+
+@pytest.mark.asyncio
+async def test_image_count_budget_drops_excess_with_marker() -> None:
+    """3 images, max_turn_images=1 -> only the FIRST is kept (deterministic order,
+    D5); the marker names both the original and dropped counts and the reason."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(name="search", tool_input={"q": "x"}))
+    sdk.messages.responses.append(make_ok(text="done"))
+    imgs = (_img(10), _img(20), _img(30))
+
+    async def ex(_name: str, _inp: dict) -> ToolResult:
+        return ToolResult("ok", images=imgs)
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="find x",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=ex,
+        max_rounds=3,
+        max_turn_images=1,
+    )
+    tc = result.steps[0].tool_calls[0]
+    assert tc.images == (imgs[0],)
+    assert "3 image(s)" in tc.result
+    assert "2 of them" in tc.result
+    assert "2 exceeded the 1-image per-turn budget" in tc.result
+
+
+@pytest.mark.asyncio
+async def test_image_byte_budget_drops_excess_with_marker() -> None:
+    """2 images of 1000 decoded bytes each, max_turn_image_bytes=1500 -> only the
+    first fits; the marker names the byte budget."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(name="search", tool_input={"q": "x"}))
+    sdk.messages.responses.append(make_ok(text="done"))
+    imgs = (_img(1000), _img(1000))
+
+    async def ex(_name: str, _inp: dict) -> ToolResult:
+        return ToolResult("ok", images=imgs)
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="find x",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=ex,
+        max_rounds=3,
+        max_turn_image_bytes=1500,
+    )
+    tc = result.steps[0].tool_calls[0]
+    assert tc.images == (imgs[0],)
+    assert "1500-byte per-turn budget" in tc.result
+
+
+@pytest.mark.asyncio
+async def test_zero_image_budget_drops_all_images() -> None:
+    """D9 guard: max_turn_images=0 means 'no images at all', not 'unset'. A
+    truthiness bug (`if max_turn_images:`) would let this image through."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(name="search", tool_input={"q": "x"}))
+    sdk.messages.responses.append(make_ok(text="done"))
+    img = _img(10)
+
+    async def ex(_name: str, _inp: dict) -> ToolResult:
+        return ToolResult("ok", images=(img,))
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="find x",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=ex,
+        max_rounds=3,
+        max_turn_images=0,
+    )
+    tc = result.steps[0].tool_calls[0]
+    assert tc.images == ()
+    assert "IMAGES WITHHELD" in tc.result
+
+
+@pytest.mark.asyncio
+async def test_image_drop_audits() -> None:
+    """Dropping images emits a tool_loop_result_images_dropped warning with the
+    count/byte breakdown."""
+    audit = _CapturingAudit()
+    fake_sdk = FakeAsyncAnthropic()
+    loop = ToolUseLoop(client=_make_client(fake_sdk), audit_logger=audit)  # type: ignore[arg-type]
+    fake_sdk.messages.responses.append(make_tool_use(name="search", tool_input={"q": "x"}))
+    fake_sdk.messages.responses.append(make_ok(text="done"))
+    imgs = (_img(10), _img(20), _img(30))
+
+    async def ex(_name: str, _inp: dict) -> ToolResult:
+        return ToolResult("ok", images=imgs)
+
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="find x",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=ex,
+        max_rounds=3,
+        max_turn_images=1,
+    )
+    assert any(m == "tool_loop_result_images_dropped" for m, _ in audit.warnings)
+    _, kw = next(w for w in audit.warnings if w[0] == "tool_loop_result_images_dropped")
+    assert kw["tool_name"] == "search"
+    assert kw["original_images"] == 3
+    assert kw["dropped_images"] == 2
+    assert kw["dropped_by_count"] == 2
+    assert kw["dropped_by_bytes"] == 0
+
+
+@pytest.mark.asyncio
+async def test_all_images_dropped_with_empty_content_yields_marker_string() -> None:
+    """D4 invariant: empty text + all images dropped -> content is exactly the marker
+    string (non-empty, no leading blank line), and the committed tool_result block's
+    `content` is a bare string, not a list (an empty parts list would be rejected)."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_1", name="search"))
+    sdk.messages.responses.append(make_ok(text="done"))
+    img = _img(100)
+
+    async def ex(_name: str, _inp: dict) -> ToolResult:
+        return ToolResult("", images=(img,))
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="find x",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=ex,
+        max_rounds=3,
+        max_turn_images=0,
+    )
+    tc = result.steps[0].tool_calls[0]
+    assert tc.result.startswith("[platform] [IMAGES WITHHELD")
+    assert not tc.result.startswith("\n")
+    content = sdk.messages.captured_requests[1]["messages"][-1]["content"][0]["content"]
+    assert isinstance(content, str)
+    assert content == tc.result
+
+
+@pytest.mark.asyncio
+async def test_text_and_image_caps_compose() -> None:
+    """D7: the text cap and the image budget are independent and both apply to the
+    same result — final content carries both markers."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(name="search", tool_input={"q": "x"}))
+    sdk.messages.responses.append(make_ok(text="done"))
+    img = _img(100)
+
+    async def ex(_name: str, _inp: dict) -> ToolResult:
+        return ToolResult("x" * 100, images=(img,))
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="find x",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=ex,
+        max_rounds=3,
+        max_result_chars=10,
+        max_turn_images=0,
+    )
+    tc = result.steps[0].tool_calls[0]
+    assert tc.result.startswith("x" * 10)
+    assert "TRUNCATED BY agent-runtime" in tc.result
+    assert "IMAGES WITHHELD" in tc.result
+    assert tc.images == ()
