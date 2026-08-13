@@ -1531,3 +1531,179 @@ async def test_text_and_image_caps_compose() -> None:
     assert "TRUNCATED BY agent-runtime" in tc.result
     assert "IMAGES WITHHELD" in tc.result
     assert tc.images == ()
+
+
+# ── T-135: per-turn budget across rounds + suspend/resume ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_image_budget_is_per_turn_across_rounds() -> None:
+    """D2: the budget is a PER-TURN total spanning multiple tool rounds, not a
+    per-result cap. Round 1 admits its image; round 2's image is entirely dropped."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_1", name="render"))
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_2", name="render"))
+    sdk.messages.responses.append(make_ok(text="done"))
+    img1 = _img(10)
+    img2 = _img(10)
+    seen: list[int] = []
+
+    async def ex(_name: str, _inp: dict) -> ToolResult:
+        img = img1 if not seen else img2
+        seen.append(1)
+        return ToolResult("ok", images=(img,))
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[{"name": "render", "input_schema": {}}],
+        executor=ex,
+        max_rounds=3,
+        max_turn_images=1,
+    )
+    round1_call = result.steps[0].tool_calls[0]
+    round2_call = result.steps[1].tool_calls[0]
+    assert round1_call.images == (img1,)
+    assert "IMAGES WITHHELD" not in round1_call.result
+    assert round2_call.images == ()
+    assert "IMAGES WITHHELD" in round2_call.result
+
+
+@pytest.mark.asyncio
+async def test_suspend_state_records_image_budget() -> None:
+    """A confirm-gated suspend after one image was admitted stores the running
+    images_used counter in state, JSON-safely."""
+    import json
+
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    img = _img(1000)
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_r", name="render"))
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_w", name="send_email"))
+
+    async def ex(name: str, _inp: dict) -> ToolResult:
+        if name == "render":
+            return ToolResult("caption", images=(img,))
+        return ToolResult("sent")
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[
+            {"name": "render", "input_schema": {}},
+            {"name": "send_email", "input_schema": {}},
+        ],
+        executor=ex,
+        max_rounds=3,
+        confirm=_CONFIRM_WRITES,
+        max_turn_images=5,
+    )
+    assert result.pending_confirmation is not None
+    state = result.pending_confirmation.state
+    assert state["images_used"] == {"count": 1, "bytes": 1000}
+    assert json.dumps(state)  # JSON-safety of the whole blob
+
+
+@pytest.mark.asyncio
+async def test_resume_carries_image_budget_forward() -> None:
+    """D3, the highest-value test: the per-turn budget SURVIVES the suspend/resume
+    boundary. If resume() reset the counter (like it does for `agg`), this second
+    image would wrongly be admitted — that is the precise bug D3 warns about."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    img1 = _img(10)
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_1", name="render"))
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_2", name="send_email"))
+
+    def _confirm(name: str, _inp: dict) -> bool:
+        return name == "send_email"
+
+    async def ex1(_name: str, _inp: dict) -> ToolResult:
+        return ToolResult("caption", images=(img1,))
+
+    suspend = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[
+            {"name": "render", "input_schema": {}},
+            {"name": "send_email", "input_schema": {}},
+        ],
+        executor=ex1,
+        max_rounds=3,
+        confirm=_confirm,
+        max_turn_images=1,
+    )
+    assert suspend.pending_confirmation is not None
+    assert suspend.pending_confirmation.state["images_used"] == {"count": 1, "bytes": 10}
+
+    img2 = _img(10)
+    sdk.messages.responses.append(make_ok(text="done"))
+
+    async def ex2(_name: str, _inp: dict) -> ToolResult:
+        return ToolResult("sent", images=(img2,))
+
+    result = await loop.resume(
+        state=suspend.pending_confirmation.state,
+        decision=ExecuteDecision(),
+        tools=[
+            {"name": "render", "input_schema": {}},
+            {"name": "send_email", "input_schema": {}},
+        ],
+        executor=ex2,
+        confirm=_confirm,
+        static_system_prefix="SYS",
+        max_rounds=3,
+        max_turn_images=1,
+    )
+    all_calls = [c for s in result.steps for c in s.tool_calls]
+    send_call = next(c for c in all_calls if c.name == "send_email")
+    assert send_call.images == ()
+    assert "IMAGES WITHHELD" in send_call.result
+
+
+@pytest.mark.asyncio
+async def test_resume_without_images_used_key_starts_fresh_budget() -> None:
+    """Deploy safety: a suspend state persisted before T-135 has no 'images_used'
+    key. resume() must not KeyError and must start with a fresh budget (mirrors
+    test_call_from_dict_without_images_key_defaults_empty)."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(name="write", tool_input={"body": "x"}))
+
+    def _confirm(name: str, _inp: dict) -> bool:
+        return name == "write"
+
+    suspend = await loop.run(
+        static_system_prefix="SYS",
+        user_message="do it",
+        tools=[{"name": "write", "input_schema": {}}],
+        executor=_never_called,
+        max_rounds=3,
+        confirm=_confirm,
+    )
+    assert suspend.pending_confirmation is not None
+    state = suspend.pending_confirmation.state
+    del state["images_used"]
+
+    img = _img(10)
+    sdk.messages.responses.append(make_ok(text="done"))
+
+    async def ex(_name: str, _inp: dict) -> ToolResult:
+        return ToolResult("ok", images=(img,))
+
+    result = await loop.resume(
+        state=state,
+        decision=ExecuteDecision(),
+        tools=[{"name": "write", "input_schema": {}}],
+        executor=ex,
+        confirm=_confirm,
+        static_system_prefix="SYS",
+        max_rounds=3,
+        max_turn_images=1,
+        max_turn_image_bytes=1000,
+    )
+    all_calls = [c for s in result.steps for c in s.tool_calls]
+    write_call = next(c for c in all_calls if c.name == "write")
+    assert write_call.images == (img,)
+    assert "IMAGES WITHHELD" not in write_call.result
