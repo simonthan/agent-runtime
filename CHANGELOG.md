@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.25.0 — 2026-08-14
+
+### Fixed
+- `SessionManager.create_session` now writes the session blob **before** it claims the
+  `(user_id, bot_id)` reverse index, and deletes that blob if the atomic `SET NX` claim is
+  lost. The index is the publication of a session; claiming first left a globally visible
+  pointer to a session that did not exist yet, for the four awaits it took to reach
+  `_save_session`. A concurrent reader landing in that window resolved the index, missed
+  the blob, classified it as a dangling pointer, **deleted the index** and returned
+  `NewSession()` — un-claiming a valid brand-new session and letting the consumer open a
+  SECOND session for the same `(user, bot)`, which is the one thing the one-session-per-pair
+  invariant (ARCH §4 #4) forbids. Same ordering, same reason, as the cold path
+  `_rehydrate_cold_session`, which T-133 already wrote save-before-claim. Two secondary
+  wins fall out: a crash between the two writes now leaves the pair **unclaimed** instead
+  of claimed-for-a-phantom, and a Redis failure on the blob write can no longer strand a
+  claim at all. No API change, no consumer change required. (TBP T-153, relatesTo T-133)
+
+### Changed
+- `get_or_prompt_resume`'s dangling-index self-heal and `_resolve_cold_claim_loss`'s
+  unreadable-winner arm are **unchanged in behaviour** but are no longer defending against
+  a first-party race: after the above, no code path in this library publishes an index
+  value ahead of its blob (`create_session` and `_rehydrate_cold_session` are the only
+  writers of a new index value; `_rearm_active_index` is `xx=True`). Both remain as
+  defence against Redis `maxmemory` eviction of a blob whose index key survives. Their
+  docstrings are corrected accordingly; no consumer-visible change.
+- **One consumer-visible consequence, same class as the T-133 note:** when a cold
+  rehydration loses its NX claim to a concurrent `create_session`, the winner's blob is now
+  guaranteed to be present and `active`, so `_resolve_cold_claim_loss` returns
+  `Active(winner)` where it previously could return `Resumable(winner)`. That is the
+  intended answer — a session created seconds ago must not be handed a "continuing your
+  conversation" notice — and consumers already handle both arms of `ResumeDecision`.
+
 ## v0.24.0 — 2026-08-13
 
 ### Added
