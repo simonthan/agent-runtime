@@ -173,6 +173,16 @@ class SessionManager:
             client_context=client_context or {},
         )
 
+        # T-153: the blob is written BEFORE the index claim. The index is the
+        # PUBLICATION of the session — claiming first left a globally visible pointer
+        # to a session that did not exist yet, and `get_or_prompt_resume`'s
+        # dangling-pointer self-heal (step 1) deletes such a pointer unconditionally.
+        # A reader landing in that window therefore un-claimed a perfectly valid
+        # brand-new session and returned NewSession(), letting the consumer open a
+        # SECOND session for the same (user, bot). Same ordering, same reason, as
+        # `_rehydrate_cold_session` (T-133).
+        await self._save_session(session)
+
         # Atomic claim: SET NX prevents duplicate-session race (D4b)
         claimed = await self.redis.set(
             self._active_index_key(user_id, bot_id),
@@ -182,6 +192,17 @@ class SessionManager:
         )
 
         if not claimed:
+            # Lost the race. Drop the blob we just wrote: `session_id` is a local
+            # uuid4 that was never published (no index, no resume token, no durable
+            # row — both of those writes are on the winning path below), so nothing
+            # can be holding it, and leaving it leaks one Redis key per losing
+            # attempt for the whole idle window.
+            # ONLY the session key. The active-index key belongs to the WINNER;
+            # deleting it here would evict a valid claim — the precise bug this
+            # reorder exists to remove.
+            # Not guarded: the next statement's `redis.get` would fail on the same
+            # outage, so swallowing hides the outage and fixes nothing.
+            await self.redis.delete(self._session_key(session_id))
             # Another session won the race — surface the existing session.
             decision = await self.get_or_prompt_resume(user_id=user_id, bot_id=bot_id)
             match decision:
@@ -194,8 +215,6 @@ class SessionManager:
                 case NewSession():
                     # Shouldn't happen here, but treat defensively as a race loss
                     raise SessionAlreadyActive(session_id=session_id, last_activity_ts=_utc_now())
-
-        await self._save_session(session)
 
         # Increment per-user active session counter (O(1) vs O(N) scan)
         count_key = self._count_key(user_id)
@@ -463,6 +482,8 @@ class SessionManager:
         The session blob is written BEFORE the index claim on purpose — an index that
         points at a session key which does not exist yet reads as a dangling pointer to
         the next caller, which deletes it (see ``get_or_prompt_resume`` step 1).
+        ``create_session`` follows the same ordering since T-153; it is the library-wide
+        rule for writing a NEW value into the (user, bot) index, not a cold-path quirk.
         """
         last = _ensure_utc(row.last_message_at or row.created_at)
         # T-093 Fix B — see _load_durable_history for why this is load-bearing.
@@ -509,14 +530,16 @@ class SessionManager:
           across two ids. ``Active`` when its blob is live, because there is nothing
           left to rehydrate and a session created seconds ago must not get a
           "continuing your conversation" notice.
-        - Index holds a different id whose blob is NOT readable or not active — most
-          likely ``create_session``'s narrow claim→save window (it claims at :177 and
-          saves at :198): ``Resumable``, never ``Active``. ``Resumable`` is the only
-          decision that routes a consumer back through a second resume attempt once
-          the winner's blob lands; ``Active`` would have the consumer act on a session
-          id it cannot read, dropping that turn's messages from Redis AND from the
-          durable transcript (``update_session`` returns early on a missing session,
-          before the durable write).
+        - Index holds a different id whose blob is NOT readable or not active — the winner's
+          blob was evicted (Redis ``maxmemory``) or it went non-active between the claim and
+          this read: ``Resumable``, never ``Active``. (Before T-153 the dominant cause was
+          ``create_session``'s claim→save window; that window no longer exists — every
+          first-party writer of a NEW index value now saves the blob first. The fail-safe
+          stays, because eviction does not.) ``Resumable`` is the only decision that routes a
+          consumer back through a second resume attempt once the blob is readable again;
+          ``Active`` would have the consumer act on a session id it cannot read, dropping
+          that turn's messages from Redis AND from the durable transcript
+          (``update_session`` returns early on a missing session, before the durable write).
         """
         current = await self.redis.get(self._active_index_key(user_id, bot_id))
         if not current or current == own_session_id:

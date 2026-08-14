@@ -557,10 +557,12 @@ async def test_cold_rehydration_lost_claim_to_same_session_is_still_resumable():
 
 
 async def test_cold_rehydration_winner_not_yet_persisted_is_resumable_not_active():
-    """The winner claimed the index but has not written its blob yet (create_session
-    claims at :177, saves at :198). Active would be a dead end — `_select`'s Active arm
-    skips resume(), and a turn on an unreadable session drops its messages from Redis AND
-    from the durable transcript. Resumable gives the consumer a retry."""
+    """The winner's index claim resolves to a blob that is not readable — Redis evicted it
+    under `maxmemory`, or it went away between the claim and this read. (Until T-153 the
+    dominant cause was create_session's claim→save window; that window is gone, this
+    fail-safe is not.) Active would be a dead end — `_select`'s Active arm skips resume(),
+    and a turn on an unreadable session drops its messages from Redis AND from the durable
+    transcript. Resumable gives the consumer a retry."""
     mgr, redis, _repo = _make_manager()
     session = await mgr.create_session(user_id="u1", bot_id="b1")
     index_key = "session:active:u1:b1"
