@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.25.1 — 2026-08-14
+
+### Fixed
+- `ToolUseLoop._cap_result` now repairs its own clip seam before appending the
+  `[platform]`-framed truncation notice. It was the third site in the library that clips
+  untrusted text and the only one that did not: both sanitizer functions re-neutralize
+  their truncated head, because a clip can manufacture a sentinel by cutting a longer word
+  short. `_PLATFORM_PROVENANCE_PATTERN` is the sole `\b`-anchored alternative in
+  `_NEUTRALIZE_RE` — every other alternative is a fixed literal, which a prefix cannot
+  contain unless its source did — so it is the only sentinel a suffix-clip can create:
+  `[platformer review]` passes the sanitizer untouched and clips to `[platform`,
+  resurrecting a first-party provenance opener out of inert data.
+- The same clip could sever the trailing `</tool_output>`, leaving the truncation and
+  images-dropped notices stranded inside an unclosed untrusted-data envelope. Provenance
+  for platform-injected markers is POSITIONAL rather than prefix-based (a `[platform]`
+  prefix does not survive an untrusted frame — TBP T-155/T-164), so an unclosed envelope
+  destroys it. `_cap_result` now re-closes a severed envelope, which restores the position
+  for BOTH markers.
+- Both repairs are pre-existing, LOW-severity and unreachable at teams-bot-platform's
+  default config (`sanitize_tool_result` clips at 8000 chars, the loop's cap is 100000);
+  fixed as a library-correctness property that must hold for any consumer's cap.
+  (TBP T-162, relatesTo T-155/T-164)
+
+### Added
+- `agent_runtime.safety.repair_clipped_tool_result(head)` — public, idempotent, and
+  byte-identical to its input when neither repair applies. The seam pattern is `\Z`-anchored
+  and that anchor is load-bearing: an unanchored pass would also destroy the genuine
+  `[platform]` notes consumers append to `ToolResult.content` after the envelope.
+
+### Changed
+- No behaviour change for any caller whose tool results do not exceed `max_result_chars`,
+  and none for `max_result_chars=None`. No consumer code change is required — a pin bump is
+  sufficient.
+
 ## v0.25.0 — 2026-08-14
 
 ### Fixed

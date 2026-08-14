@@ -17,7 +17,7 @@ Consumed by teams-bot-platform and ithelpdesk via git-pinned dependency.
 See the three-layer reuse model in teams-bot-platform/ARCHITECTURE.md §2.
 """
 
-__version__ = "0.25.0"
+__version__ = "0.25.1"
 
 from agent_runtime.observability import (
     RequestIDMiddleware,
