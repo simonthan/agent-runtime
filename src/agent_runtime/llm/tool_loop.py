@@ -28,6 +28,7 @@ from agent_runtime.llm.compaction import estimate_tokens
 from agent_runtime.llm.models import LLMImage
 from agent_runtime.llm.round_context import ToolRoundContext, bind_tool_round
 from agent_runtime.logging import AuditLogger, NullAuditLogger
+from agent_runtime.safety.prompt_sanitizer import repair_clipped_tool_result
 
 __all__ = [
     "ConfirmPredicate",
@@ -712,7 +713,15 @@ class ToolUseLoop:
                 cap_chars=max_result_chars,
                 removed_chars=removed,
             )
-            content = content[:max_result_chars] + marker
+            # T-162: the clip is the THIRD site that can manufacture a sentinel out of
+            # already-neutralized text, and the only one that can sever the tool_output
+            # envelope. Repair the head BEFORE the `[platform]`-framed marker is appended —
+            # that marker's provenance is POSITIONAL (it must sit outside a CLOSED
+            # envelope; T-155/T-164), so appending it to a severed envelope buries a
+            # first-party notice inside untrusted data. `removed` above deliberately stays
+            # `original - max_result_chars`: it describes the CLIP, and the re-close ADDS
+            # characters (recomputing it from len(head) can go negative on a small cap).
+            content = repair_clipped_tool_result(content[:max_result_chars]) + marker
 
         kept_images, img_marker = self._cap_images(
             tool_name=tool_name,

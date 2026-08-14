@@ -100,7 +100,7 @@ def _sub_to_fixed_point(rx: re.Pattern[str], s: str) -> str:
     the platform fragment's `\[\s*platform` then matches that freshly-created text --
     which a single non-overlapping pass never rescans (T-132 §D2b).
 
-    Termination: every alternative in both compiled patterns matches at least 2 chars
+    Termination: every alternative in every pattern passed here matches at least 2 chars
     and is replaced by exactly 1, so any pass that changes the string strictly shortens
     it. Real inputs converge in 1-3 passes; the cap is belt-and-braces only.
     """
@@ -200,3 +200,73 @@ def sanitize_tool_result(text: str | None, max_len: int = 8000) -> str:
     if not s.strip():
         return ""
     return f"{_TOOL_OUTPUT_PREFIX}\n{_TOOL_OUTPUT_OPEN}\n{s}\n{_TOOL_OUTPUT_CLOSE}"
+
+
+# Sentinels a SUFFIX CLIP can manufacture in text that was ALREADY neutralized.
+# `_PLATFORM_PROVENANCE_PATTERN` is the sole \b-ANCHORED alternative in _NEUTRALIZE_RE —
+# every other alternative is a fixed literal, and a prefix cannot contain a literal its
+# source string did not (head = s[:n], so a literal in head sits at the same offset in s).
+# A \b-anchored match is the only kind whose success depends on what FOLLOWS it, so it is
+# the only kind a clip can create: cutting `[platformer` short to `[platform` supplies the
+# word boundary the full word denied, resurrecting a first-party provenance opener out of
+# inert data. Same §D2b hazard both sanitizers re-neutralize for at their own max_len clip.
+#
+# \Z-ANCHORED, and that is exact rather than a heuristic narrowing (T-162 RC4): if a match
+# in `head` ends before position n, the identical span exists in `s` and was already
+# handled there, so EVERY clip-created match ends at the end of the head. The anchor is
+# load-bearing — an unanchored pass would also eat the GENUINE `[platform]` notes consumers
+# append to ToolResult.content after the envelope (teams-bot-platform does this in nine
+# places, e.g. "[platform] Tool-round budget: …"), silently mangling first-party
+# instructions into prose. Do not widen it.
+#
+# The `(?:...)` wrapper is LOAD-BEARING, not decoration (R3 MEDIUM-1). It is a no-op today
+# because _PLATFORM_PROVENANCE_PATTERN has no top-level alternation — but that pattern is
+# alternated INTO _SENTINEL_RE and _NEUTRALIZE_RE, so growing a top-level `|` is a natural
+# future edit. Without the group, `A|B` + `\Z` parses as `A|(B\Z)`: the anchor would silently
+# bind to the last alternative only, and every other branch would become an UNANCHORED
+# whole-head match — i.e. exactly the RC4 regression this anchor exists to prevent, arriving
+# silently in an unrelated commit. Do not remove the group.
+_CLIP_SEAM_RE = re.compile(f"(?:{_PLATFORM_PROVENANCE_PATTERN})\\Z", re.IGNORECASE)
+
+
+def repair_clipped_tool_result(head: str) -> str:
+    """Make a suffix-clipped tool result safe to append a first-party notice to.
+
+    For callers that clip an already-sanitized result — `ToolUseLoop._cap_result` is the
+    one in-tree — this is the third clip site's equivalent of the re-neutralization
+    `sanitize_for_llm_prompt` and `sanitize_tool_result` each perform on their own
+    truncated head. Run it on the clipped head BEFORE appending any `[platform]`-framed
+    marker. Idempotent, and byte-identical to its input when neither repair applies (so an
+    uncapped or non-enveloped caller is unaffected).
+
+    Two repairs, in this order:
+
+    1. Neutralize the clip seam (`_CLIP_SEAM_RE` — see there for why it is \\Z-anchored and
+       why widening it would destroy genuine first-party notes).
+    2. Re-close a SEVERED envelope. The clip can land inside — or before — the trailing
+       `</tool_output>`, leaving the envelope open, so a notice appended after it is
+       textually outside the body but structurally INSIDE the untrusted envelope. That
+       matters because provenance for platform-injected markers is POSITIONAL, not
+       prefix-based: a `[platform]` prefix does not survive the untrusted frame (TBP
+       T-155/T-164), so the marker's only real provenance signal is sitting outside a
+       CLOSED envelope. Re-closing restores that position.
+
+    Balance is counted on the exact first-party literals `sanitize_tool_result` emits
+    (which neutralizes both tags, in any case, inside the body). This is a STRUCTURAL
+    repair predicated on the caller having sanitized — it is not itself a trust boundary;
+    an unsanitized caller has no envelope guarantee to repair. In practice the imbalance
+    is 0 or 1; the general form costs nothing.
+
+    Accepted residual: a clip landing MID-tag leaves an inert partial fragment
+    (`</tool_ou`) inside the envelope. Deliberately NOT stripped — every proper prefix of
+    `</tool_output>` includes the single character `<`, so stripping on that basis would
+    mutate legitimate body text ending in `<`. A partial tag is not a tag and carries no
+    instruction.
+    """
+    # Single sub, no fixed-point loop: the \Z anchor admits at most one match, and its
+    # replacement leaves the string ending in whitespace, so no second match can form.
+    head = _CLIP_SEAM_RE.sub(" ", head)
+    unclosed = head.count(_TOOL_OUTPUT_OPEN) - head.count(_TOOL_OUTPUT_CLOSE)
+    if unclosed > 0:
+        head += f"\n{_TOOL_OUTPUT_CLOSE}" * unclosed
+    return head

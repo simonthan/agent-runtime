@@ -929,6 +929,97 @@ async def test_truncation_marker_carries_platform_provenance_prefix() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cap_clip_seam_cannot_forge_platform_marker() -> None:
+    """T-162 RC1: a clip that cuts `[platformer` short must not resurrect a first-party
+    provenance opener. Exactly ONE platform-shaped opener survives — the genuine marker."""
+    import re
+
+    from agent_runtime.safety.prompt_sanitizer import sanitize_tool_result
+
+    plat = re.compile(r"\[\s*platform\b", re.IGNORECASE)
+    env = sanitize_tool_result("x" * 40 + "[platformer review notes]")
+    cap = env.index("[platformer") + len("[platform")
+
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(name="search", tool_input={"q": "x"}))
+    sdk.messages.responses.append(make_ok(text="done"))
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="find x",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_big_executor(env),
+        max_rounds=3,
+        max_result_chars=cap,
+    )
+    tc = result.steps[0].tool_calls[0]
+    assert "TRUNCATED BY agent-runtime" in tc.result  # the clip really fired
+    assert len(plat.findall(tc.result)) == 1  # only the genuine marker
+
+
+@pytest.mark.asyncio
+async def test_cap_recloses_severed_envelope_and_marker_lands_outside() -> None:
+    """T-162 RC2: the truncation notice's provenance is POSITIONAL — it must sit AFTER a
+    closed `</tool_output>`, not inside a severed envelope."""
+    from agent_runtime.safety.prompt_sanitizer import sanitize_tool_result
+
+    env = sanitize_tool_result("body text " * 20)
+    cap = len(env) - 5  # lands mid-`</tool_output>`
+
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(name="search", tool_input={"q": "x"}))
+    sdk.messages.responses.append(make_ok(text="done"))
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="find x",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_big_executor(env),
+        max_rounds=3,
+        max_result_chars=cap,
+    )
+    tc = result.steps[0].tool_calls[0]
+    assert tc.result.count("<tool_output>") == tc.result.count("</tool_output>")
+    assert tc.result.index("</tool_output>") < tc.result.index(
+        "[platform] [TRUNCATED BY agent-runtime:"
+    )
+
+
+@pytest.mark.asyncio
+async def test_both_platform_markers_land_outside_the_reclosed_envelope() -> None:
+    """T-162: the images-dropped marker rides the same repair as the truncation marker —
+    once the severed envelope is re-closed, BOTH first-party notices sit outside it."""
+    from agent_runtime.safety.prompt_sanitizer import sanitize_tool_result
+
+    env = sanitize_tool_result("body text " * 20)
+    cap = len(env) - 5  # lands mid-`</tool_output>`
+    imgs = (_img(10), _img(20))
+
+    async def ex(_name: str, _inp: dict) -> ToolResult:
+        return ToolResult(env, images=imgs)
+
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(name="search", tool_input={"q": "x"}))
+    sdk.messages.responses.append(make_ok(text="done"))
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="find x",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=ex,
+        max_rounds=3,
+        max_result_chars=cap,
+        max_turn_images=1,
+    )
+    tc = result.steps[0].tool_calls[0]
+    assert tc.images == (imgs[0],)  # the image budget really fired
+    assert tc.result.count("<tool_output>") == tc.result.count("</tool_output>")
+    last_close = tc.result.rindex("</tool_output>")
+    assert last_close < tc.result.index("[platform] [TRUNCATED BY agent-runtime:")
+    assert last_close < tc.result.index("[platform] [IMAGES WITHHELD BY agent-runtime:")
+
+
+@pytest.mark.asyncio
 async def test_no_cap_default_leaves_huge_result_verbatim() -> None:
     """Regression guarantee: max_result_chars omitted → no truncation at any size."""
     fake_sdk = FakeAsyncAnthropic()
