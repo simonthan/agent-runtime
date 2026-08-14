@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.24.0 — 2026-08-13
+
+### Added
+- `pg_advisory_single_flight(session_factory, *, key)` + `advisory_lock_key(namespace, ident)` —
+  a Postgres session-scoped advisory-lock single-flight guard, in the new leaf module
+  `agent_runtime.pg_advisory` (import it directly; not re-exported from the package root, same
+  as `agent_runtime.protocol`). **New public API, hence the minor bump.** This is the extraction
+  of teams-bot-platform's
+  `NotificationEventRepository.digest_sweep_lock` (TBP T-140), whose mechanics were validated
+  against a live Postgres 16: AUTOCOMMIT session-scoped lock, never commit/rollback on the lock
+  session (a commit returns a still-locked connection to the pool, where it is re-acquired
+  REENTRANTLY), explicit unlock in a `finally`, and `except BaseException` → `invalidate()` on
+  the unlock so a cancelled job never returns a locked connection to the pool. Any consumer with
+  a scheduled sweep whose side effects are not idempotent wants this. SQLAlchemy is NOT a
+  declared dependency: the module imports `text` lazily inside the guard (the caller
+  necessarily already has SQLAlchemy to construct the sessionmaker it passes), so importing
+  `agent_runtime` on a `[redis]`- or `[teams]`-only install is unaffected. (TBP T-165)
+
 ## v0.23.0 — 2026-08-13
 
 ### Added

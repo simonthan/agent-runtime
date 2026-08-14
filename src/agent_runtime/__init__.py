@@ -10,13 +10,14 @@ Each subpackage owns one slice of the runtime vocabulary:
 - ``llm``        — Anthropic API wrapper with opt-in history cache breakpoint (extras: ``[llm]``)
 - ``connectors`` — BaseConnector ABC, ConnectorResult, RetryMixin, throttle mechanism
 - ``protocol``   — NodeResult + NodeHandler/TemplateResolver/NodeExecutor Protocols
+- ``pg_advisory`` — Postgres advisory-lock single-flight guard (import-time dependency-free)
 - ``transport``  — channel adapters (Microsoft Teams via ``transport.teams``; extras: ``[teams]``)
 
 Consumed by teams-bot-platform and ithelpdesk via git-pinned dependency.
 See the three-layer reuse model in teams-bot-platform/ARCHITECTURE.md §2.
 """
 
-__version__ = "0.23.0"
+__version__ = "0.24.0"
 
 from agent_runtime.observability import (
     RequestIDMiddleware,

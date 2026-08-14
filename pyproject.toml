@@ -1,6 +1,6 @@
 [project]
 name = "agent-runtime"
-version = "0.23.0"
+version = "0.24.0"
 description = "Shared runtime primitives for Microsoft Teams knowledge bots — resilience, safety, session flows, execution context. Consumed by teams-bot-platform and ithelpdesk."
 readme = "README.md"
 license = "MIT"
@@ -26,7 +26,11 @@ postgres = ["asyncpg>=0.29,<1"]
 [dependency-groups]
 dev = [{include-group = "lint"}, {include-group = "test"}]
 lint = ["ruff>=0.6", "ty>=0.0.1a5"]
-test = ["pytest>=8", "pytest-cov>=5", "pytest-asyncio>=0.23"]
+# sqlalchemy is a TEST-only dependency: agent_runtime.pg_advisory imports `text` lazily,
+# inside the guard, and never at module import (see that module's docstring). It is not a
+# runtime dependency — a caller necessarily already has SQLAlchemy to build the
+# sessionmaker it passes.
+test = ["pytest>=8", "pytest-cov>=5", "pytest-asyncio>=0.23", "sqlalchemy>=2,<3"]
 
 [build-system]
 requires = ["uv_build>=0.11.3,<0.12.0"]
