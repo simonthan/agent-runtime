@@ -203,6 +203,34 @@ class _RoundSuspended:
 _RoundOutcome = _RoundCompleted | _RoundSuspended
 
 
+def _strip_tool_result_markers(messages: list[dict[str, Any]]) -> None:
+    """Remove ``cache_control`` from every tool_result block in ``messages``.
+
+    The moving round marker (T-190) is the ONLY marker that ever sits on a
+    tool_result block — BP2 (retrieval) and BP3 (history) live on text blocks —
+    so stripping by block type is exact. Handles both the live-loop case (the
+    previous round's marker) and a marker riding a resumed ``state["messages"]``
+    across the suspend boundary. In-place on the message dicts (state-persisted
+    lists included — deliberate: a stripped stale marker must not resurrect).
+
+    Precondition: caller-supplied ``history`` must not END in a tool_result-typed
+    block, or ``cache_history=True`` would have placed BP3 on it and this strip
+    would remove BP3 too. True for all current consumers — tool rounds are
+    internal to the loop and never persisted as session history.
+    """
+    for m in messages:
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for i, block in enumerate(content):
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_result"
+                and "cache_control" in block
+            ):
+                content[i] = {k: v for k, v in block.items() if k != "cache_control"}
+
+
 def _tool_result_content(call: ToolCall) -> str | list[dict[str, Any]]:
     """The `content` value for one tool_result block.
 
@@ -240,6 +268,7 @@ class ToolUseLoop:
         images: tuple[LLMImage, ...] = (),
         history: tuple[dict[str, Any], ...] = (),
         cache_history: bool = False,
+        cache_tool_rounds: bool = False,
         model: str | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
@@ -285,7 +314,12 @@ class ToolUseLoop:
         downscaled) and an explicit marker tells the model what it cannot see. Bytes are
         measured DECODED. `0` is meaningful: it drops every image. Default `None` on both
         = no budget = byte-for-byte unchanged (regression guarantee). The loop owns no
-        default; the consumer supplies the ceilings, exactly as with max_result_chars."""
+        default; the consumer supplies the ceilings, exactly as with max_result_chars.
+
+        `cache_tool_rounds=True` (T-190) places a MOVING ephemeral marker on the latest
+        committed round's last tool_result so later rounds and the forced final call read
+        earlier rounds from cache. Opt-in, default False = byte-for-byte unchanged
+        (regression guarantee)."""
         system_blocks = self._build_system_blocks(static_system_prefix, dynamic_system_suffix)
         first_user: list[dict[str, Any]] = []
         if retrieval_block:
@@ -319,6 +353,7 @@ class ToolUseLoop:
             images_used={"count": 0, "bytes": 0},
             max_turn_images=max_turn_images,
             max_turn_image_bytes=max_turn_image_bytes,
+            cache_tool_rounds=cache_tool_rounds,
         )
 
     async def resume(
@@ -332,6 +367,7 @@ class ToolUseLoop:
         static_system_prefix: str,
         max_rounds: int,
         dynamic_system_suffix: str | None = None,
+        cache_tool_rounds: bool = False,
         model: str | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
@@ -361,7 +397,11 @@ class ToolUseLoop:
 
         `max_turn_images` / `max_turn_image_bytes` mirror `run()` (T-135) and must be
         re-supplied on every call. The consumed budget itself DOES ride `state` — it is a
-        bound, not a bill."""
+        bound, not a bill.
+
+        `cache_tool_rounds` (T-190): re-supply on every call, exactly as max_result_chars
+        — only conversation progress lives in state. A state suspended with a marker and
+        resumed with False keeps the stale marker (harmless: count stays ≤4)."""
         # cache_history: no param — the run()-time history marker rides state["messages"].
         system_blocks = self._build_system_blocks(static_system_prefix, dynamic_system_suffix)
         messages: list[dict[str, Any]] = state["messages"]
@@ -448,6 +488,7 @@ class ToolUseLoop:
             assistant_text=rnd["assistant_text"],
             tool_uses=tool_uses,
             calls=round_outcome.calls,
+            cache_tool_rounds=cache_tool_rounds,
         )
         return await self._drive(
             system_blocks=system_blocks,
@@ -466,6 +507,7 @@ class ToolUseLoop:
             images_used=images_used,
             max_turn_images=max_turn_images,
             max_turn_image_bytes=max_turn_image_bytes,
+            cache_tool_rounds=cache_tool_rounds,
         )
 
     async def _drive(
@@ -487,6 +529,7 @@ class ToolUseLoop:
         images_used: dict[str, int],
         max_turn_images: int | None,
         max_turn_image_bytes: int | None,
+        cache_tool_rounds: bool = False,
     ) -> ToolLoopResult:
         """Shared round engine. `while rounds < max_rounds` (correct at the
         max_rounds=0 boundary — zero tool rounds, straight to the forced answer)."""
@@ -537,6 +580,7 @@ class ToolUseLoop:
                 assistant_text=resp.content,
                 tool_uses=tool_uses,
                 calls=outcome.calls,
+                cache_tool_rounds=cache_tool_rounds,
             )
 
         # Cap reached (or max_rounds==0). ONE final model call WITHOUT tools so the
@@ -748,6 +792,7 @@ class ToolUseLoop:
         assistant_text: str,
         tool_uses: list[dict[str, Any]],
         calls: list[ToolCall],
+        cache_tool_rounds: bool = False,
     ) -> None:
         """Append the completed round's assistant turn (text + every tool_use block)
         and the user turn (a tool_result for every call, derived from `calls`), and
@@ -769,6 +814,18 @@ class ToolUseLoop:
             }
             for c in calls
         ]
+        if cache_tool_rounds:
+            # T-190 moving marker: strip the previous round's marker (or one riding a
+            # resumed state), then mark the LAST tool_result of THIS round. At most one
+            # moving marker exists, so BP1+BP2+BP3+this = 4, never 5 (API limit).
+            # Insertion is BEFORE the two messages.append calls (load-bearing — see plan
+            # §A1): placing this block after the appends would make _strip immediately
+            # remove the marker just added (the marked block already in messages).
+            _strip_tool_result_markers(messages)
+            tool_result_blocks[-1] = {
+                **tool_result_blocks[-1],
+                "cache_control": {"type": "ephemeral"},
+            }
         steps.append(ToolLoopStep(assistant_text=assistant_text, tool_calls=tuple(calls)))
         messages.append({"role": "assistant", "content": assistant_blocks})
         messages.append({"role": "user", "content": tool_result_blocks})
