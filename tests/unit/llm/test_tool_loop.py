@@ -1823,3 +1823,225 @@ async def test_resume_without_images_used_key_starts_fresh_budget() -> None:
     write_call = next(c for c in all_calls if c.name == "write")
     assert write_call.images == (img,)
     assert "IMAGES WITHHELD" not in write_call.result
+
+
+# ---- T-190: cache_tool_rounds moving marker --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cache_tool_rounds_marks_last_tool_result() -> None:
+    """2-round run with cache_tool_rounds=True:
+    - request 2 (round 1 committed): round 1's user message has cache_control on
+      its LAST tool_result block and nowhere else among tool_result blocks.
+    - request 3 (final): round 1's marker stripped; round 2's last tool_result marked.
+    """
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    # Round 1: tool_use -> round 2: tool_use -> final answer
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_1", name="search", tool_input={"q": "a"}))
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_2", name="search", tool_input={"q": "b"}))
+    sdk.messages.responses.append(make_ok(text="done"))
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_ok_executor,
+        max_rounds=5,
+        cache_tool_rounds=True,
+    )
+    assert result.final_text == "done"
+    reqs = sdk.messages.captured_requests
+
+    # request index 1 = after round 1 committed; last user msg = round 1's results
+    req2 = reqs[1]
+    user_turn_r1 = req2["messages"][-1]
+    assert user_turn_r1["role"] == "user"
+    tr_blocks_r1 = [b for b in user_turn_r1["content"] if b.get("type") == "tool_result"]
+    # last block must be marked; no other tool_result block in the whole request is marked
+    assert tr_blocks_r1[-1].get("cache_control") == {"type": "ephemeral"}
+    all_tr_in_req2 = [
+        b
+        for m in req2["messages"]
+        if isinstance(m.get("content"), list)
+        for b in m["content"]
+        if b.get("type") == "tool_result"
+    ]
+    marked_in_req2 = [b for b in all_tr_in_req2 if "cache_control" in b]
+    assert len(marked_in_req2) == 1
+
+    # request index 2 = final no-tools call; round 1's marker stripped, round 2's marked
+    req3 = reqs[2]
+    all_tr_in_req3 = [
+        b
+        for m in req3["messages"]
+        if isinstance(m.get("content"), list)
+        for b in m["content"]
+        if b.get("type") == "tool_result"
+    ]
+    marked_in_req3 = [b for b in all_tr_in_req3 if "cache_control" in b]
+    assert len(marked_in_req3) == 1
+    # The marked block must be in the LAST user message (round 2's results)
+    last_user_msg_r2 = req3["messages"][-1]
+    tr_in_last_r2 = [b for b in last_user_msg_r2["content"] if b.get("type") == "tool_result"]
+    assert tr_in_last_r2[-1].get("cache_control") == {"type": "ephemeral"}
+
+
+@pytest.mark.asyncio
+async def test_cache_tool_rounds_default_off_byte_identical() -> None:
+    """Default (cache_tool_rounds=False): no tool_result block ever carries cache_control."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_1", name="search", tool_input={}))
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_2", name="search", tool_input={}))
+    sdk.messages.responses.append(make_ok(text="done"))
+
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_ok_executor,
+        max_rounds=5,
+    )
+    for req in sdk.messages.captured_requests:
+        for m in req["messages"]:
+            content = m.get("content")
+            if not isinstance(content, list):
+                continue
+            for b in content:
+                if b.get("type") == "tool_result":
+                    assert "cache_control" not in b, f"unexpected marker on {b}"
+
+
+@pytest.mark.asyncio
+async def test_cache_tool_rounds_marker_count_at_limit() -> None:
+    """With retrieval_block + cache_history + non-empty history + cache_tool_rounds + 2 rounds:
+    every captured request must have ≤4 cache_control markers total."""
+
+    def _count_markers(req: dict) -> int:
+        count = 0
+        for block in req.get("system", []):
+            if "cache_control" in block:
+                count += 1
+        for m in req.get("messages", []):
+            content = m.get("content")
+            if isinstance(content, list):
+                for b in content:
+                    if "cache_control" in b:
+                        count += 1
+            elif isinstance(content, str):
+                pass
+        return count
+
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_1", name="search", tool_input={}))
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_2", name="search", tool_input={}))
+    sdk.messages.responses.append(make_ok(text="done"))
+
+    history_msg: dict = {
+        "role": "user",
+        "content": [{"type": "text", "text": "prior turn"}],
+    }
+
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_ok_executor,
+        max_rounds=5,
+        retrieval_block="RETRIEVED",
+        history=(history_msg,),
+        cache_history=True,
+        cache_tool_rounds=True,
+    )
+    for req in sdk.messages.captured_requests:
+        count = _count_markers(req)
+        assert count <= 4, f"marker count={count} exceeds limit 4 in request"
+
+
+@pytest.mark.asyncio
+async def test_cache_tool_rounds_resume_strips_state_marker() -> None:
+    """Suspend after round 1 committed with marker; JSON round-trip state; resume with
+    cache_tool_rounds=True: exactly one moving marker in resumed request, on that round's
+    last tool_result."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+
+    # Round 1: two tool uses, but second triggers confirm → round committed first tool,
+    # suspends on second.  We actually want round 1 to COMMIT fully (with the marker),
+    # then suspend on round 2.  Use two separate rounds instead: round 1 commits (search),
+    # round 2 triggers confirm on send_email.
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_1", name="search", tool_input={}))
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_w", name="send_email", tool_input={"to": "x"}))
+
+    _confirm_email = lambda name, _inp: name == "send_email"  # noqa: E731
+
+    suspended = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[{"name": "search", "input_schema": {}}, {"name": "send_email", "input_schema": {}}],
+        executor=_ok_executor,
+        max_rounds=5,
+        confirm=_confirm_email,
+        cache_tool_rounds=True,
+    )
+    assert suspended.pending_confirmation is not None
+
+    import json
+
+    # JSON round-trip state to simulate persistence
+    state_json = json.dumps(suspended.pending_confirmation.state)
+    state = json.loads(state_json)
+
+    sdk.messages.responses.append(make_ok(text="sent"))
+
+    result = await loop.resume(
+        state=state,
+        decision=ExecuteDecision(),
+        tools=[{"name": "search", "input_schema": {}}, {"name": "send_email", "input_schema": {}}],
+        executor=_ok_executor,
+        confirm=_confirm_email,
+        static_system_prefix="SYS",
+        max_rounds=5,
+        cache_tool_rounds=True,
+    )
+    assert result.final_text == "sent"
+
+    # The resumed request: after the resumed round commits (send_email), the final call
+    # carries exactly one moving marker.
+    final_req = sdk.messages.captured_requests[-1]
+    all_tr_blocks = [
+        b
+        for m in final_req["messages"]
+        if isinstance(m.get("content"), list)
+        for b in m["content"]
+        if b.get("type") == "tool_result"
+    ]
+    marked = [b for b in all_tr_blocks if "cache_control" in b]
+    assert len(marked) == 1
+
+
+@pytest.mark.asyncio
+async def test_single_tool_result_marker_placement() -> None:
+    """1-round run: final no-tools request has the marker on that round's last tool_result."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_1", name="search", tool_input={}))
+    sdk.messages.responses.append(make_ok(text="answer"))
+
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_ok_executor,
+        max_rounds=3,
+        cache_tool_rounds=True,
+    )
+    # final (no-tools) request
+    final_req = sdk.messages.captured_requests[-1]
+    last_user = final_req["messages"][-1]
+    assert last_user["role"] == "user"
+    tr_blocks = [b for b in last_user["content"] if b.get("type") == "tool_result"]
+    assert len(tr_blocks) == 1
+    assert tr_blocks[-1].get("cache_control") == {"type": "ephemeral"}

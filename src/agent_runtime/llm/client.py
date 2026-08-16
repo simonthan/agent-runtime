@@ -140,7 +140,7 @@ class AnthropicClient:
         client: _AnthropicAPI,
         default_model: str = "claude-sonnet-4-6",
         default_max_tokens: int = 4096,
-        default_temperature: float = 0.0,
+        default_temperature: float | None = 0.0,
         audit_logger: AuditLogger | None = None,
     ) -> None:
         self._client = client
@@ -173,10 +173,14 @@ class AnthropicClient:
         create_kwargs: dict[str, Any] = {
             "model": chosen_model,
             "max_tokens": chosen_max_tokens,
-            "temperature": chosen_temperature,
             "system": system_blocks,
             "messages": messages,
         }
+        if chosen_temperature is not None:
+            # T-190: None ⇒ omit — newer model families hard-400 on an explicit
+            # temperature; omission defers to the API default. Default 0.0 keeps
+            # every existing caller byte-identical.
+            create_kwargs["temperature"] = chosen_temperature
         if tools:
             create_kwargs["tools"] = tools
 
@@ -239,6 +243,7 @@ class AnthropicClient:
         images: tuple[LLMImage, ...] = (),
         tools: list[dict[str, Any]] | None = None,
         cache_history: bool = False,
+        cache_retrieval: bool = True,
         max_tokens: int | None = None,
         temperature: float | None = None,
         model: str | None = None,
@@ -246,7 +251,10 @@ class AnthropicClient:
         """Send a completion request with ``cache_control`` ephemeral breakpoints.
 
         Breakpoint #1: ``static_system_prefix`` (always cached).
-        Breakpoint #2: ``retrieval_block`` (cached when present; prepended to user_message).
+        Breakpoint #2: ``retrieval_block`` (cached when present and
+        ``cache_retrieval=True``; prepended to user_message). Pass
+        ``cache_retrieval=False`` to skip the BP2 write for single-shot callers
+        whose retrieval block is never read back (T-190).
         Breakpoint #3 (opt-in): the last history message, marked when
         ``cache_history=True`` and ``history`` is non-empty — caches the stable
         conversation prefix so multi-turn sessions read it from cache (T-038a).
@@ -277,9 +285,13 @@ class AnthropicClient:
         user_content: list[dict[str, Any]] = []
         if retrieval_block:
             # Truthy check — see ``dynamic_system_suffix`` comment above.
-            user_content.append(
-                {"type": "text", "text": retrieval_block, "cache_control": {"type": "ephemeral"}}
-            )
+            block: dict[str, Any] = {"type": "text", "text": retrieval_block}
+            if cache_retrieval:
+                # T-190: opt-out for single-shot callers whose BP2 write is never
+                # read back (no rounds follow; cross-turn needs a byte-identical
+                # block). Default True = unchanged.
+                block["cache_control"] = {"type": "ephemeral"}
+            user_content.append(block)
         user_content.extend(img.to_block() for img in images)
         if user_message or not images:
             user_content.append({"type": "text", "text": user_message})

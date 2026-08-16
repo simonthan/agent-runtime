@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.26.0 — 2026-08-16
+
+### Added
+- `ToolUseLoop.run()` and `resume()` gain `cache_tool_rounds: bool = False` — a MOVING
+  ephemeral cache breakpoint (BP4, T-190) placed on the last tool_result block of the most
+  recently committed round. Each new round strips the previous round's marker (scan-by-type,
+  exact for tool_result blocks) before marking the current round, so the API's 4-marker limit
+  is never exceeded. Default `False` = byte-for-byte unchanged (regression guarantee).
+- `AnthropicClient.complete()` gains `cache_retrieval: bool = True` — opt-out for single-shot
+  callers whose BP2 retrieval write is provably never read back (no rounds follow, cross-turn
+  reuse needs a byte-identical block). Default `True` = unchanged.
+- `AnthropicClient.__init__` `default_temperature` type widens to `float | None = 0.0`.
+  Constructing with `default_temperature=None` omits `temperature` from SDK calls entirely,
+  deferring to the API default. Newer model families hard-400 on an explicit temperature=0;
+  omission is the safe forward-compatible choice. All existing callers unchanged.
+
 ## v0.25.1 — 2026-08-14
 
 ### Fixed

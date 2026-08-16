@@ -565,3 +565,59 @@ async def test_complete_images_block_order(
     last_history_content = last_history_msg["content"]
     assert isinstance(last_history_content, list)
     assert last_history_content[-1]["cache_control"] == {"type": "ephemeral"}
+
+
+# ---- T-190: cache_retrieval opt-out + temperature omission -----------------
+
+
+@pytest.mark.asyncio
+async def test_complete_cache_retrieval_false_omits_marker(
+    client: AnthropicClient, fake_sdk: FakeAsyncAnthropic
+) -> None:
+    """complete(retrieval_block="X", cache_retrieval=False): text block has no cache_control."""
+    fake_sdk.messages.responses.append(make_ok())
+    await client.complete(
+        static_system_prefix="STATIC",
+        user_message="hi",
+        retrieval_block="RETRIEVED",
+        cache_retrieval=False,
+    )
+    req = fake_sdk.messages.captured_requests[0]
+    user_msg = req["messages"][-1]
+    retrieval_block = next(
+        b for b in user_msg["content"] if b.get("type") == "text" and b.get("text") == "RETRIEVED"
+    )
+    assert "cache_control" not in retrieval_block
+
+
+@pytest.mark.asyncio
+async def test_default_temperature_none_omits_param() -> None:
+    """Client with default_temperature=None omits 'temperature' from SDK call entirely;
+    explicit per-call temperature=0.5 still sends it."""
+    fake_sdk = FakeAsyncAnthropic()
+    client_no_temp = AnthropicClient(client=fake_sdk, default_temperature=None)  # type: ignore[arg-type]
+
+    # No per-call override — temperature must be absent
+    fake_sdk.messages.responses.append(make_ok())
+    await client_no_temp.complete(static_system_prefix="STATIC", user_message="hi")
+    req = fake_sdk.messages.captured_requests[0]
+    assert "temperature" not in req
+
+    # Explicit per-call temperature overrides the None default
+    fake_sdk.messages.responses.append(make_ok())
+    await client_no_temp.complete(
+        static_system_prefix="STATIC", user_message="hi", temperature=0.5
+    )
+    req2 = fake_sdk.messages.captured_requests[1]
+    assert req2["temperature"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_default_temperature_unchanged(
+    client: AnthropicClient, fake_sdk: FakeAsyncAnthropic
+) -> None:
+    """Default client (temperature=0.0) still sends temperature=0.0 — regression guard."""
+    fake_sdk.messages.responses.append(make_ok())
+    await client.complete(static_system_prefix="STATIC", user_message="hi")
+    req = fake_sdk.messages.captured_requests[0]
+    assert req["temperature"] == 0.0
