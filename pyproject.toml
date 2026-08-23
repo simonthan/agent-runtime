@@ -1,6 +1,6 @@
 [project]
 name = "agent-runtime"
-version = "0.26.0"
+version = "0.27.0"
 description = "Shared runtime primitives for Microsoft Teams knowledge bots — resilience, safety, session flows, execution context. Consumed by teams-bot-platform and ithelpdesk."
 readme = "README.md"
 license = "MIT"
@@ -19,6 +19,7 @@ teams = [
     "botbuilder-schema>=4.15,<5",
     "aiohttp>=3.9,<4",
     "msal>=1.31,<2",
+    "pillow-heif>=0.16,<2",
 ]
 redis = ["redis>=5,<6"]
 postgres = ["asyncpg>=0.29,<1"]

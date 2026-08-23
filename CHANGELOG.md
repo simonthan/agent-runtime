@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.27.0 — 2026-08-22
+
+### Added
+- HEIC→JPEG transcoding for Teams inline images (T-134-b). `sniff_heif()` in
+  `agent_runtime.image_sniff` (dependency-free ftyp-box detection, re-exported from
+  `agent_runtime.llm`); `download_inline_image` now recovers iPhone HEIC photos by
+  transcoding to JPEG (quality 85, EXIF orientation baked in) in a worker thread inside
+  the existing 30 s deadline, then re-sniffing the output. Requires the new
+  `pillow-heif` dependency in the `[teams]` extra; when it is absent, or the payload is
+  corrupt, or the JPEG exceeds `max_bytes`, behavior degrades to the pre-existing
+  skip-one-image `InlineImageDownloadError`. Non-HEIC paths are byte-for-byte unchanged.
+
 ## v0.26.0 — 2026-08-16
 
 ### Added

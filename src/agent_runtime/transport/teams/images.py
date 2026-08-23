@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from agent_runtime.image_sniff import sniff_image_mime
+from agent_runtime.image_sniff import sniff_heif, sniff_image_mime
 from agent_runtime.transport.teams._msal import BoundedAppCredentials
 
 if TYPE_CHECKING:
@@ -57,6 +57,11 @@ _DOWNLOAD_TIMEOUT = httpx.Timeout(10.0, read=15.0)
 # more diagnostic ReadTimeout rather than an anonymous deadline expiry.
 # Read from the module global at call time so tests can patch it.
 _DOWNLOAD_DEADLINE_SECONDS = 30.0
+
+# T-134-b -- JPEG re-encode quality for recovered HEIC photos. 85 is the
+# conventional visually-lossless point; the model does not benefit from more.
+_HEIC_JPEG_QUALITY = 85
+
 
 class InlineImageDownloadError(Exception):
     """An inline image could not be downloaded or failed validation.
@@ -102,6 +107,32 @@ def _host_is_allowed(url: str, allowed_hosts: frozenset[str]) -> bool:
         return False
     host = parsed.hostname.lower()
     return any(host == allowed or host.endswith(f".{allowed}") for allowed in allowed_hosts)
+
+
+def _transcode_heif_to_jpeg(data: bytes) -> bytes:
+    """Decode a HEIF/HEIC payload and re-encode as baseline JPEG.
+
+    Runs in a worker thread (CPU-bound; pillow decode holds the GIL only in
+    slices). Imports are lazy and the caller catches ``Exception``: when the
+    optional ``pillow-heif`` dependency is absent, or the payload is a corrupt
+    HEIF container, the caller degrades to the pre-T-134-b behavior — skip the
+    one image. ``exif_transpose`` bakes the EXIF orientation in, since phone
+    photos are routinely stored rotated; alpha/other modes are flattened to RGB
+    because JPEG cannot carry them.
+    """
+    from io import BytesIO  # noqa: PLC0415 -- lazy on purpose, see docstring
+
+    from PIL import Image, ImageOps  # noqa: PLC0415 -- optional [teams] dep, lazy on purpose
+    from pillow_heif import register_heif_opener  # noqa: PLC0415 -- optional [teams] dep
+
+    register_heif_opener()
+    with Image.open(BytesIO(data)) as raw_im:
+        transposed = ImageOps.exif_transpose(raw_im)
+        if transposed.mode not in ("RGB", "L"):
+            transposed = transposed.convert("RGB")
+        out = BytesIO()
+        transposed.save(out, format="JPEG", quality=_HEIC_JPEG_QUALITY)
+        return out.getvalue()
 
 
 # T-115m -- credentials live for the process, keyed by the (frozen, hashable) value.
@@ -208,7 +239,30 @@ async def _stream_download(
         # exists to eliminate. Raising converts a mid-turn API failure into this module's
         # ordinary skip-one-image contract. Parameterised types need no stripping: the
         # sniffed value replaces the header string outright.
+        # T-134-b: HEIF/HEIC bytes are the one recovered case -- see the transcode branch below.
         sniffed = sniff_image_mime(data)
+        if sniffed is None and sniff_heif(data):
+            # T-134-b -- iPhone HEIC recovery. The transcode runs inside the
+            # caller's `asyncio.timeout(_DOWNLOAD_DEADLINE_SECONDS)` scope, so a
+            # pathological decode is cut off by the same wall clock as the
+            # download itself (the worker thread runs to completion in the
+            # background; its result is discarded). Type name only in the
+            # message, never str(exc) (SEC-2/SEC-3).
+            try:
+                data = await asyncio.to_thread(_transcode_heif_to_jpeg, data)
+            except Exception as exc:
+                msg = f"HEIC transcode failed: {type(exc).__name__}"
+                raise InlineImageDownloadError(msg) from exc
+            if len(data) > max_bytes:
+                # A 10 MiB HEIC can legally re-encode to a larger JPEG; the
+                # "no oversize bytes are ever returned" contract must hold for
+                # the transcoded payload too.
+                msg = f"Transcoded HEIC exceeded the {max_bytes}-byte cap"
+                raise InlineImageDownloadError(msg)
+            # Re-sniff the OUTPUT: the magic bytes stay the only authority for
+            # `mime`, so the T-134 invariant (mime ∈ Anthropic's four types)
+            # survives without a special case.
+            sniffed = sniff_image_mime(data)
         if sniffed is None:
             msg = (
                 "Inline image download returned a non-image payload "
@@ -237,9 +291,12 @@ async def download_inline_image(
     magic bytes decide ``DownloadedImage.mime``, which is therefore always one
     of Anthropic's four supported types (T-134). Teams' CDN serves real images
     as ``application/octet-stream`` (T-084b) and mislabels others outright, so
-    neither a declared type nor its absence is trusted. Oversize responses, and
-    responses whose bytes match no known image signature, raise with the partial
-    bytes discarded.
+    neither a declared type nor its absence is trusted. HEIF/HEIC payloads
+    (iPhone photos) are the one recovery: they are transcoded to JPEG in a
+    worker thread, inside the same wall-clock deadline, and re-sniffed — a
+    failed or oversize transcode degrades to the ordinary skip-one-image error
+    (T-134-b). Oversize responses, and responses whose bytes match no known
+    image signature, raise with the partial bytes discarded.
 
     ``client`` is an injectable ``httpx.AsyncClient`` for tests / connection
     pool reuse; when omitted, a client is created and closed for this call,
