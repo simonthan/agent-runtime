@@ -260,21 +260,6 @@ async def test_mislabelled_image_gets_the_sniffed_type_not_the_declared_one():
     assert result.mime == "image/jpeg"
 
 
-async def test_heic_is_rejected_at_the_transport_not_at_the_llm():
-    """T-134: iPhone HEIC is genuinely unsupported by Anthropic, so skipping is correct —
-    but it must surface as an image-download failure the consumer already handles, not as a
-    media-type ValueError three layers later."""
-    heic_bytes = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00heicmif1"
-
-    def _heic_handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=heic_bytes, headers={"content-type": "image/heic"})
-
-    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
-    client = _client_with_handler(_heic_handler)
-    with pytest.raises(InlineImageDownloadError, match="non-image payload"):
-        await download_inline_image(att, _CREDENTIALS, client=client)
-
-
 async def test_octet_stream_still_respects_size_cap():
     def _big_octet_handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -470,3 +455,77 @@ async def test_token_failure_message_carries_the_type_not_the_exception_text():
     # Exact equality, not a substring check: it proves nothing ELSE leaked into the message.
     assert str(excinfo.value) == "Failed to acquire Bot Framework connector token: ConnectTimeout"
     assert isinstance(excinfo.value.__cause__, ConnectTimeout)
+
+
+# ---------------------------------------------------------------------------
+# T-134-b: HEIC→JPEG transcoding
+# ---------------------------------------------------------------------------
+
+
+def _real_heic_bytes() -> bytes:
+    """A genuine tiny HEIC file, encoded at test time (no binary fixture in git)."""
+    pillow_heif = pytest.importorskip("pillow_heif")
+    from io import BytesIO
+
+    from PIL import Image
+
+    pillow_heif.register_heif_opener()
+    buf = BytesIO()
+    # format="HEIF" produces a generic HEVC-coded HEIF container — a superset
+    # variant of iPhone HEIC (which adds Apple metadata boxes). Detection is
+    # brand-based (`ftyp` + brand in _HEIF_BRANDS) so the variant difference is
+    # immaterial; the assert pins the property the branch actually keys on.
+    Image.new("RGB", (4, 4), (200, 30, 30)).save(buf, format="HEIF")
+    data = buf.getvalue()
+    assert data[4:8] == b"ftyp"
+    return data
+
+
+async def test_heic_payload_is_transcoded_to_jpeg():
+    heic = _real_heic_bytes()
+
+    def _heic_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=heic, headers={"content-type": "application/octet-stream"}
+        )
+
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    client = _client_with_handler(_heic_handler)
+    result = await download_inline_image(att, _CREDENTIALS, client=client)
+    assert result.mime == "image/jpeg"
+    assert result.data.startswith(b"\xff\xd8\xff")  # re-sniffed real JPEG bytes
+
+
+async def test_corrupt_heic_container_raises_skip_error():
+    """HEIF magic over garbage must degrade to the ordinary skip contract.
+
+    The missing-dependency case (ImportError from `import pillow_heif`) and a
+    corrupt payload (PIL raising on garbage) both land in the same `except
+    Exception` arm — one test covers both failure classes without simulating an
+    uninstalled package.
+    """
+    corrupt = b"\x00\x00\x00\x18ftypheic" + b"\x00" * 64
+
+    def _handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=corrupt)
+
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    client = _client_with_handler(_handler)
+    with pytest.raises(InlineImageDownloadError, match="HEIC transcode failed"):
+        await download_inline_image(att, _CREDENTIALS, client=client)
+
+
+async def test_oversize_transcode_output_raises(monkeypatch):
+    """A transcode that inflates past max_bytes must not return oversize bytes."""
+    heic = _real_heic_bytes()
+
+    def _heic_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=heic)
+
+    monkeypatch.setattr(
+        images, "_transcode_heif_to_jpeg", lambda _data: b"\xff\xd8\xff" + b"\x00" * 512
+    )
+    att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
+    client = _client_with_handler(_heic_handler)
+    with pytest.raises(InlineImageDownloadError, match="exceeded the"):
+        await download_inline_image(att, _CREDENTIALS, client=client, max_bytes=256)
