@@ -24,7 +24,7 @@ See ``agent_runtime.llm.client.AnthropicClient.complete`` docstring for the
 two-breakpoint cache contract (static system prefix + per-turn retrieval block).
 """
 
-from agent_runtime.image_sniff import sniff_image_mime
+from agent_runtime.image_sniff import sniff_heif, sniff_image_mime
 from agent_runtime.llm.client import AnthropicClient
 from agent_runtime.llm.compaction import (
     CompactionConfig,
@@ -99,5 +99,6 @@ __all__ = [
     "build_anthropic_sdk_client",
     "current_tool_round",
     "estimate_tokens",
+    "sniff_heif",
     "sniff_image_mime",
 ]
