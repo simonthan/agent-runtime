@@ -47,8 +47,9 @@ class FakeOutboundChannel:
         self.updates.append((activity_id, text))
         return True
 
-    async def send_card(self, card: dict) -> None:
+    async def send_card(self, card: dict) -> str | None:
         self.sent_cards.append(card)
+        return f"card-activity-{len(self.sent_cards)}"
 
     async def send_oauth_card(self, card: dict) -> None:
         self.sent_oauth_cards.append(card)

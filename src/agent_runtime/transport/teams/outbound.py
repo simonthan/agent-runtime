@@ -53,7 +53,7 @@ class OutboundChannel(Protocol):
     """Minimal outbound surface — text, Adaptive Card, OAuth Card, typing, edit-in-place."""
 
     async def send_text(self, text: str) -> str | None: ...
-    async def send_card(self, card: dict) -> None: ...
+    async def send_card(self, card: dict) -> str | None: ...
     async def send_oauth_card(self, card: dict) -> None: ...
     async def send_typing(self) -> None: ...
     async def update_activity(self, activity_id: str, text: str) -> bool: ...
@@ -123,11 +123,19 @@ class BotFrameworkOutboundChannel:
             return False
         return True
 
-    async def send_card(self, card: dict) -> None:
+    async def send_card(self, card: dict) -> str | None:
+        """Send an Adaptive Card activity; return the channel-assigned activity id.
+
+        Mirrors ``send_text``: the id is what ``update_activity`` targets (a consumer
+        superseding a stale approval card, T-237). ``or None`` for the same
+        empty-string-id reason documented on ``send_text`` above. Returns ``None``
+        when the card cannot be edited later. Send failures still RAISE.
+        """
         attachment = Attachment(content_type=_ADAPTIVE_CARD_CONTENT_TYPE, content=card)
-        await self._turn_context.send_activity(
+        response = await self._turn_context.send_activity(
             Activity(type=ActivityTypes.message, attachments=[attachment])
         )
+        return getattr(response, "id", None) or None
 
     async def send_oauth_card(self, card: dict) -> None:
         attachment = Attachment(content_type=_OAUTH_CARD_CONTENT_TYPE, content=card)

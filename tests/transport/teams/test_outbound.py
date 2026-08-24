@@ -208,6 +208,27 @@ async def test_get_sign_in_resource_does_not_block_the_event_loop(turn_context):
     assert observed["concurrent_ran_first"] is True
 
 
+async def test_send_card_returns_activity_id(turn_context):
+    turn_context.send_activity = AsyncMock(return_value=ResourceResponse(id="abc"))
+    channel = BotFrameworkOutboundChannel(turn_context)
+    card = {"type": "AdaptiveCard", "version": "1.4", "body": []}
+    assert await channel.send_card(card) == "abc"
+
+
+async def test_send_card_returns_none_when_no_resource_response(turn_context):
+    turn_context.send_activity = AsyncMock(return_value=None)
+    channel = BotFrameworkOutboundChannel(turn_context)
+    assert await channel.send_card({}) is None
+
+
+async def test_send_card_normalises_empty_id_to_none(turn_context):
+    """botbuilder substitutes ResourceResponse(id="") when the Connector response is
+    falsy — empty string must normalise to None for the same reason as send_text."""
+    turn_context.send_activity = AsyncMock(return_value=ResourceResponse(id=""))
+    channel = BotFrameworkOutboundChannel(turn_context)
+    assert await channel.send_card({}) is None
+
+
 async def test_get_sign_in_resource_times_out_instead_of_hanging(turn_context, monkeypatch, caplog):
     """T-134: msrest's only bound on this round trip is a per-phase `timeout=100`, and
     `to_thread` is uncancellable, so a stalled token service hung EVERY SSO-prompting turn

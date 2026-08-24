@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.28.0 — 2026-08-24
+- `OutboundChannel.send_card` now returns the posted activity id (`str | None`),
+  mirroring `send_text`. Backwards-compatible widening: implementations returning
+  `None` remain valid. Enables card supersede via `update_activity` (TBP T-237).
+- `FakeOutboundChannel.send_card` returns a synthetic `card-activity-N` id.
+
 ## v0.27.0 — 2026-08-22
 
 ### Added

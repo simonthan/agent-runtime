@@ -81,3 +81,12 @@ async def test_fake_update_activity_unsupported_returns_false():
     fake = FakeOutboundChannel(supports_update=False)
     assert await fake.update_activity("activity-1", "x") is False
     assert fake.updates == []
+
+
+async def test_fake_send_card_returns_incrementing_activity_ids():
+    fake = FakeOutboundChannel()
+    card1 = {"type": "AdaptiveCard", "body": [{"type": "TextBlock", "text": "one"}]}
+    card2 = {"type": "AdaptiveCard", "body": [{"type": "TextBlock", "text": "two"}]}
+    assert await fake.send_card(card1) == "card-activity-1"
+    assert await fake.send_card(card2) == "card-activity-2"
+    assert fake.sent_cards == [card1, card2]
