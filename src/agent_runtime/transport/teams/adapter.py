@@ -178,7 +178,7 @@ class _EventDispatchingHandler(ActivityHandler):
                         ) or "unknown",
                     )
                 except Exception:  # noqa: BLE001
-                    logger.warning("on_identity_failed_hook_raised")
+                    logger.warning("on_identity_failed_hook_raised", exc_info=True)
             return
         # Non-dict activity.value (e.g. typed MessagingExtensionQuery objects in
         # botbuilder ≥4.16) is intentionally coerced to None until a richer event
