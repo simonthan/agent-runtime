@@ -35,6 +35,7 @@ __all__ = [
     "ExecuteDecision",
     "InjectResultDecision",
     "PendingConfirmation",
+    "PreCompletionHook",
     "ResumeDecision",
     "ToolCall",
     "ToolExecutor",
@@ -110,6 +111,10 @@ class ToolResult:
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[ToolResult]]
 # (tool_name, tool_input) -> True if this call must be confirmed before dispatch.
 ConfirmPredicate = Callable[[str, dict[str, Any]], bool]
+# T-284: optional hook invoked before each LLM call inside _drive().
+# Returns None to proceed normally, or a string to inject as a system
+# instruction for a forced-final call (no further tool rounds).
+PreCompletionHook = Callable[[], str | None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,6 +280,7 @@ class ToolUseLoop:
         max_result_chars: int | None = None,
         max_turn_images: int | None = None,
         max_turn_image_bytes: int | None = None,
+        pre_completion_hook: PreCompletionHook | None = None,
     ) -> ToolLoopResult:
         """Run the fenced loop. `max_rounds` caps model turns that return
         stop_reason=='tool_use'. Returns once the model stops requesting tools, the
@@ -354,6 +360,7 @@ class ToolUseLoop:
             max_turn_images=max_turn_images,
             max_turn_image_bytes=max_turn_image_bytes,
             cache_tool_rounds=cache_tool_rounds,
+            pre_completion_hook=pre_completion_hook,
         )
 
     async def resume(
@@ -374,6 +381,7 @@ class ToolUseLoop:
         max_result_chars: int | None = None,
         max_turn_images: int | None = None,
         max_turn_image_bytes: int | None = None,
+        pre_completion_hook: PreCompletionHook | None = None,
     ) -> ToolLoopResult:
         """Resume a loop suspended by a confirm-required tool. `state` is the opaque
         dict from `PendingConfirmation.state` (may have been JSON round-tripped through
@@ -508,6 +516,7 @@ class ToolUseLoop:
             max_turn_images=max_turn_images,
             max_turn_image_bytes=max_turn_image_bytes,
             cache_tool_rounds=cache_tool_rounds,
+            pre_completion_hook=pre_completion_hook,
         )
 
     async def _drive(
@@ -530,10 +539,26 @@ class ToolUseLoop:
         max_turn_images: int | None,
         max_turn_image_bytes: int | None,
         cache_tool_rounds: bool = False,
+        pre_completion_hook: PreCompletionHook | None = None,
     ) -> ToolLoopResult:
         """Shared round engine. `while rounds < max_rounds` (correct at the
-        max_rounds=0 boundary — zero tool rounds, straight to the forced answer)."""
+        max_rounds=0 boundary — zero tool rounds, straight to the forced answer).
+
+        T-284: `pre_completion_hook`, when supplied, is called before each model
+        call AND before the forced-final call. If it returns a non-None string:
+        (a) inside the while loop: break, skipping remaining tool rounds;
+        (b) the string is appended as an uncached system block to the forced-final
+        call so the model sees the wrap-up instruction.
+        Policy-free: the hook owns the threshold check and the instruction text;
+        the loop only handles injection mechanics."""
+        wrap_up_text: str | None = None
+        cap_reached = False
         while rounds < max_rounds:
+            # T-284 — check wrap-up hook before each LLM call
+            if pre_completion_hook is not None and wrap_up_text is None:
+                wrap_up_text = pre_completion_hook()
+                if wrap_up_text is not None:
+                    break
             resp = await self._client.complete_messages(
                 system_blocks=system_blocks,
                 messages=messages,
@@ -582,12 +607,24 @@ class ToolUseLoop:
                 calls=outcome.calls,
                 cache_tool_rounds=cache_tool_rounds,
             )
+        else:
+            cap_reached = True
 
-        # Cap reached (or max_rounds==0). ONE final model call WITHOUT tools so the
-        # model must answer from what it has — no dangling tool_use possible.
-        self._audit.warning("tool_loop_cap_exhausted", rounds=rounds, max_rounds=max_rounds)
+        # T-284 — check hook before forced-final (covers cap-exhaustion case)
+        if wrap_up_text is None and pre_completion_hook is not None:
+            wrap_up_text = pre_completion_hook()
+
+        effective_system = system_blocks
+        if wrap_up_text is not None:
+            effective_system = [*system_blocks, {"type": "text", "text": wrap_up_text}]
+            self._audit.info("tool_loop_wrap_up_injected", rounds=rounds, max_rounds=max_rounds)
+
+        if cap_reached:
+            # Preserve existing audit event — monitors key off this.
+            self._audit.warning("tool_loop_cap_exhausted", rounds=rounds, max_rounds=max_rounds)
+
         final = await self._client.complete_messages(
-            system_blocks=system_blocks,
+            system_blocks=effective_system,
             messages=messages,
             tools=None,
             model=model,
@@ -596,7 +633,11 @@ class ToolUseLoop:
         )
         self._accumulate(agg, final)
         return self._result(
-            final.content, "cap_exhausted", cap_exhausted=True, steps=steps, agg=agg
+            final.content,
+            "cap_exhausted" if cap_reached else final.stop_reason,
+            cap_exhausted=cap_reached,
+            steps=steps,
+            agg=agg,
         )
 
     async def _resolve_round(

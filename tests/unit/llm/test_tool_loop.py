@@ -2045,3 +2045,229 @@ async def test_single_tool_result_marker_placement() -> None:
     tr_blocks = [b for b in last_user["content"] if b.get("type") == "tool_result"]
     assert len(tr_blocks) == 1
     assert tr_blocks[-1].get("cache_control") == {"type": "ephemeral"}
+
+
+# ── T-284: pre_completion_hook ────────────────────────────────────────────────
+
+
+class _CapturingAuditLogger:
+    """Minimal AuditLogger that records (level, message, kwargs) tuples."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, dict]] = []
+
+    def debug(self, message: str, **kwargs: object) -> None:
+        self.events.append(("debug", message, kwargs))
+
+    def info(self, message: str, **kwargs: object) -> None:
+        self.events.append(("info", message, kwargs))
+
+    def warning(self, message: str, **kwargs: object) -> None:
+        self.events.append(("warning", message, kwargs))
+
+    def error(self, message: str, **kwargs: object) -> None:
+        self.events.append(("error", message, kwargs))
+
+    def security(self, message: str, **kwargs: object) -> None:
+        self.events.append(("security", message, kwargs))
+
+    def action(self, action: str, result: str, **kwargs: object) -> None:
+        self.events.append(("action", action, kwargs))
+
+
+@pytest.mark.asyncio
+async def test_pre_completion_hook_returns_none_no_change() -> None:
+    """Hook always returns None → loop behaves identically to no-hook (1 tool round + answer)."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_1", name="search"))
+    sdk.messages.responses.append(make_ok(text="done"))
+
+    call_count = 0
+
+    def hook() -> str | None:
+        nonlocal call_count
+        call_count += 1
+        return None
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_ok_executor,
+        max_rounds=3,
+        pre_completion_hook=hook,
+    )
+
+    assert result.cap_exhausted is False
+    assert result.stop_reason == "end_turn"
+    assert len(result.steps) == 1
+    assert result.final_text == "done"
+    # Hook was called at least once (before the first round)
+    assert call_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_pre_completion_hook_fires_before_first_round() -> None:
+    """Hook returns text on first call → no tool rounds, forced-final carries injected text."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    # Only queue the forced-final response — no tool rounds should execute
+    sdk.messages.responses.append(make_ok(text="wrapped up"))
+
+    _wrap_up_text = "Please wrap up your response now."
+
+    def hook() -> str | None:
+        return _wrap_up_text
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_never_called,
+        max_rounds=3,
+        pre_completion_hook=hook,
+    )
+
+    assert result.cap_exhausted is False
+    assert result.stop_reason == "end_turn"
+    assert result.final_text == "wrapped up"
+    # Exactly 1 SDK call (the forced-final, no tool rounds)
+    assert len(sdk.messages.captured_requests) == 1
+    # The forced-final carries the injected text in system
+    final_req = sdk.messages.captured_requests[0]
+    assert any(
+        b.get("type") == "text" and b.get("text") == _wrap_up_text
+        for b in final_req["system"]
+    )
+    # No tools in forced-final call
+    assert "tools" not in final_req
+
+
+@pytest.mark.asyncio
+async def test_pre_completion_hook_fires_between_rounds() -> None:
+    """Hook returns None first, then text: only 1 tool round executes, forced-final injected."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_1", name="search"))
+    sdk.messages.responses.append(make_ok(text="wrapped after 1 round"))
+
+    call_count = 0
+    _wrap_up_text = "Time to wrap up."
+
+    def hook() -> str | None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return None  # Let first round proceed
+        return _wrap_up_text
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_ok_executor,
+        max_rounds=5,
+        pre_completion_hook=hook,
+    )
+
+    assert result.cap_exhausted is False
+    assert result.stop_reason == "end_turn"
+    assert len(result.steps) == 1  # Only 1 tool round completed
+    assert result.final_text == "wrapped after 1 round"
+    # Forced-final carries the injected text in system
+    final_req = sdk.messages.captured_requests[-1]
+    assert any(
+        b.get("type") == "text" and b.get("text") == _wrap_up_text
+        for b in final_req["system"]
+    )
+    assert "tools" not in final_req
+
+
+@pytest.mark.asyncio
+async def test_pre_completion_hook_fires_at_cap_exhaustion() -> None:
+    """Hook returns None inside loop; AFTER cap exhaustion returns text.
+    Both tool_loop_wrap_up_injected (INFO) and tool_loop_cap_exhausted (WARNING) fire."""
+    fake_sdk = FakeAsyncAnthropic()
+    audit = _CapturingAuditLogger()
+    client = _make_client(fake_sdk)
+    loop = ToolUseLoop(client=client, audit_logger=audit)
+
+    fake_sdk.messages.responses.append(make_tool_use(tool_id="tu_a"))
+    fake_sdk.messages.responses.append(make_tool_use(tool_id="tu_b"))
+    fake_sdk.messages.responses.append(make_ok(text="forced final"))
+
+    call_count = 0
+    _wrap_up_text = "Summarise what you found so far."
+
+    def hook() -> str | None:
+        nonlocal call_count
+        call_count += 1
+        # max_rounds=2 → hook is called twice inside loop (before each LLM call),
+        # then once after the loop exits normally (cap reached)
+        if call_count <= 2:
+            return None
+        return _wrap_up_text
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_ok_executor,
+        max_rounds=2,
+        pre_completion_hook=hook,
+    )
+
+    assert result.cap_exhausted is True
+    assert result.stop_reason == "cap_exhausted"
+    assert result.final_text == "forced final"
+
+    # Both audit events must fire
+    info_events = [
+        e for e in audit.events if e[0] == "info" and e[1] == "tool_loop_wrap_up_injected"
+    ]
+    warn_events = [
+        e for e in audit.events if e[0] == "warning" and e[1] == "tool_loop_cap_exhausted"
+    ]
+    assert len(info_events) == 1, f"expected 1 info wrap_up event, got {info_events}"
+    assert len(warn_events) == 1, f"expected 1 warning cap_exhausted event, got {warn_events}"
+
+    # Forced-final carries the injected text in system
+    final_req = fake_sdk.messages.captured_requests[-1]
+    assert any(
+        b.get("type") == "text" and b.get("text") == _wrap_up_text
+        for b in final_req["system"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_pre_completion_hook_at_max_rounds_zero() -> None:
+    """max_rounds=0: while loop skipped, hook fires at post-loop check, wrap-up injected."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(make_ok(text="immediate wrap"))
+
+    _wrap_up_text = "Zero rounds — wrap up immediately."
+
+    def hook() -> str | None:
+        return _wrap_up_text
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=_never_called,
+        max_rounds=0,
+        pre_completion_hook=hook,
+    )
+
+    assert result.cap_exhausted is True
+    assert result.final_text == "immediate wrap"
+    # Only 1 SDK call (the forced-final)
+    assert len(sdk.messages.captured_requests) == 1
+    final_req = sdk.messages.captured_requests[0]
+    assert any(
+        b.get("type") == "text" and b.get("text") == _wrap_up_text
+        for b in final_req["system"]
+    )
+    assert "tools" not in final_req
