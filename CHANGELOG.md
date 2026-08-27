@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.29.0 — 2026-08-27
+
+### Added
+- `ToolUseLoop.run()` / `.resume()` accept an optional `pre_completion_hook`
+  callback (`Callable[[], str | None]`). Invoked before each LLM call inside
+  `_drive()` and before the forced-final call. When the hook returns a string,
+  remaining tool rounds are skipped and the string is injected as an uncached
+  system block for the forced-final call. Enables consumers to implement
+  time-budget guards without modifying the loop. Emits `tool_loop_wrap_up_injected`
+  audit INFO when triggered. Default `None` = no hook = byte-for-byte unchanged.
+  (TBP T-284)
+
 ## v0.28.0 — 2026-08-24
 - `OutboundChannel.send_card` now returns the posted activity id (`str | None`),
   mirroring `send_text`. Backwards-compatible widening: implementations returning
