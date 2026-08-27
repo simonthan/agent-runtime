@@ -70,6 +70,7 @@ async def test_resolve_identity_drops_when_graph_raises_because_email_unavailabl
     messages = [r.message for r in caplog.records]
     assert any("TeamsInfo.get_member failed" in m for m in messages)
     assert any("Dropping inbound activity" in m for m in messages)
+    assert any("conversation_type=personal" in r.getMessage() for r in caplog.records)
 
 
 @patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)

@@ -16,6 +16,7 @@ from botbuilder.core import (
 )
 from botbuilder.schema import (
     Activity,
+    ActivityTypes,  # T-286: used in best-effort reply
     ChannelAccount,
     ConversationAccount,
     ConversationReference,
@@ -23,6 +24,7 @@ from botbuilder.schema import (
 )
 from botframework.connector.auth import AuthenticationConstants
 
+from agent_runtime.safety import mask_telemetry
 from agent_runtime.transport.teams._msal import BoundedAppCredentials
 from agent_runtime.transport.teams.events import (
     ConversationRef,
@@ -45,6 +47,12 @@ logger = logging.getLogger(__name__)
 # Teams delivers a 1:1 chat file upload as an attachment with this contentType;
 # its `content.uniqueId` is the OneDrive driveItem id (the read-on-demand key).
 _TEAMS_FILE_DOWNLOAD_INFO = "application/vnd.microsoft.teams.file.download.info"
+
+# T-286: best-effort reply when identity resolution fails.
+_IDENTITY_FAIL_REPLY = (
+    "I'm unable to process messages in this conversation. "
+    "Please try messaging me in a direct chat."
+)
 
 
 def _extract_file_attachments(raw: list | None) -> tuple[FileAttachment, ...]:
@@ -146,6 +154,31 @@ class _EventDispatchingHandler(ActivityHandler):
     async def on_message_activity(self, turn_context: TurnContext) -> None:
         ref = await resolve_identity(turn_context)
         if ref is None:
+            # T-286: best-effort reply — user must never lose a message silently.
+            try:
+                await turn_context.send_activity(
+                    Activity(type=ActivityTypes.message, text=_IDENTITY_FAIL_REPLY)
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "identity_fail_reply_send_failed from_id=%s error=%s",
+                    turn_context.activity.from_property.id,
+                    mask_telemetry(str(exc)),
+                )
+            # Notify consumer handler if it implements the optional audit hook.
+            hook = getattr(self._handler, "on_identity_failed", None)
+            if hook is not None:
+                activity = turn_context.activity
+                try:
+                    await hook(
+                        from_id=getattr(activity.from_property, "id", "") or "",
+                        aad_object_id=getattr(activity.from_property, "aad_object_id", "") or "",
+                        conversation_type=getattr(
+                            activity.conversation, "conversation_type", ""
+                        ) or "unknown",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning("on_identity_failed_hook_raised", exc_info=True)
             return
         # Non-dict activity.value (e.g. typed MessagingExtensionQuery objects in
         # botbuilder ≥4.16) is intentionally coerced to None until a richer event

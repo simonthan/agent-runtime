@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.30.0 — 2026-08-27
+
+### Added
+- Best-effort reply on identity-resolution failure in `on_message_activity`: the
+  user now sees "I'm unable to process messages in this conversation" instead of
+  a silent drop. Reply failure is swallowed (never raises). (TBP T-286)
+- Optional `on_identity_failed` hook call (duck-typed via `getattr`) on the
+  consumer's `TeamsHandler` — passes `from_id`, `aad_object_id`, and
+  `conversation_type` for consumer-side audit. (TBP T-286)
+- `conversation_type` added to the "Dropping inbound activity" WARNING in
+  `resolve_identity` for surface diagnosis. (TBP T-286)
+
 ## v0.29.0 — 2026-08-27
 
 ### Added

@@ -153,12 +153,14 @@ async def resolve_identity(turn_context: TurnContext) -> ConversationRef | None:
         aad_object_id = getattr(from_info, "aad_object_id", "") or ""
 
     if not email:
+        conv_type = getattr(activity.conversation, "conversation_type", "") or "unknown"
         logger.warning(
             "Dropping inbound activity — no email resolved for Teams user "
-            "(from_id=%s aad_object_id=%s). Either TeamsInfo.get_member failed "
-            "or returned an empty email.",
+            "(from_id=%s aad_object_id=%s conversation_type=%s). Either "
+            "TeamsInfo.get_member failed or returned an empty email.",
             from_info.id,
             aad_object_id,
+            conv_type,
         )
         return None
 
