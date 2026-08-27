@@ -4,6 +4,8 @@ import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from botbuilder.core import TurnContext
+from botbuilder.schema import ActivityTypes
 from botframework.connector.auth import AuthenticationConstants, MicrosoftAppCredentials
 
 from agent_runtime.transport.teams import TeamsAdapter, TeamsAdapterConfig
@@ -192,3 +194,124 @@ async def test_warm_gate_mirrors_the_sdk_gate_literally(_mock_token):  # noqa: P
     blank_secret = TeamsAdapter(TeamsAdapterConfig("a", "", "t"), _NoOpHandler())
     assert await blank_secret.warm_connector_token() is True
     _mock_token.assert_called_once()
+
+
+async def test_on_message_sends_best_effort_reply_when_identity_fails():
+    """T-286: a message whose identity can't be resolved gets a user-visible
+    reply instead of being silently dropped."""
+    sent: list[str] = []
+
+    class _TrackingHandler:
+        async def on_event(self, event, outbound):
+            return None
+
+    async def _dispatch(_activity, _auth_header, callback):
+        ctx = MagicMock()
+        ctx.activity = MagicMock()
+        ctx.activity.type = ActivityTypes.message
+        ctx.activity.from_property = MagicMock(id="29:test", aad_object_id="", name="Test")
+        ctx.activity.value = None
+        ctx.activity.attachments = None
+        ctx.send_activity = AsyncMock(side_effect=lambda a: sent.append(a.text))
+        await callback(ctx)
+
+    adapter = TeamsAdapter(TeamsAdapterConfig("a", "p", "t"), _TrackingHandler())
+    adapter._adapter.process_activity = _dispatch
+
+    with (
+        patch(
+            "agent_runtime.transport.teams.adapter.resolve_identity",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch.object(TurnContext, "remove_recipient_mention", return_value="hello"),
+    ):
+        await adapter.process_activity({"type": "message"}, auth_header="Bearer x")
+
+    assert len(sent) == 1
+    assert "unable to process" in sent[0].lower()
+
+
+async def test_on_message_calls_identity_failed_hook_when_identity_fails():
+    """T-286: the adapter calls on_identity_failed on the handler if it exists."""
+    hook_calls: list[dict] = []
+
+    class _HookHandler:
+        async def on_event(self, event, outbound):
+            return None
+
+        async def on_identity_failed(self, *, from_id, aad_object_id, conversation_type):
+            hook_calls.append({
+                "from_id": from_id,
+                "aad_object_id": aad_object_id,
+                "conversation_type": conversation_type,
+            })
+
+    async def _dispatch(_activity, _auth_header, callback):
+        ctx = MagicMock()
+        ctx.activity = MagicMock()
+        ctx.activity.type = ActivityTypes.message
+        ctx.activity.from_property = MagicMock(
+            id="29:test", aad_object_id="oid-123", name="Test"
+        )
+        ctx.activity.conversation = MagicMock(conversation_type="groupChat")
+        ctx.activity.value = None
+        ctx.activity.attachments = None
+        ctx.send_activity = AsyncMock()
+        await callback(ctx)
+
+    adapter = TeamsAdapter(TeamsAdapterConfig("a", "p", "t"), _HookHandler())
+    adapter._adapter.process_activity = _dispatch
+
+    with (
+        patch(
+            "agent_runtime.transport.teams.adapter.resolve_identity",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch.object(TurnContext, "remove_recipient_mention", return_value="hello"),
+    ):
+        await adapter.process_activity({"type": "message"}, auth_header="Bearer x")
+
+    assert len(hook_calls) == 1
+    assert hook_calls[0]["from_id"] == "29:test"
+    assert hook_calls[0]["aad_object_id"] == "oid-123"
+    assert hook_calls[0]["conversation_type"] == "groupChat"
+
+
+async def test_on_message_swallows_reply_failure_and_still_calls_hook():
+    """T-286: if the best-effort reply fails, the hook still fires."""
+    hook_calls: list[dict] = []
+
+    class _HookHandler:
+        async def on_event(self, event, outbound):
+            return None
+
+        async def on_identity_failed(self, *, from_id, aad_object_id, conversation_type):
+            hook_calls.append({"from_id": from_id})
+
+    async def _dispatch(_activity, _auth_header, callback):
+        ctx = MagicMock()
+        ctx.activity = MagicMock()
+        ctx.activity.type = ActivityTypes.message
+        ctx.activity.from_property = MagicMock(id="29:test", aad_object_id="", name="Test")
+        ctx.activity.conversation = MagicMock(conversation_type="personal")
+        ctx.activity.value = None
+        ctx.activity.attachments = None
+        ctx.send_activity = AsyncMock(side_effect=RuntimeError("Connector refused"))
+        await callback(ctx)
+
+    adapter = TeamsAdapter(TeamsAdapterConfig("a", "p", "t"), _HookHandler())
+    adapter._adapter.process_activity = _dispatch
+
+    with (
+        patch(
+            "agent_runtime.transport.teams.adapter.resolve_identity",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch.object(TurnContext, "remove_recipient_mention", return_value="hello"),
+    ):
+        await adapter.process_activity({"type": "message"}, auth_header="Bearer x")
+
+    assert len(hook_calls) == 1  # hook fired despite reply failure
