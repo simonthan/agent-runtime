@@ -5,6 +5,7 @@ Public surface:
 - ``AnthropicClient`` — async client with ``complete()`` / ``complete_messages()`` methods
 - ``build_anthropic_sdk_client`` — provider factory (public Anthropic API vs Azure AI Foundry)
 - ``ClaudeResponse`` — frozen dataclass with token-usage + cache-stats
+- ``GROUNDED_DELIVERY_INSTRUCTIONS`` — shared system-prompt guard (grounded delivery, T-300)
 - ``Message`` / ``History`` — conversation history types
 - ``LLMImage`` / ``ANTHROPIC_IMAGE_MEDIA_TYPES`` — base64 image content blocks for the
   first user message (T-067d vision passthrough)
@@ -40,6 +41,7 @@ from agent_runtime.llm.errors import (
     LLMResponseError,
 )
 from agent_runtime.llm.factory import build_anthropic_sdk_client
+from agent_runtime.llm.prompt_guards import GROUNDED_DELIVERY_INSTRUCTIONS
 from agent_runtime.llm.models import (
     ANTHROPIC_IMAGE_MEDIA_TYPES,
     ClaudeResponse,
@@ -77,6 +79,7 @@ __all__ = [
     "CompactionResult",
     "ConfirmPredicate",
     "ExecuteDecision",
+    "GROUNDED_DELIVERY_INSTRUCTIONS",
     "History",
     "InjectResultDecision",
     "LLMAPIError",
