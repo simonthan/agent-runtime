@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.31.0 — 2026-08-28
+
+### Added
+
+- `llm.prompt_guards.GROUNDED_DELIVERY_INSTRUCTIONS` shared system-prompt guard (TBP T-300).
+
 ## v0.30.0 — 2026-08-27
 
 ### Added
