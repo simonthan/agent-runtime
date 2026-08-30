@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.32.0 — 2026-08-29
+
+### Added
+
+- `ANTI_RETRACTION_INSTRUCTIONS` prompt guard (T-313).
+
 ## v0.31.0 — 2026-08-28
 
 ### Added
