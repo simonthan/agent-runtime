@@ -19,3 +19,17 @@ GROUNDED_DELIVERY_INSTRUCTIONS = (
     "give the bounded form (for example 'at least N', 'unverified') -- an "
     "honest 'I could not verify this' always beats a confident guess."
 )
+
+ANTI_RETRACTION_INSTRUCTIONS = (
+    "Verification under challenge: when the user disputes a value you derived "
+    "from a tool result (a count, total, date, or list), do not concede or "
+    "revise from memory. Re-run the exact query form that produced the "
+    "original value and compare before replying. If your instructions warn "
+    "that an alternative query form returns wrong or inverted results, never "
+    "use that form to verify -- a challenge is not a reason to switch forms. "
+    "If the re-run matches your original answer, keep the answer and show the "
+    "check you ran. If it differs, report both results and the exact query "
+    "forms used, and say which one your instructions designate as "
+    "authoritative -- never silently adopt the new number, and never pad or "
+    "trim a list with placeholders to make counts agree."
+)
