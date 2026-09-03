@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.32.1 — 2026-09-02
+
+### Changed
+
+- `transport.teams.images.transcode_heif_to_jpeg` is now public; `_transcode_heif_to_jpeg` stays as a one-release alias (removed in v0.33). (TBP T-338)
+
 ## v0.32.0 — 2026-08-29
 
 ### Added
