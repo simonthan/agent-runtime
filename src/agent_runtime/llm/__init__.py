@@ -42,7 +42,10 @@ from agent_runtime.llm.errors import (
     LLMResponseError,
 )
 from agent_runtime.llm.factory import build_anthropic_sdk_client
-from agent_runtime.llm.prompt_guards import ANTI_RETRACTION_INSTRUCTIONS, GROUNDED_DELIVERY_INSTRUCTIONS
+from agent_runtime.llm.prompt_guards import (
+    ANTI_RETRACTION_INSTRUCTIONS,
+    GROUNDED_DELIVERY_INSTRUCTIONS,
+)
 from agent_runtime.llm.models import (
     ANTHROPIC_IMAGE_MEDIA_TYPES,
     ClaudeResponse,

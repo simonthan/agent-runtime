@@ -1838,8 +1838,12 @@ async def test_cache_tool_rounds_marks_last_tool_result() -> None:
     fake_sdk = FakeAsyncAnthropic()
     loop, sdk = _make_loop(fake_sdk)
     # Round 1: tool_use -> round 2: tool_use -> final answer
-    sdk.messages.responses.append(make_tool_use(tool_id="tu_1", name="search", tool_input={"q": "a"}))
-    sdk.messages.responses.append(make_tool_use(tool_id="tu_2", name="search", tool_input={"q": "b"}))
+    sdk.messages.responses.append(
+        make_tool_use(tool_id="tu_1", name="search", tool_input={"q": "a"})
+    )
+    sdk.messages.responses.append(
+        make_tool_use(tool_id="tu_2", name="search", tool_input={"q": "b"})
+    )
     sdk.messages.responses.append(make_ok(text="done"))
 
     result = await loop.run(
@@ -1973,7 +1977,9 @@ async def test_cache_tool_rounds_resume_strips_state_marker() -> None:
     # then suspend on round 2.  Use two separate rounds instead: round 1 commits (search),
     # round 2 triggers confirm on send_email.
     sdk.messages.responses.append(make_tool_use(tool_id="tu_1", name="search", tool_input={}))
-    sdk.messages.responses.append(make_tool_use(tool_id="tu_w", name="send_email", tool_input={"to": "x"}))
+    sdk.messages.responses.append(
+        make_tool_use(tool_id="tu_w", name="send_email", tool_input={"to": "x"})
+    )
 
     _confirm_email = lambda name, _inp: name == "send_email"  # noqa: E731
 
@@ -2137,8 +2143,7 @@ async def test_pre_completion_hook_fires_before_first_round() -> None:
     # The forced-final carries the injected text in system
     final_req = sdk.messages.captured_requests[0]
     assert any(
-        b.get("type") == "text" and b.get("text") == _wrap_up_text
-        for b in final_req["system"]
+        b.get("type") == "text" and b.get("text") == _wrap_up_text for b in final_req["system"]
     )
     # No tools in forced-final call
     assert "tools" not in final_req
@@ -2178,8 +2183,7 @@ async def test_pre_completion_hook_fires_between_rounds() -> None:
     # Forced-final carries the injected text in system
     final_req = sdk.messages.captured_requests[-1]
     assert any(
-        b.get("type") == "text" and b.get("text") == _wrap_up_text
-        for b in final_req["system"]
+        b.get("type") == "text" and b.get("text") == _wrap_up_text for b in final_req["system"]
     )
     assert "tools" not in final_req
 
@@ -2235,8 +2239,7 @@ async def test_pre_completion_hook_fires_at_cap_exhaustion() -> None:
     # Forced-final carries the injected text in system
     final_req = fake_sdk.messages.captured_requests[-1]
     assert any(
-        b.get("type") == "text" and b.get("text") == _wrap_up_text
-        for b in final_req["system"]
+        b.get("type") == "text" and b.get("text") == _wrap_up_text for b in final_req["system"]
     )
 
 
@@ -2267,7 +2270,6 @@ async def test_pre_completion_hook_at_max_rounds_zero() -> None:
     assert len(sdk.messages.captured_requests) == 1
     final_req = sdk.messages.captured_requests[0]
     assert any(
-        b.get("type") == "text" and b.get("text") == _wrap_up_text
-        for b in final_req["system"]
+        b.get("type") == "text" and b.get("text") == _wrap_up_text for b in final_req["system"]
     )
     assert "tools" not in final_req

@@ -241,19 +241,19 @@ async def test_on_message_calls_identity_failed_hook_when_identity_fails():
             return None
 
         async def on_identity_failed(self, *, from_id, aad_object_id, conversation_type):
-            hook_calls.append({
-                "from_id": from_id,
-                "aad_object_id": aad_object_id,
-                "conversation_type": conversation_type,
-            })
+            hook_calls.append(
+                {
+                    "from_id": from_id,
+                    "aad_object_id": aad_object_id,
+                    "conversation_type": conversation_type,
+                }
+            )
 
     async def _dispatch(_activity, _auth_header, callback):
         ctx = MagicMock()
         ctx.activity = MagicMock()
         ctx.activity.type = ActivityTypes.message
-        ctx.activity.from_property = MagicMock(
-            id="29:test", aad_object_id="oid-123", name="Test"
-        )
+        ctx.activity.from_property = MagicMock(id="29:test", aad_object_id="oid-123", name="Test")
         ctx.activity.conversation = MagicMock(conversation_type="groupChat")
         ctx.activity.value = None
         ctx.activity.attachments = None

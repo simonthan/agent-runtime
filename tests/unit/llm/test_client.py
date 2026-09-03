@@ -605,9 +605,7 @@ async def test_default_temperature_none_omits_param() -> None:
 
     # Explicit per-call temperature overrides the None default
     fake_sdk.messages.responses.append(make_ok())
-    await client_no_temp.complete(
-        static_system_prefix="STATIC", user_message="hi", temperature=0.5
-    )
+    await client_no_temp.complete(static_system_prefix="STATIC", user_message="hi", temperature=0.5)
     req2 = fake_sdk.messages.captured_requests[1]
     assert req2["temperature"] == 0.5
 

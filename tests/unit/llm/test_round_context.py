@@ -52,8 +52,9 @@ def test_bind_restores_previous_value_on_nesting() -> None:
 def test_bind_restores_on_exception() -> None:
     # `pytest.raises`, NOT try/except/pass: this repo runs ruff `select = ["ALL"]` and the
     # `tests/**` per-file-ignores do not include SIM, so a suppressed exception is SIM105.
-    with pytest.raises(RuntimeError), bind_tool_round(
-        ToolRoundContext(round_index=1, max_rounds=3)
+    with (
+        pytest.raises(RuntimeError),
+        bind_tool_round(ToolRoundContext(round_index=1, max_rounds=3)),
     ):
         raise RuntimeError("boom")
     assert current_tool_round() is None

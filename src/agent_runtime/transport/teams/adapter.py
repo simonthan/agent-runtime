@@ -50,8 +50,7 @@ _TEAMS_FILE_DOWNLOAD_INFO = "application/vnd.microsoft.teams.file.download.info"
 
 # T-286: best-effort reply when identity resolution fails.
 _IDENTITY_FAIL_REPLY = (
-    "I'm unable to process messages in this conversation. "
-    "Please try messaging me in a direct chat."
+    "I'm unable to process messages in this conversation. Please try messaging me in a direct chat."
 )
 
 
@@ -173,9 +172,8 @@ class _EventDispatchingHandler(ActivityHandler):
                     await hook(
                         from_id=getattr(activity.from_property, "id", "") or "",
                         aad_object_id=getattr(activity.from_property, "aad_object_id", "") or "",
-                        conversation_type=getattr(
-                            activity.conversation, "conversation_type", ""
-                        ) or "unknown",
+                        conversation_type=getattr(activity.conversation, "conversation_type", "")
+                        or "unknown",
                     )
                 except Exception:  # noqa: BLE001
                     logger.warning("on_identity_failed_hook_raised", exc_info=True)
