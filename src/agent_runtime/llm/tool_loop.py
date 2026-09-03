@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from agent_runtime.llm.client import AnthropicClient, assemble_history_messages
 from agent_runtime.llm.compaction import estimate_tokens
@@ -228,12 +228,13 @@ def _strip_tool_result_markers(messages: list[dict[str, Any]]) -> None:
         if not isinstance(content, list):
             continue
         for i, block in enumerate(content):
-            if (
-                isinstance(block, dict)
-                and block.get("type") == "tool_result"
-                and "cache_control" in block
-            ):
-                content[i] = {k: v for k, v in block.items() if k != "cache_control"}
+            if not isinstance(block, dict):
+                continue
+            # `content` is untyped JSON-shaped data; name the shape once so the checker
+            # sees a str-keyed dict instead of the isinstance-narrowed `dict[Never, Never]`.
+            typed: dict[str, Any] = cast("dict[str, Any]", block)
+            if typed.get("type") == "tool_result" and "cache_control" in typed:
+                content[i] = {k: v for k, v in typed.items() if k != "cache_control"}
 
 
 def _tool_result_content(call: ToolCall) -> str | list[dict[str, Any]]:
@@ -846,7 +847,9 @@ class ToolUseLoop:
             {"type": "tool_use", "id": tu["id"], "name": tu["name"], "input": tu["input"]}
             for tu in tool_uses
         )
-        tool_result_blocks = [
+        # Annotated like `assistant_blocks`: the comprehension alone infers a value type
+        # too narrow for the `cache_control` dict added below.
+        tool_result_blocks: list[dict[str, Any]] = [
             {
                 "type": "tool_result",
                 "tool_use_id": c.id,
