@@ -523,9 +523,15 @@ async def test_oversize_transcode_output_raises(monkeypatch):
         return httpx.Response(200, content=heic)
 
     monkeypatch.setattr(
-        images, "_transcode_heif_to_jpeg", lambda _data: b"\xff\xd8\xff" + b"\x00" * 512
+        images, "transcode_heif_to_jpeg", lambda _data: b"\xff\xd8\xff" + b"\x00" * 512
     )
     att = make_inline_image(content_url="https://smba.trafficmanager.net/x")
     client = _client_with_handler(_heic_handler)
     with pytest.raises(InlineImageDownloadError, match="exceeded the"):
         await download_inline_image(att, _CREDENTIALS, client=client, max_bytes=256)
+
+
+def test_transcode_helper_is_public_with_private_alias():
+    """T-338: consumers import the public name; the private name survives one release."""
+    assert callable(images.transcode_heif_to_jpeg)
+    assert images._transcode_heif_to_jpeg is images.transcode_heif_to_jpeg

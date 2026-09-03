@@ -109,8 +109,13 @@ def _host_is_allowed(url: str, allowed_hosts: frozenset[str]) -> bool:
     return any(host == allowed or host.endswith(f".{allowed}") for allowed in allowed_hosts)
 
 
-def _transcode_heif_to_jpeg(data: bytes) -> bytes:
+def transcode_heif_to_jpeg(data: bytes) -> bytes:
     """Decode a HEIF/HEIC payload and re-encode as baseline JPEG.
+
+    Public since v0.32.1 (T-338): consumers that accept uploads outside the
+    Teams transport (teams-bot-platform's web upload path) share this exact
+    recovery. ``_transcode_heif_to_jpeg`` remains as a private alias for ONE
+    release and is removed in v0.33.
 
     Runs in a worker thread (CPU-bound; pillow decode holds the GIL only in
     slices). Imports are lazy and the caller catches ``Exception``: when the
@@ -133,6 +138,10 @@ def _transcode_heif_to_jpeg(data: bytes) -> bytes:
         out = BytesIO()
         transposed.save(out, format="JPEG", quality=_HEIC_JPEG_QUALITY)
         return out.getvalue()
+
+
+# T-338: one-release compatibility alias for the pre-v0.32.1 private name. Remove in v0.33.
+_transcode_heif_to_jpeg = transcode_heif_to_jpeg
 
 
 # T-115m -- credentials live for the process, keyed by the (frozen, hashable) value.
@@ -249,7 +258,7 @@ async def _stream_download(
             # background; its result is discarded). Type name only in the
             # message, never str(exc) (SEC-2/SEC-3).
             try:
-                data = await asyncio.to_thread(_transcode_heif_to_jpeg, data)
+                data = await asyncio.to_thread(transcode_heif_to_jpeg, data)
             except Exception as exc:
                 msg = f"HEIC transcode failed: {type(exc).__name__}"
                 raise InlineImageDownloadError(msg) from exc
