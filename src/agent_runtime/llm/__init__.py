@@ -5,7 +5,8 @@ Public surface:
 - ``AnthropicClient`` — async client with ``complete()`` / ``complete_messages()`` methods
 - ``build_anthropic_sdk_client`` — provider factory (public Anthropic API vs Azure AI Foundry)
 - ``ClaudeResponse`` — frozen dataclass with token-usage + cache-stats
-- ``ANTI_RETRACTION_INSTRUCTIONS`` — shared system-prompt guard (verify before conceding a challenged answer, T-313)
+- ``ANTI_RETRACTION_INSTRUCTIONS`` — shared system-prompt guard (verify before conceding a
+  challenged answer, T-313)
 - ``GROUNDED_DELIVERY_INSTRUCTIONS`` — shared system-prompt guard (grounded delivery, T-300)
 - ``Message`` / ``History`` — conversation history types
 - ``LLMImage`` / ``ANTHROPIC_IMAGE_MEDIA_TYPES`` — base64 image content blocks for the
@@ -42,10 +43,6 @@ from agent_runtime.llm.errors import (
     LLMResponseError,
 )
 from agent_runtime.llm.factory import build_anthropic_sdk_client
-from agent_runtime.llm.prompt_guards import (
-    ANTI_RETRACTION_INSTRUCTIONS,
-    GROUNDED_DELIVERY_INSTRUCTIONS,
-)
 from agent_runtime.llm.models import (
     ANTHROPIC_IMAGE_MEDIA_TYPES,
     ClaudeResponse,
@@ -53,6 +50,10 @@ from agent_runtime.llm.models import (
     LLMImage,
     Message,
     ToolUseBlock,
+)
+from agent_runtime.llm.prompt_guards import (
+    ANTI_RETRACTION_INSTRUCTIONS,
+    GROUNDED_DELIVERY_INSTRUCTIONS,
 )
 from agent_runtime.llm.round_context import (
     ToolRoundContext,
@@ -75,8 +76,9 @@ from agent_runtime.llm.tool_loop import (
 )
 
 __all__ = [
-    "ANTI_RETRACTION_INSTRUCTIONS",
     "ANTHROPIC_IMAGE_MEDIA_TYPES",
+    "ANTI_RETRACTION_INSTRUCTIONS",
+    "GROUNDED_DELIVERY_INSTRUCTIONS",
     "AnthropicClient",
     "ClaudeResponse",
     "CompactionConfig",
@@ -84,7 +86,6 @@ __all__ = [
     "CompactionResult",
     "ConfirmPredicate",
     "ExecuteDecision",
-    "GROUNDED_DELIVERY_INSTRUCTIONS",
     "History",
     "InjectResultDecision",
     "LLMAPIError",
