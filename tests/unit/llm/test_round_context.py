@@ -79,3 +79,16 @@ async def test_sibling_tasks_do_not_see_each_others_context() -> None:
 
     await asyncio.gather(turn("a", 7), turn("b", 11), bystander())
     assert seen == {"a": 7, "b": 11, "bystander": None}
+
+
+def test_bind_tool_use_id_restores_on_nested_exit():
+    """T12 (direct): nested bind_tool_use_id restores outer value on exit."""
+    from agent_runtime.llm.round_context import bind_tool_use_id, current_tool_use_id
+
+    assert current_tool_use_id() is None
+    with bind_tool_use_id("b"):
+        assert current_tool_use_id() == "b"
+        with bind_tool_use_id("a"):
+            assert current_tool_use_id() == "a"
+        assert current_tool_use_id() == "b"  # restored to outer
+    assert current_tool_use_id() is None  # restored to default

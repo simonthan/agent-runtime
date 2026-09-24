@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.33.0 — 2026-09-24
+
+### Added
+
+- `ToolUseLoop.run()` / `.resume()` accept `parallel_safe: ParallelSafePredicate` and
+  `max_parallel_calls: int`. When both are set (and `max_parallel_calls >= 2`), each maximal
+  run of consecutive parallel-safe, non-confirm tool_use blocks in a round executes
+  concurrently, bounded by `max_parallel_calls`. Results, the per-turn image budget and
+  audit events are applied in tool_use order; a confirm-required block still suspends at
+  its own index; a non-parallel-safe block is an ordering barrier. Unset = byte-for-byte
+  serial (regression guarantee). New audit events `tool_loop_parallel_batch` (one per
+  concurrent batch of 2+) and `tool_loop_parallel_sibling_error` (a batch member that failed
+  after an earlier one — only the first failure in tool_use order is raised). The
+  `parallel_safe` predicate must be pure: it may be consulted more than once per block.
+  (TBP T-7092)
+- `agent_runtime.llm.current_tool_use_id()` / `bind_tool_use_id()`: the loop binds the
+  executing block's tool_use id around every executor invocation (serial, concurrent and
+  resume paths), so an executor can correlate per-call measurements with `ToolCall.id`
+  without a signature change. Additive; executors that never read it are unaffected. (TBP T-7092)
+
+### Notes
+
+- The `_transcode_heif_to_jpeg` alias announced for removal in v0.33 stays one more
+  release; removal moves to v0.34.
+
 ## v0.32.1 — 2026-09-02
 
 ### Changed

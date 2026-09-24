@@ -30,7 +30,13 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # ruff select=["ALL"] here: TC003 wants annotation-only stdlib imports guarded
     from collections.abc import Iterator
 
-__all__ = ["ToolRoundContext", "bind_tool_round", "current_tool_round"]
+__all__ = [
+    "ToolRoundContext",
+    "bind_tool_round",
+    "bind_tool_use_id",
+    "current_tool_round",
+    "current_tool_use_id",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,3 +103,30 @@ def bind_tool_round(ctx: ToolRoundContext) -> Iterator[None]:
         yield
     finally:
         _round_var.reset(token)
+
+
+_tool_use_id_var: ContextVar[str | None] = ContextVar("agent_runtime_tool_use_id", default=None)
+
+
+def current_tool_use_id() -> str | None:
+    """The Anthropic ``tool_use`` id of the call being executed right now, or ``None``
+    outside a ToolUseLoop executor invocation (T-7092).
+
+    Lets an executor correlate its own measurements with the loop's ``ToolCall.id``
+    without a signature change (same backward-compatibility contract as
+    ``current_tool_round``). Needed once calls in a round can run concurrently: an
+    ordered list of per-call measurements no longer arrives in tool_use order.
+    """
+    return _tool_use_id_var.get()
+
+
+@contextmanager
+def bind_tool_use_id(tool_use_id: str) -> Iterator[None]:
+    """Bind ``tool_use_id`` for one executor invocation, then restore the previous value
+    (token-based, like ``bind_tool_round``). Inside a concurrent batch each call runs in
+    its own asyncio task, so each sees only its own id."""
+    token = _tool_use_id_var.set(tool_use_id)
+    try:
+        yield
+    finally:
+        _tool_use_id_var.reset(token)

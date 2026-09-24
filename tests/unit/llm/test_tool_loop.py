@@ -8,6 +8,8 @@ on run() + resume() preserves marker from state["messages"].
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 pytest.importorskip("anthropic")
@@ -2273,3 +2275,795 @@ async def test_pre_completion_hook_at_max_rounds_zero() -> None:
         b.get("type") == "text" and b.get("text") == _wrap_up_text for b in final_req["system"]
     )
     assert "tools" not in final_req
+
+
+# ---- T-7092: concurrent parallel-safe calls ----
+
+
+def _round(*blocks):
+    """Build a FakeMessage with stop_reason='tool_use' from (id, name, input) tuples."""
+    return FakeMessage(
+        content=[FakeToolUseBlock(id=bid, name=n, input=inp) for bid, n, inp in blocks],
+        model="claude-sonnet-4-6",
+        stop_reason="tool_use",
+        usage=FakeUsage(input_tokens=100, output_tokens=30),
+    )
+
+
+class _Tracker:
+    """Executor that records start/end order and the max number in flight."""
+
+    def __init__(
+        self,
+        delays=None,
+        raises=None,
+    ):
+        self.delays = delays or {}
+        self.raises = raises or {}
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.events: list = []
+        self.rounds: list = []
+
+    async def __call__(self, name, inp):
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        self.events.append(f"start:{inp['k']}")
+        self.rounds.append(current_tool_round())
+        try:
+            await asyncio.sleep(self.delays.get(inp["k"], 0.05))
+            if inp["k"] in self.raises:  # T8: raise AFTER the (possibly 0) sleep
+                raise self.raises[inp["k"]]
+        except asyncio.CancelledError:  # T9: record, then propagate
+            self.events.append(f"cancelled:{inp['k']}")
+            raise
+        finally:
+            self.in_flight -= 1
+        self.events.append(f"end:{inp['k']}")
+        return ToolResult(content=f"res:{inp['k']}")
+
+
+_READS = lambda name, _inp: name.startswith("read")  # noqa: E731
+
+
+@pytest.mark.asyncio
+async def test_t7092_reads_run_concurrently_and_keep_order():
+    """T1: three parallel reads finish in wall-clock max(delays), results in tool_use order."""
+    import time
+
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        _round(
+            ("t1", "read_a", {"k": "a"}),
+            ("t2", "read_b", {"k": "b"}),
+            ("t3", "read_c", {"k": "c"}),
+        )
+    )
+    sdk.messages.responses.append(make_ok(text="done"))
+
+    tracker = _Tracker(delays={"a": 0.3, "b": 0.2, "c": 0.1})
+    started = time.perf_counter()
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=tracker,
+        max_rounds=3,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+    )
+    elapsed = time.perf_counter() - started
+
+    assert tracker.max_in_flight == 3
+    step = result.steps[0]
+    assert [c.id for c in step.tool_calls] == ["t1", "t2", "t3"]
+    assert [c.result for c in step.tool_calls] == ["res:a", "res:b", "res:c"]
+    # wall-clock < 0.55s (serial would be ~0.6s); secondary assertion
+    assert elapsed < 0.55
+    # tool_result blocks in 2nd request are in tool_use order
+    req = sdk.messages.captured_requests[1]
+    all_user = [m for m in req["messages"] if m.get("role") == "user"]
+    last_user_content = all_user[-1]["content"]
+    tr_ids = [
+        b["tool_use_id"]
+        for b in last_user_content
+        if isinstance(b, dict) and b.get("type") == "tool_result"
+    ]
+    assert tr_ids == ["t1", "t2", "t3"]
+
+
+@pytest.mark.asyncio
+async def test_t7092_bounded_by_max_parallel_calls():
+    """T2: semaphore caps concurrent calls to max_parallel_calls."""
+    # Cap 4 with 6 reads
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        _round(
+            ("t1", "read_1", {"k": "1"}),
+            ("t2", "read_2", {"k": "2"}),
+            ("t3", "read_3", {"k": "3"}),
+            ("t4", "read_4", {"k": "4"}),
+            ("t5", "read_5", {"k": "5"}),
+            ("t6", "read_6", {"k": "6"}),
+        )
+    )
+    sdk.messages.responses.append(make_ok(text="done"))
+
+    tracker = _Tracker()
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=tracker,
+        max_rounds=3,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+    )
+    assert tracker.max_in_flight == 4
+
+    # Cap 2
+    fake_sdk2 = FakeAsyncAnthropic()
+    loop2, sdk2 = _make_loop(fake_sdk2)
+    sdk2.messages.responses.append(
+        _round(
+            ("t1", "read_1", {"k": "1"}),
+            ("t2", "read_2", {"k": "2"}),
+            ("t3", "read_3", {"k": "3"}),
+            ("t4", "read_4", {"k": "4"}),
+            ("t5", "read_5", {"k": "5"}),
+            ("t6", "read_6", {"k": "6"}),
+        )
+    )
+    sdk2.messages.responses.append(make_ok(text="done"))
+
+    tracker2 = _Tracker()
+    await loop2.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=tracker2,
+        max_rounds=3,
+        parallel_safe=_READS,
+        max_parallel_calls=2,
+    )
+    assert tracker2.max_in_flight == 2
+
+
+@pytest.mark.asyncio
+async def test_t7092_serial_block_is_a_barrier():
+    """T3: a non-parallel-safe block is a barrier; reads on each side overlap."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        _round(
+            ("t1", "read_1", {"k": "1"}),
+            ("t2", "read_2", {"k": "2"}),
+            ("t3", "write_w", {"k": "w"}),
+            ("t4", "read_3", {"k": "3"}),
+            ("t5", "read_4", {"k": "4"}),
+        )
+    )
+    sdk.messages.responses.append(make_ok(text="done"))
+
+    tracker = _Tracker()
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=tracker,
+        max_rounds=3,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+    )
+
+    evs = tracker.events
+    w_start = evs.index("start:w")
+    w_end = evs.index("end:w")
+    assert evs.index("end:1") < w_start
+    assert evs.index("end:2") < w_start
+    assert w_end < evs.index("start:3")
+    assert w_end < evs.index("start:4")
+    # reads 3 and 4 overlap (both started before either ended)
+    s3, s4 = evs.index("start:3"), evs.index("start:4")
+    e3, e4 = evs.index("end:3"), evs.index("end:4")
+    assert max(s3, s4) < min(e3, e4)
+
+
+@pytest.mark.asyncio
+async def test_t7092_confirm_partitions_and_resume_batches_rest():
+    """T4: confirm suspends at send_email; reads before and after overlap."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        _round(
+            ("t1", "read_a", {"k": "1"}),
+            ("t2", "read_b", {"k": "2"}),
+            ("t3", "send_email", {"k": "c"}),
+            ("t4", "read_c", {"k": "3"}),
+            ("t5", "read_d", {"k": "4"}),
+        )
+    )
+
+    tracker = _Tracker()
+    suspended = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=tracker,
+        max_rounds=3,
+        confirm=_CONFIRM_WRITES,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+    )
+
+    assert suspended.pending_confirmation is not None
+    pc = suspended.pending_confirmation
+    assert pc.state["round"]["pending_index"] == 2
+    assert [c["id"] for c in pc.state["round"]["calls"]] == ["t1", "t2"]
+    # Executor never saw c, 3, 4 during initial run
+    executed_ks = {e[len("start:") :] for e in tracker.events if e.startswith("start:")}
+    assert executed_ks == {"1", "2"}
+
+    # Resume: send_email runs serially, then reads 3 and 4 overlap
+    sdk.messages.responses.append(make_ok(text="all done"))
+    result = await loop.resume(
+        state=pc.state,
+        decision=ExecuteDecision(),
+        tools=[],
+        executor=tracker,
+        confirm=_CONFIRM_WRITES,
+        static_system_prefix="SYS",
+        max_rounds=3,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+    )
+
+    assert result.pending_confirmation is None
+    assert result.final_text == "all done"
+    step = result.steps[-1]
+    assert [c.id for c in step.tool_calls] == ["t1", "t2", "t3", "t4", "t5"]
+
+    evs = tracker.events
+    c_end = evs.index("end:c")
+    s3, s4 = evs.index("start:3"), evs.index("start:4")
+    e3, e4 = evs.index("end:3"), evs.index("end:4")
+    assert c_end < s3  # 3 didn't start before c ended
+    assert c_end < s4  # 4 didn't start before c ended
+    assert max(s3, s4) < min(e3, e4)  # reads 3 and 4 overlap
+
+
+@pytest.mark.asyncio
+async def test_t7092_confirm_evaluated_once_per_block():
+    """T5: confirm called exactly N times for N blocks; write's confirm is after end:read."""
+    # Part 1: [read, read, read] → confirm called exactly 3 times
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        _round(
+            ("t1", "read_a", {"k": "1"}),
+            ("t2", "read_b", {"k": "2"}),
+            ("t3", "read_c", {"k": "3"}),
+        )
+    )
+    sdk.messages.responses.append(make_ok(text="done"))
+
+    confirm_count = 0
+
+    def counting_confirm(name, inp):
+        nonlocal confirm_count
+        confirm_count += 1
+        return _CONFIRM_WRITES(name, inp)
+
+    tracker = _Tracker()
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=tracker,
+        max_rounds=3,
+        confirm=counting_confirm,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+    )
+    assert confirm_count == 3
+
+    # Part 2: [read, write, read] → confirm for write evaluated only after end:1
+    fake_sdk2 = FakeAsyncAnthropic()
+    loop2, sdk2 = _make_loop(fake_sdk2)
+    sdk2.messages.responses.append(
+        _round(
+            ("t1", "read_a", {"k": "1"}),
+            ("t2", "write_w", {"k": "w"}),
+            ("t3", "read_c", {"k": "3"}),
+        )
+    )
+    sdk2.messages.responses.append(make_ok(text="done"))
+
+    tracker2 = _Tracker()
+
+    def logging_confirm(name, inp):
+        tracker2.events.append(f"confirm:{inp['k']}")
+        return _CONFIRM_WRITES(name, inp)
+
+    await loop2.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=tracker2,
+        max_rounds=3,
+        confirm=logging_confirm,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+    )
+    evs2 = tracker2.events
+    assert evs2.index("end:1") < evs2.index("confirm:w")
+
+
+@pytest.mark.asyncio
+async def test_t7092_regression_default_is_serial():
+    """T6: no new kwargs → max_in_flight == 1, events strictly start/end alternating."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        _round(
+            ("t1", "read_a", {"k": "1"}),
+            ("t2", "read_b", {"k": "2"}),
+            ("t3", "read_c", {"k": "3"}),
+        )
+    )
+    sdk.messages.responses.append(make_ok(text="done"))
+
+    tracker = _Tracker()
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=tracker,
+        max_rounds=3,
+        # no parallel_safe / max_parallel_calls
+    )
+
+    assert tracker.max_in_flight == 1
+    evs = tracker.events
+    assert evs == ["start:1", "end:1", "start:2", "end:2", "start:3", "end:3"]
+
+
+@pytest.mark.asyncio
+async def test_t7092_cap_one_or_none_is_serial():
+    """T7: partial args (cap=1, cap=None, predicate=None) all keep serial execution."""
+
+    async def _run_3reads(parallel_safe, max_parallel_calls):
+        fake_sdk = FakeAsyncAnthropic()
+        loop, sdk = _make_loop(fake_sdk)
+        sdk.messages.responses.append(
+            _round(
+                ("t1", "read_a", {"k": "1"}),
+                ("t2", "read_b", {"k": "2"}),
+                ("t3", "read_c", {"k": "3"}),
+            )
+        )
+        sdk.messages.responses.append(make_ok(text="done"))
+        tracker = _Tracker()
+        kwargs = {}
+        if parallel_safe is not None:
+            kwargs["parallel_safe"] = parallel_safe
+        if max_parallel_calls is not None:
+            kwargs["max_parallel_calls"] = max_parallel_calls
+        await loop.run(
+            static_system_prefix="SYS",
+            user_message="go",
+            tools=[],
+            executor=tracker,
+            max_rounds=3,
+            **kwargs,
+        )
+        return tracker.max_in_flight
+
+    assert await _run_3reads(_READS, 1) == 1
+    assert await _run_3reads(_READS, None) == 1
+    assert await _run_3reads(None, 4) == 1
+
+
+@pytest.mark.asyncio
+async def test_t7092_first_exception_in_order_reraised_siblings_settle():
+    """T8: first exception in tool_use order is re-raised; k=3 settles (no orphan)."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        _round(
+            ("t1", "read_a", {"k": "1"}),
+            ("t2", "read_b", {"k": "2"}),
+            ("t3", "read_c", {"k": "3"}),
+        )
+    )
+
+    tracker = _Tracker(
+        delays={"1": 0.1, "2": 0, "3": 0.2},
+        raises={"1": ValueError("one"), "2": KeyError("two")},
+    )
+
+    with pytest.raises(ValueError, match="one"):
+        await loop.run(
+            static_system_prefix="SYS",
+            user_message="go",
+            tools=[],
+            executor=tracker,
+            max_rounds=3,
+            parallel_safe=_READS,
+            max_parallel_calls=4,
+        )
+
+    assert "end:3" in tracker.events  # k=3 settled (not orphaned)
+    # pytest.raises(ValueError) already guarantees it's not an ExceptionGroup
+
+
+@pytest.mark.asyncio
+async def test_t7092_outer_cancellation_reaches_children():
+    """T9: asyncio.timeout cancels every in-flight child; no tasks remain after sleep(0)."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        _round(
+            ("t1", "read_a", {"k": "1"}),
+            ("t2", "read_b", {"k": "2"}),
+            ("t3", "read_c", {"k": "3"}),
+        )
+    )
+
+    tracker = _Tracker(delays={"1": 5, "2": 5, "3": 5})
+    before = asyncio.all_tasks()
+
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.2):
+            await loop.run(
+                static_system_prefix="SYS",
+                user_message="go",
+                tools=[],
+                executor=tracker,
+                max_rounds=3,
+                parallel_safe=_READS,
+                max_parallel_calls=4,
+            )
+
+    for k in ("1", "2", "3"):
+        assert tracker.events.count(f"cancelled:{k}") == 1
+    assert not any(e.startswith("end:") for e in tracker.events)
+    await asyncio.sleep(0)
+    leftover = asyncio.all_tasks() - before - {asyncio.current_task()}
+    assert leftover == set()
+
+
+@pytest.mark.asyncio
+async def test_t7092_image_budget_applied_in_tool_use_order():
+    """T10: image budget applied in tool_use order; k=1 completes last but keeps image."""
+    from agent_runtime.llm.models import LLMImage
+
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        _round(
+            ("t1", "read_a", {"k": "1"}),
+            ("t2", "read_b", {"k": "2"}),
+        )
+    )
+    sdk.messages.responses.append(make_ok(text="done"))
+
+    img = LLMImage(media_type="image/png", data_b64="AAAA")
+
+    async def image_executor(_name, inp):
+        # k=1 sleeps longer (completes LAST); k=2 completes first
+        await asyncio.sleep(0.15 if inp["k"] == "1" else 0.05)
+        return ToolResult(content=f"res:{inp['k']}", images=(img,))
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=image_executor,
+        max_rounds=3,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+        max_turn_images=1,
+    )
+
+    step = result.steps[0]
+    # call 1 (first in tool_use order): image admitted (budget = 0/1 used)
+    assert len(step.tool_calls[0].images) == 1
+    # call 2 (second in tool_use order): image dropped (budget = 1/1 exhausted)
+    assert len(step.tool_calls[1].images) == 0
+    assert "[IMAGES WITHHELD" in step.tool_calls[1].result
+
+
+@pytest.mark.asyncio
+async def test_t7092_round_context_visible_in_every_concurrent_call():
+    """T11: current_tool_round() is bound inside all concurrent executor calls."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        _round(
+            ("t1", "read_a", {"k": "1"}),
+            ("t2", "read_b", {"k": "2"}),
+            ("t3", "read_c", {"k": "3"}),
+        )
+    )
+    sdk.messages.responses.append(make_ok(text="done"))
+
+    tracker = _Tracker()
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=tracker,
+        max_rounds=3,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+    )
+
+    assert all(r is not None for r in tracker.rounds)
+    assert all(r.round_index == 1 for r in tracker.rounds)
+    assert all(r.max_rounds == 3 for r in tracker.rounds)
+
+
+@pytest.mark.asyncio
+async def test_t7092_tool_use_id_bound_per_call():
+    """T12: current_tool_use_id() gives each call its own block id on all paths."""
+    from agent_runtime.llm import bind_tool_use_id, current_tool_use_id
+
+    # (a) serial path
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        _round(
+            ("t1", "write_a", {"k": "1"}),
+            ("t2", "write_b", {"k": "2"}),
+            ("t3", "write_c", {"k": "3"}),
+        )
+    )
+    sdk.messages.responses.append(make_ok(text="done"))
+
+    ids_serial = {}
+
+    async def _id_rec_serial(_name, inp):
+        ids_serial[inp["k"]] = current_tool_use_id()
+        return ToolResult(content="ok")
+
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=_id_rec_serial,
+        max_rounds=3,
+        # no parallel_safe → serial
+    )
+    assert ids_serial == {"1": "t1", "2": "t2", "3": "t3"}
+    assert current_tool_use_id() is None
+
+    # (b) concurrent batch — reverse completion order, each sees own id
+    fake_sdk2 = FakeAsyncAnthropic()
+    loop2, sdk2 = _make_loop(fake_sdk2)
+    sdk2.messages.responses.append(
+        _round(
+            ("t1", "read_a", {"k": "1"}),  # longest delay → last to complete
+            ("t2", "read_b", {"k": "2"}),
+            ("t3", "read_c", {"k": "3"}),  # shortest delay → first to complete
+        )
+    )
+    sdk2.messages.responses.append(make_ok(text="done"))
+
+    ids_concurrent = {}
+    completion_order = []
+
+    async def _id_rec_concurrent(_name, inp):
+        k = inp["k"]
+        ids_concurrent[k] = current_tool_use_id()
+        await asyncio.sleep({"1": 0.15, "2": 0.1, "3": 0.05}[k])
+        completion_order.append(k)
+        return ToolResult(content="ok")
+
+    await loop2.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=_id_rec_concurrent,
+        max_rounds=3,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+    )
+    assert completion_order == ["3", "2", "1"]
+    assert ids_concurrent == {"1": "t1", "2": "t2", "3": "t3"}
+    assert current_tool_use_id() is None
+
+    # (c) resume's pending ExecuteDecision call sees its own id
+    fake_sdk3 = FakeAsyncAnthropic()
+    loop3, sdk3 = _make_loop(fake_sdk3)
+    sdk3.messages.responses.append(_round(("tx", "send_email", {"k": "e"})))
+    sdk3.messages.responses.append(make_ok(text="done"))
+
+    suspended = await loop3.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=_never_called,
+        max_rounds=3,
+        confirm=_CONFIRM_WRITES,
+    )
+    assert suspended.pending_confirmation is not None
+
+    id_on_resume = []
+
+    async def _resume_exec(_name, _inp):
+        id_on_resume.append(current_tool_use_id())
+        return ToolResult(content="ok")
+
+    await loop3.resume(
+        state=suspended.pending_confirmation.state,
+        decision=ExecuteDecision(),
+        tools=[],
+        executor=_resume_exec,
+        confirm=_CONFIRM_WRITES,
+        static_system_prefix="SYS",
+        max_rounds=3,
+    )
+    assert id_on_resume == ["tx"]
+    assert current_tool_use_id() is None
+
+
+@pytest.mark.asyncio
+async def test_t7092_isolated_safe_block_runs_inline_no_batch_event():
+    """T13: an isolated parallel-safe block (A7c) stays inline; no tool_loop_parallel_batch."""
+    from agent_runtime.logging import NullAuditLogger
+
+    class _RecLogger(NullAuditLogger):
+        def __init__(self):
+            self.msgs = []
+
+        def info(self, message, **kwargs):
+            self.msgs.append(message)
+
+        def warning(self, message, **kwargs):
+            self.msgs.append(message)
+
+    # Part 1: [write, read, write] — read is isolated (neighbours are serial)
+    fake_sdk = FakeAsyncAnthropic()
+    rec = _RecLogger()
+    client = _make_client(fake_sdk)
+    from agent_runtime.llm import ToolUseLoop as _ToolUseLoop
+
+    loop = _ToolUseLoop(client=client, audit_logger=rec)
+    fake_sdk.messages.responses.append(
+        _round(
+            ("t1", "write_a", {"k": "w1"}),
+            ("t2", "read_b", {"k": "r"}),
+            ("t3", "write_c", {"k": "w2"}),
+        )
+    )
+    fake_sdk.messages.responses.append(make_ok(text="done"))
+
+    test_task = asyncio.current_task()
+    tasks_seen = []
+
+    async def _task_exec(_name, inp):
+        tasks_seen.append(asyncio.current_task())
+        return ToolResult(content=f"res:{inp['k']}")
+
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=_task_exec,
+        max_rounds=3,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+    )
+
+    assert "tool_loop_parallel_batch" not in rec.msgs
+    assert all(t is test_task for t in tasks_seen)
+
+    # Part 2: [read, read] — batch of 2 → exactly one tool_loop_parallel_batch event
+    fake_sdk2 = FakeAsyncAnthropic()
+    rec2 = _RecLogger()
+    client2 = _make_client(fake_sdk2)
+    loop2 = _ToolUseLoop(client=client2, audit_logger=rec2)
+    fake_sdk2.messages.responses.append(
+        _round(
+            ("t1", "read_a", {"k": "1"}),
+            ("t2", "read_b", {"k": "2"}),
+        )
+    )
+    fake_sdk2.messages.responses.append(make_ok(text="done"))
+
+    tracker2 = _Tracker()
+    await loop2.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=tracker2,
+        max_rounds=3,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+    )
+
+    assert rec2.msgs.count("tool_loop_parallel_batch") == 1
+
+
+async def test_t7092_confirm_cached_when_confirm_ends_a_parallel_run():
+    """A3: a parallel-safe block that `confirm` flags ends the run while it is being
+    extended; the loop head must reuse that verdict, not ask `confirm` a second time
+    (a consumer's confirm can be stateful). Removing the per-index cache makes this 4."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        _round(
+            ("t1", "read_a", {"k": "1"}),
+            ("t2", "read_b", {"k": "2"}),
+            ("t3", "read_gated", {"k": "g"}),
+        )
+    )
+    asked: list[str] = []
+
+    def gated_confirm(_name, inp):
+        asked.append(inp["k"])
+        return inp["k"] == "g"
+
+    tracker = _Tracker()
+    suspended = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=tracker,
+        max_rounds=3,
+        confirm=gated_confirm,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+    )
+
+    pc = suspended.pending_confirmation
+    assert pc is not None
+    assert pc.state["round"]["pending_index"] == 2
+    assert [c["id"] for c in pc.state["round"]["calls"]] == ["t1", "t2"]
+    assert tracker.max_in_flight == 2
+    assert asked == ["1", "2", "g"]
+
+
+async def test_t7092_extra_sibling_failures_are_logged_not_dropped():
+    """Opus review MEDIUM: only the first failure (tool_use order) is raised; every
+    later failing sibling is logged as `tool_loop_parallel_sibling_error` so the
+    evidence of a multi-failure batch is not silently lost."""
+    from agent_runtime.logging import NullAuditLogger
+
+    class _RecLogger(NullAuditLogger):
+        def __init__(self):
+            self.warnings: list[tuple[str, dict]] = []
+
+        def warning(self, message, **kwargs):
+            self.warnings.append((message, kwargs))
+
+    fake_sdk = FakeAsyncAnthropic()
+    rec = _RecLogger()
+    loop = ToolUseLoop(client=_make_client(fake_sdk), audit_logger=rec)
+    fake_sdk.messages.responses.append(
+        _round(
+            ("t1", "read_a", {"k": "1"}),
+            ("t2", "read_b", {"k": "2"}),
+            ("t3", "read_c", {"k": "3"}),
+        )
+    )
+    tracker = _Tracker(raises={"1": ValueError("one"), "3": KeyError("three")})
+
+    with pytest.raises(ValueError, match="one"):
+        await loop.run(
+            static_system_prefix="SYS",
+            user_message="go",
+            tools=[],
+            executor=tracker,
+            max_rounds=3,
+            parallel_safe=_READS,
+            max_parallel_calls=4,
+        )
+
+    sibling = [kw for msg, kw in rec.warnings if msg == "tool_loop_parallel_sibling_error"]
+    assert sibling == [
+        {"round_index": 1, "tool_use_id": "t3", "tool_name": "read_c", "error": "KeyError"}
+    ]
