@@ -3025,3 +3025,45 @@ async def test_t7092_confirm_cached_when_confirm_ends_a_parallel_run():
     assert [c["id"] for c in pc.state["round"]["calls"]] == ["t1", "t2"]
     assert tracker.max_in_flight == 2
     assert asked == ["1", "2", "g"]
+
+
+async def test_t7092_extra_sibling_failures_are_logged_not_dropped():
+    """Opus review MEDIUM: only the first failure (tool_use order) is raised; every
+    later failing sibling is logged as `tool_loop_parallel_sibling_error` so the
+    evidence of a multi-failure batch is not silently lost."""
+    from agent_runtime.logging import NullAuditLogger
+
+    class _RecLogger(NullAuditLogger):
+        def __init__(self):
+            self.warnings: list[tuple[str, dict]] = []
+
+        def warning(self, message, **kwargs):
+            self.warnings.append((message, kwargs))
+
+    fake_sdk = FakeAsyncAnthropic()
+    rec = _RecLogger()
+    loop = ToolUseLoop(client=_make_client(fake_sdk), audit_logger=rec)
+    fake_sdk.messages.responses.append(
+        _round(
+            ("t1", "read_a", {"k": "1"}),
+            ("t2", "read_b", {"k": "2"}),
+            ("t3", "read_c", {"k": "3"}),
+        )
+    )
+    tracker = _Tracker(raises={"1": ValueError("one"), "3": KeyError("three")})
+
+    with pytest.raises(ValueError, match="one"):
+        await loop.run(
+            static_system_prefix="SYS",
+            user_message="go",
+            tools=[],
+            executor=tracker,
+            max_rounds=3,
+            parallel_safe=_READS,
+            max_parallel_calls=4,
+        )
+
+    sibling = [kw for msg, kw in rec.warnings if msg == "tool_loop_parallel_sibling_error"]
+    assert sibling == [
+        {"round_index": 1, "tool_use_id": "t3", "tool_name": "read_c", "error": "KeyError"}
+    ]

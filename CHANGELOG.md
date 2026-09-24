@@ -10,7 +10,11 @@
   concurrently, bounded by `max_parallel_calls`. Results, the per-turn image budget and
   audit events are applied in tool_use order; a confirm-required block still suspends at
   its own index; a non-parallel-safe block is an ordering barrier. Unset = byte-for-byte
-  serial (regression guarantee). New audit event `tool_loop_parallel_batch`. (TBP T-7092)
+  serial (regression guarantee). New audit events `tool_loop_parallel_batch` (one per
+  concurrent batch of 2+) and `tool_loop_parallel_sibling_error` (a batch member that failed
+  after an earlier one — only the first failure in tool_use order is raised). The
+  `parallel_safe` predicate must be pure: it may be consulted more than once per block.
+  (TBP T-7092)
 - `agent_runtime.llm.current_tool_use_id()` / `bind_tool_use_id()`: the loop binds the
   executing block's tool_use id around every executor invocation (serial, concurrent and
   resume paths), so an executor can correlate per-call measurements with `ToolCall.id`

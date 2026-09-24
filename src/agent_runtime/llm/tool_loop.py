@@ -116,8 +116,9 @@ ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[ToolResult]]
 ConfirmPredicate = Callable[[str, dict[str, Any]], bool]
 # T-7092: (tool_name, tool_input) -> True if this call may run CONCURRENTLY with the
 # adjacent parallel-safe calls of the same round. Consumer policy (e.g. an MCP
-# readOnlyHint allowlist) — the loop never decides what is safe. Never consulted for
-# a block `confirm` flags; `confirm` wins.
+# readOnlyHint allowlist) — the loop never decides what is safe. It may be consulted
+# for any block, including confirm-flagged ones, and more than once per block, so it
+# must be pure and side-effect-free; `confirm` always wins.
 ParallelSafePredicate = Callable[[str, dict[str, Any]], bool]
 # T-284: optional hook invoked before each LLM call inside _drive().
 # Returns None to proceed normally, or a string to inject as a system
@@ -355,7 +356,9 @@ class ToolUseLoop:
         events and the image budget are applied in tool_use order. CONTRACT: with
         `parallel_safe` set, `confirm` may be evaluated for a parallel-safe block before
         the preceding parallel-safe blocks of the same round have finished — `confirm`
-        must not depend on their side effects."""
+        must not depend on their side effects. `parallel_safe` may be consulted for any
+        block (confirm-flagged ones included) and more than once per block — it must be
+        pure and side-effect-free; `confirm` always wins."""
         system_blocks = self._build_system_blocks(static_system_prefix, dynamic_system_suffix)
         first_user: list[dict[str, Any]] = []
         if retrieval_block:
@@ -852,11 +855,25 @@ class ToolUseLoop:
             tool_names=[tu["name"] for tu in batch],
             elapsed_ms=round((time.monotonic() - started) * 1000),
         )
+        first_error: BaseException | None = None
         results: list[ToolResult] = []
-        for item in settled:
-            if isinstance(item, BaseException):
-                raise item
-            results.append(item)
+        for tu, item in zip(batch, settled, strict=True):
+            if not isinstance(item, BaseException):
+                results.append(item)
+            elif first_error is None:
+                first_error = item
+            elif not isinstance(item, asyncio.CancelledError):
+                # Only the first failure (tool_use order) is raised; keep the evidence
+                # of every later one instead of dropping it silently.
+                self._audit.warning(
+                    "tool_loop_parallel_sibling_error",
+                    round_index=round_index,
+                    tool_use_id=tu["id"],
+                    tool_name=tu["name"],
+                    error=type(item).__name__,
+                )
+        if first_error is not None:
+            raise first_error
         return results
 
     def _cap_images(
