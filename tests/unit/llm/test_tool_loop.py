@@ -2986,3 +2986,42 @@ async def test_t7092_isolated_safe_block_runs_inline_no_batch_event():
     )
 
     assert rec2.msgs.count("tool_loop_parallel_batch") == 1
+
+
+async def test_t7092_confirm_cached_when_confirm_ends_a_parallel_run():
+    """A3: a parallel-safe block that `confirm` flags ends the run while it is being
+    extended; the loop head must reuse that verdict, not ask `confirm` a second time
+    (a consumer's confirm can be stateful). Removing the per-index cache makes this 4."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        _round(
+            ("t1", "read_a", {"k": "1"}),
+            ("t2", "read_b", {"k": "2"}),
+            ("t3", "read_gated", {"k": "g"}),
+        )
+    )
+    asked: list[str] = []
+
+    def gated_confirm(_name, inp):
+        asked.append(inp["k"])
+        return inp["k"] == "g"
+
+    tracker = _Tracker()
+    suspended = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=tracker,
+        max_rounds=3,
+        confirm=gated_confirm,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+    )
+
+    pc = suspended.pending_confirmation
+    assert pc is not None
+    assert pc.state["round"]["pending_index"] == 2
+    assert [c["id"] for c in pc.state["round"]["calls"]] == ["t1", "t2"]
+    assert tracker.max_in_flight == 2
+    assert asked == ["1", "2", "g"]
