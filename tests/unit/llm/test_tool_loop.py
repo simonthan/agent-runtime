@@ -2327,7 +2327,7 @@ _READS = lambda name, _inp: name.startswith("read")  # noqa: E731
 
 
 @pytest.mark.asyncio
-async def test_T7092_reads_run_concurrently_and_keep_order():
+async def test_t7092_reads_run_concurrently_and_keep_order():
     """T1: three parallel reads finish in wall-clock max(delays), results in tool_use order."""
     import time
 
@@ -2374,7 +2374,7 @@ async def test_T7092_reads_run_concurrently_and_keep_order():
 
 
 @pytest.mark.asyncio
-async def test_T7092_bounded_by_max_parallel_calls():
+async def test_t7092_bounded_by_max_parallel_calls():
     """T2: semaphore caps concurrent calls to max_parallel_calls."""
     # Cap 4 with 6 reads
     fake_sdk = FakeAsyncAnthropic()
@@ -2432,7 +2432,7 @@ async def test_T7092_bounded_by_max_parallel_calls():
 
 
 @pytest.mark.asyncio
-async def test_T7092_serial_block_is_a_barrier():
+async def test_t7092_serial_block_is_a_barrier():
     """T3: a non-parallel-safe block is a barrier; reads on each side overlap."""
     fake_sdk = FakeAsyncAnthropic()
     loop, sdk = _make_loop(fake_sdk)
@@ -2472,7 +2472,7 @@ async def test_T7092_serial_block_is_a_barrier():
 
 
 @pytest.mark.asyncio
-async def test_T7092_confirm_partitions_and_resume_batches_rest():
+async def test_t7092_confirm_partitions_and_resume_batches_rest():
     """T4: confirm suspends at send_email; reads before and after overlap."""
     fake_sdk = FakeAsyncAnthropic()
     loop, sdk = _make_loop(fake_sdk)
@@ -2535,7 +2535,7 @@ async def test_T7092_confirm_partitions_and_resume_batches_rest():
 
 
 @pytest.mark.asyncio
-async def test_T7092_confirm_evaluated_once_per_block():
+async def test_t7092_confirm_evaluated_once_per_block():
     """T5: confirm called exactly N times for N blocks; write's confirm is after end:read."""
     # Part 1: [read, read, read] → confirm called exactly 3 times
     fake_sdk = FakeAsyncAnthropic()
@@ -2602,7 +2602,7 @@ async def test_T7092_confirm_evaluated_once_per_block():
 
 
 @pytest.mark.asyncio
-async def test_T7092_regression_default_is_serial():
+async def test_t7092_regression_default_is_serial():
     """T6: no new kwargs → max_in_flight == 1, events strictly start/end alternating."""
     fake_sdk = FakeAsyncAnthropic()
     loop, sdk = _make_loop(fake_sdk)
@@ -2631,7 +2631,7 @@ async def test_T7092_regression_default_is_serial():
 
 
 @pytest.mark.asyncio
-async def test_T7092_cap_one_or_none_is_serial():
+async def test_t7092_cap_one_or_none_is_serial():
     """T7: partial args (cap=1, cap=None, predicate=None) all keep serial execution."""
 
     async def _run_3reads(parallel_safe, max_parallel_calls):
@@ -2667,7 +2667,7 @@ async def test_T7092_cap_one_or_none_is_serial():
 
 
 @pytest.mark.asyncio
-async def test_T7092_first_exception_in_order_reraised_siblings_settle():
+async def test_t7092_first_exception_in_order_reraised_siblings_settle():
     """T8: first exception in tool_use order is re-raised; k=3 settles (no orphan)."""
     fake_sdk = FakeAsyncAnthropic()
     loop, sdk = _make_loop(fake_sdk)
@@ -2700,7 +2700,7 @@ async def test_T7092_first_exception_in_order_reraised_siblings_settle():
 
 
 @pytest.mark.asyncio
-async def test_T7092_outer_cancellation_reaches_children():
+async def test_t7092_outer_cancellation_reaches_children():
     """T9: asyncio.timeout cancels every in-flight child; no tasks remain after sleep(0)."""
     fake_sdk = FakeAsyncAnthropic()
     loop, sdk = _make_loop(fake_sdk)
@@ -2736,7 +2736,7 @@ async def test_T7092_outer_cancellation_reaches_children():
 
 
 @pytest.mark.asyncio
-async def test_T7092_image_budget_applied_in_tool_use_order():
+async def test_t7092_image_budget_applied_in_tool_use_order():
     """T10: image budget applied in tool_use order; k=1 completes last but keeps image."""
     from agent_runtime.llm.models import LLMImage
 
@@ -2752,7 +2752,7 @@ async def test_T7092_image_budget_applied_in_tool_use_order():
 
     img = LLMImage(media_type="image/png", data_b64="AAAA")
 
-    async def image_executor(name, inp):
+    async def image_executor(_name, inp):
         # k=1 sleeps longer (completes LAST); k=2 completes first
         await asyncio.sleep(0.15 if inp["k"] == "1" else 0.05)
         return ToolResult(content=f"res:{inp['k']}", images=(img,))
@@ -2777,7 +2777,7 @@ async def test_T7092_image_budget_applied_in_tool_use_order():
 
 
 @pytest.mark.asyncio
-async def test_T7092_round_context_visible_in_every_concurrent_call():
+async def test_t7092_round_context_visible_in_every_concurrent_call():
     """T11: current_tool_round() is bound inside all concurrent executor calls."""
     fake_sdk = FakeAsyncAnthropic()
     loop, sdk = _make_loop(fake_sdk)
@@ -2807,7 +2807,7 @@ async def test_T7092_round_context_visible_in_every_concurrent_call():
 
 
 @pytest.mark.asyncio
-async def test_T7092_tool_use_id_bound_per_call():
+async def test_t7092_tool_use_id_bound_per_call():
     """T12: current_tool_use_id() gives each call its own block id on all paths."""
     from agent_runtime.llm import bind_tool_use_id, current_tool_use_id
 
@@ -2825,7 +2825,7 @@ async def test_T7092_tool_use_id_bound_per_call():
 
     ids_serial = {}
 
-    async def _id_rec_serial(name, inp):
+    async def _id_rec_serial(_name, inp):
         ids_serial[inp["k"]] = current_tool_use_id()
         return ToolResult(content="ok")
 
@@ -2855,7 +2855,7 @@ async def test_T7092_tool_use_id_bound_per_call():
     ids_concurrent = {}
     completion_order = []
 
-    async def _id_rec_concurrent(name, inp):
+    async def _id_rec_concurrent(_name, inp):
         k = inp["k"]
         ids_concurrent[k] = current_tool_use_id()
         await asyncio.sleep({"1": 0.15, "2": 0.1, "3": 0.05}[k])
@@ -2893,7 +2893,7 @@ async def test_T7092_tool_use_id_bound_per_call():
 
     id_on_resume = []
 
-    async def _resume_exec(name, inp):
+    async def _resume_exec(_name, _inp):
         id_on_resume.append(current_tool_use_id())
         return ToolResult(content="ok")
 
@@ -2911,7 +2911,7 @@ async def test_T7092_tool_use_id_bound_per_call():
 
 
 @pytest.mark.asyncio
-async def test_T7092_isolated_safe_block_runs_inline_no_batch_event():
+async def test_t7092_isolated_safe_block_runs_inline_no_batch_event():
     """T13: an isolated parallel-safe block (A7c) stays inline; no tool_loop_parallel_batch."""
     from agent_runtime.logging import NullAuditLogger
 
@@ -2944,7 +2944,7 @@ async def test_T7092_isolated_safe_block_runs_inline_no_batch_event():
     test_task = asyncio.current_task()
     tasks_seen = []
 
-    async def _task_exec(name, inp):
+    async def _task_exec(_name, inp):
         tasks_seen.append(asyncio.current_task())
         return ToolResult(content=f"res:{inp['k']}")
 
