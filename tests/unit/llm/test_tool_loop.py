@@ -2365,7 +2365,11 @@ async def test_T7092_reads_run_concurrently_and_keep_order():
     req = sdk.messages.captured_requests[1]
     all_user = [m for m in req["messages"] if m.get("role") == "user"]
     last_user_content = all_user[-1]["content"]
-    tr_ids = [b["tool_use_id"] for b in last_user_content if isinstance(b, dict) and b.get("type") == "tool_result"]
+    tr_ids = [
+        b["tool_use_id"]
+        for b in last_user_content
+        if isinstance(b, dict) and b.get("type") == "tool_result"
+    ]
     assert tr_ids == ["t1", "t2", "t3"]
 
 
@@ -2499,7 +2503,7 @@ async def test_T7092_confirm_partitions_and_resume_batches_rest():
     assert pc.state["round"]["pending_index"] == 2
     assert [c["id"] for c in pc.state["round"]["calls"]] == ["t1", "t2"]
     # Executor never saw c, 3, 4 during initial run
-    executed_ks = {e[len("start:"):] for e in tracker.events if e.startswith("start:")}
+    executed_ks = {e[len("start:") :] for e in tracker.events if e.startswith("start:")}
     assert executed_ks == {"1", "2"}
 
     # Resume: send_email runs serially, then reads 3 and 4 overlap

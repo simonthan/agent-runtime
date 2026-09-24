@@ -20,8 +20,10 @@ Public surface:
 - ``ToolResult``, ``ToolCall``, ``ToolLoopStep``, ``ToolLoopResult``, ``ToolExecutor`` — loop types
 - ``PendingConfirmation``, ``ExecuteDecision``, ``InjectResultDecision``,
   ``ResumeDecision``, ``ConfirmPredicate`` — confirm-before-dispatch (T-025a)
+- ``ParallelSafePredicate`` — opt-in concurrent tool calls (T-7092)
 - ``ToolRoundContext``, ``current_tool_round``, ``bind_tool_round`` — the executing round's
-  index / remaining tool-round budget, readable by an executor with no signature change (T-115j)
+  index / remaining tool-round budget, readable by an executor with no signature change (T-115j);
+  ``current_tool_use_id`` / ``bind_tool_use_id`` — the executing call's tool_use id (T-7092)
 
 See ``agent_runtime.llm.client.AnthropicClient.complete`` docstring for the
 two-breakpoint cache contract (static system prefix + per-turn retrieval block).
@@ -58,12 +60,15 @@ from agent_runtime.llm.prompt_guards import (
 from agent_runtime.llm.round_context import (
     ToolRoundContext,
     bind_tool_round,
+    bind_tool_use_id,
     current_tool_round,
+    current_tool_use_id,
 )
 from agent_runtime.llm.tool_loop import (
     ConfirmPredicate,
     ExecuteDecision,
     InjectResultDecision,
+    ParallelSafePredicate,
     PendingConfirmation,
     PreCompletionHook,
     ResumeDecision,
@@ -94,6 +99,7 @@ __all__ = [
     "LLMRateLimitError",
     "LLMResponseError",
     "Message",
+    "ParallelSafePredicate",
     "PendingConfirmation",
     "PreCompletionHook",
     "ResumeDecision",
@@ -107,8 +113,10 @@ __all__ = [
     "ToolUseLoop",
     "WorkingMemory",
     "bind_tool_round",
+    "bind_tool_use_id",
     "build_anthropic_sdk_client",
     "current_tool_round",
+    "current_tool_use_id",
     "estimate_tokens",
     "sniff_heif",
     "sniff_image_mime",

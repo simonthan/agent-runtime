@@ -19,6 +19,8 @@ behaves byte-for-byte as before — the regression guarantee.
 
 from __future__ import annotations
 
+import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, cast
@@ -26,7 +28,7 @@ from typing import Any, cast
 from agent_runtime.llm.client import AnthropicClient, assemble_history_messages
 from agent_runtime.llm.compaction import estimate_tokens
 from agent_runtime.llm.models import LLMImage
-from agent_runtime.llm.round_context import ToolRoundContext, bind_tool_round
+from agent_runtime.llm.round_context import ToolRoundContext, bind_tool_round, bind_tool_use_id
 from agent_runtime.logging import AuditLogger, NullAuditLogger
 from agent_runtime.safety.prompt_sanitizer import repair_clipped_tool_result
 
@@ -34,6 +36,7 @@ __all__ = [
     "ConfirmPredicate",
     "ExecuteDecision",
     "InjectResultDecision",
+    "ParallelSafePredicate",
     "PendingConfirmation",
     "PreCompletionHook",
     "ResumeDecision",
@@ -111,10 +114,23 @@ class ToolResult:
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[ToolResult]]
 # (tool_name, tool_input) -> True if this call must be confirmed before dispatch.
 ConfirmPredicate = Callable[[str, dict[str, Any]], bool]
+# T-7092: (tool_name, tool_input) -> True if this call may run CONCURRENTLY with the
+# adjacent parallel-safe calls of the same round. Consumer policy (e.g. an MCP
+# readOnlyHint allowlist) — the loop never decides what is safe. Never consulted for
+# a block `confirm` flags; `confirm` wins.
+ParallelSafePredicate = Callable[[str, dict[str, Any]], bool]
 # T-284: optional hook invoked before each LLM call inside _drive().
 # Returns None to proceed normally, or a string to inject as a system
 # instruction for a forced-final call (no further tool rounds).
 PreCompletionHook = Callable[[], str | None]
+
+# T-7092: a bound below 2 means serial — `1` is a legitimate "off", not an error.
+_MIN_PARALLEL_CALLS = 2
+
+
+def _never_safe(_name: str, _input: dict[str, Any]) -> bool:
+    """Placeholder predicate when parallelism is off; never consulted (guarded by `parallel`)."""
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,6 +298,8 @@ class ToolUseLoop:
         max_turn_images: int | None = None,
         max_turn_image_bytes: int | None = None,
         pre_completion_hook: PreCompletionHook | None = None,
+        parallel_safe: ParallelSafePredicate | None = None,
+        max_parallel_calls: int | None = None,
     ) -> ToolLoopResult:
         """Run the fenced loop. `max_rounds` caps model turns that return
         stop_reason=='tool_use'. Returns once the model stops requesting tools, the
@@ -326,7 +344,18 @@ class ToolUseLoop:
         `cache_tool_rounds=True` (T-190) places a MOVING ephemeral marker on the latest
         committed round's last tool_result so later rounds and the forced final call read
         earlier rounds from cache. Opt-in, default False = byte-for-byte unchanged
-        (regression guarantee)."""
+        (regression guarantee).
+
+        `parallel_safe` / `max_parallel_calls` (T-7092) opt into concurrent execution of a
+        round's CONSECUTIVE parallel-safe blocks, at most `max_parallel_calls` in flight.
+        Both must be set and `max_parallel_calls >= 2`; otherwise execution is serial and
+        byte-for-byte unchanged (regression guarantee). A non-parallel-safe block is a
+        barrier (earlier calls finish before it starts; later calls start after it ends);
+        a confirm-required block still suspends at its own index (D3). Results, audit
+        events and the image budget are applied in tool_use order. CONTRACT: with
+        `parallel_safe` set, `confirm` may be evaluated for a parallel-safe block before
+        the preceding parallel-safe blocks of the same round have finished — `confirm`
+        must not depend on their side effects."""
         system_blocks = self._build_system_blocks(static_system_prefix, dynamic_system_suffix)
         first_user: list[dict[str, Any]] = []
         if retrieval_block:
@@ -362,6 +391,8 @@ class ToolUseLoop:
             max_turn_image_bytes=max_turn_image_bytes,
             cache_tool_rounds=cache_tool_rounds,
             pre_completion_hook=pre_completion_hook,
+            parallel_safe=parallel_safe,
+            max_parallel_calls=max_parallel_calls,
         )
 
     async def resume(
@@ -383,6 +414,8 @@ class ToolUseLoop:
         max_turn_images: int | None = None,
         max_turn_image_bytes: int | None = None,
         pre_completion_hook: PreCompletionHook | None = None,
+        parallel_safe: ParallelSafePredicate | None = None,
+        max_parallel_calls: int | None = None,
     ) -> ToolLoopResult:
         """Resume a loop suspended by a confirm-required tool. `state` is the opaque
         dict from `PendingConfirmation.state` (may have been JSON round-tripped through
@@ -410,7 +443,11 @@ class ToolUseLoop:
 
         `cache_tool_rounds` (T-190): re-supply on every call, exactly as max_result_chars
         — only conversation progress lives in state. A state suspended with a marker and
-        resumed with False keeps the stale marker (harmless: count stays ≤4)."""
+        resumed with False keeps the stale marker (harmless: count stays ≤4).
+
+        `parallel_safe` / `max_parallel_calls` mirror `run()` (T-7092) and must be
+        re-supplied on every call. The pending ExecuteDecision call itself always runs
+        alone."""
         # cache_history: no param — the run()-time history marker rides state["messages"].
         system_blocks = self._build_system_blocks(static_system_prefix, dynamic_system_suffix)
         messages: list[dict[str, Any]] = state["messages"]
@@ -437,7 +474,7 @@ class ToolUseLoop:
             tool_input = (
                 decision.tool_input if decision.tool_input is not None else pending["input"]
             )
-            with bind_tool_round(round_ctx):
+            with bind_tool_round(round_ctx), bind_tool_use_id(pending["id"]):
                 outcome = await executor(pending["name"], tool_input)
             outcome = self._cap_result(
                 tool_name=pending["name"],
@@ -479,6 +516,8 @@ class ToolUseLoop:
             max_turn_images=max_turn_images,
             max_turn_image_bytes=max_turn_image_bytes,
             round_ctx=round_ctx,
+            parallel_safe=parallel_safe,
+            max_parallel_calls=max_parallel_calls,
         )
         if isinstance(round_outcome, _RoundSuspended):
             return self._suspend(
@@ -518,6 +557,8 @@ class ToolUseLoop:
             max_turn_image_bytes=max_turn_image_bytes,
             cache_tool_rounds=cache_tool_rounds,
             pre_completion_hook=pre_completion_hook,
+            parallel_safe=parallel_safe,
+            max_parallel_calls=max_parallel_calls,
         )
 
     async def _drive(
@@ -541,6 +582,8 @@ class ToolUseLoop:
         max_turn_image_bytes: int | None,
         cache_tool_rounds: bool = False,
         pre_completion_hook: PreCompletionHook | None = None,
+        parallel_safe: ParallelSafePredicate | None = None,
+        max_parallel_calls: int | None = None,
     ) -> ToolLoopResult:
         """Shared round engine. `while rounds < max_rounds` (correct at the
         max_rounds=0 boundary — zero tool rounds, straight to the forced answer).
@@ -588,6 +631,8 @@ class ToolUseLoop:
                 # T-115j — the executor's only view of the round budget. `rounds` was
                 # incremented for THIS round on the line above, so it is the 1-based index.
                 round_ctx=ToolRoundContext(round_index=rounds, max_rounds=max_rounds),
+                parallel_safe=parallel_safe,
+                max_parallel_calls=max_parallel_calls,
             )
             if isinstance(outcome, _RoundSuspended):
                 return self._suspend(
@@ -641,7 +686,7 @@ class ToolUseLoop:
             agg=agg,
         )
 
-    async def _resolve_round(
+    async def _resolve_round(  # noqa: C901
         self,
         *,
         tool_uses: list[dict[str, Any]],
@@ -654,6 +699,8 @@ class ToolUseLoop:
         max_turn_images: int | None,
         max_turn_image_bytes: int | None,
         round_ctx: ToolRoundContext,
+        parallel_safe: ParallelSafePredicate | None = None,
+        max_parallel_calls: int | None = None,
     ) -> _RoundOutcome:
         """Iterate tool_use blocks from `start_index`, executing non-confirm tools
         (D3). Returns _RoundSuspended at the first confirm-required block, else
@@ -664,32 +711,153 @@ class ToolUseLoop:
         T-115j: `round_ctx` is bound for the whole body, so `current_tool_round()`
         answers inside the executor AND inside `confirm`. Token-based, so a nested
         ToolUseLoop restores this one on exit. Binding once around the loop rather
-        than per call keeps the hot path free of repeated set/reset."""
+        than per call keeps the hot path free of repeated set/reset. Concurrent batch
+        tasks (T-7092) copy this context at creation, so they see it too.
+
+        T-7092: with `parallel_safe` set and `max_parallel_calls >= 2`, each maximal run
+        of consecutive parallel-safe, non-confirm blocks executes concurrently (bounded).
+        `confirm` is evaluated at most once per block (cached by index); while extending
+        a run, `parallel_safe` is asked first so a serial block's `confirm` is never
+        evaluated early."""
+        parallel = (
+            parallel_safe is not None
+            and max_parallel_calls is not None
+            and max_parallel_calls >= _MIN_PARALLEL_CALLS
+        )
+        is_safe: ParallelSafePredicate = parallel_safe if parallel_safe is not None else _never_safe
+        confirmed: dict[int, bool] = {}
+
+        def needs_confirm(k: int) -> bool:
+            if confirm is None:
+                return False
+            if k not in confirmed:
+                confirmed[k] = confirm(tool_uses[k]["name"], tool_uses[k]["input"])
+            return confirmed[k]
+
         with bind_tool_round(round_ctx):
-            for i in range(start_index, len(tool_uses)):
+            i = start_index
+            n = len(tool_uses)
+            while i < n:
                 tu = tool_uses[i]
-                if confirm is not None and confirm(tu["name"], tu["input"]):
+                if needs_confirm(i):
                     return _RoundSuspended(pending_index=i, calls=calls)
-                outcome = await executor(tu["name"], tu["input"])
-                outcome = self._cap_result(
-                    tool_name=tu["name"],
-                    outcome=outcome,
-                    max_result_chars=max_result_chars,
-                    images_used=images_used,
-                    max_turn_images=max_turn_images,
-                    max_turn_image_bytes=max_turn_image_bytes,
-                )
-                calls.append(
-                    ToolCall(
-                        id=tu["id"],
-                        name=tu["name"],
-                        input=tu["input"],
-                        result=outcome.content,
-                        is_error=outcome.is_error,
-                        images=outcome.images,
+                # j = end of the maximal run of consecutive parallel-safe, non-confirm
+                # blocks starting at i; j == i + 1 when parallelism is off or i stands alone.
+                j = i + 1
+                if parallel and is_safe(tu["name"], tu["input"]):
+                    while j < n:
+                        nxt = tool_uses[j]
+                        if not is_safe(nxt["name"], nxt["input"]):
+                            break
+                        if needs_confirm(j):
+                            break
+                        j += 1
+                if j == i + 1:
+                    # Serial, inline in THIS task — also for an isolated parallel-safe block
+                    # (A7c: a "batch of one" gains nothing from a task and must not log a
+                    # batch event).
+                    with bind_tool_use_id(tu["id"]):
+                        outcome = await executor(tu["name"], tu["input"])
+                    self._freeze_call(
+                        calls=calls,
+                        tu=tu,
+                        outcome=outcome,
+                        max_result_chars=max_result_chars,
+                        images_used=images_used,
+                        max_turn_images=max_turn_images,
+                        max_turn_image_bytes=max_turn_image_bytes,
                     )
+                    i += 1
+                    continue
+                batch = tool_uses[i:j]
+                outcomes = await self._run_batch(
+                    batch=batch,
+                    executor=executor,
+                    limit=cast("int", max_parallel_calls),
+                    round_index=round_ctx.round_index,
                 )
-            return _RoundCompleted(calls=calls)
+                for btu, outcome in zip(batch, outcomes, strict=True):
+                    self._freeze_call(
+                        calls=calls,
+                        tu=btu,
+                        outcome=outcome,
+                        max_result_chars=max_result_chars,
+                        images_used=images_used,
+                        max_turn_images=max_turn_images,
+                        max_turn_image_bytes=max_turn_image_bytes,
+                    )
+                i = j
+        return _RoundCompleted(calls=calls)
+
+    def _freeze_call(
+        self,
+        *,
+        calls: list[ToolCall],
+        tu: dict[str, Any],
+        outcome: ToolResult,
+        max_result_chars: int | None,
+        images_used: dict[str, int],
+        max_turn_images: int | None,
+        max_turn_image_bytes: int | None,
+    ) -> None:
+        """Cap one executor result (T-081a text cap + T-135 image budget) and append its
+        ToolCall. Always called in tool_use order, so the image budget and audit events
+        are identical whether the call ran serially or in a concurrent batch (T-7092)."""
+        capped = self._cap_result(
+            tool_name=tu["name"],
+            outcome=outcome,
+            max_result_chars=max_result_chars,
+            images_used=images_used,
+            max_turn_images=max_turn_images,
+            max_turn_image_bytes=max_turn_image_bytes,
+        )
+        calls.append(
+            ToolCall(
+                id=tu["id"],
+                name=tu["name"],
+                input=tu["input"],
+                result=capped.content,
+                is_error=capped.is_error,
+                images=capped.images,
+            )
+        )
+
+    async def _run_batch(
+        self,
+        *,
+        batch: list[dict[str, Any]],
+        executor: ToolExecutor,
+        limit: int,
+        round_index: int,
+    ) -> list[ToolResult]:
+        """Execute `batch` concurrently, at most `limit` in flight; return outcomes in
+        `batch` order (T-7092). Every member settles before this returns or raises — no
+        orphaned tasks. The FIRST exception in batch order is re-raised as-is (the same
+        type the serial loop would raise; never an ExceptionGroup). Outer cancellation
+        propagates into every member via `gather`."""
+        sem = asyncio.Semaphore(limit)
+
+        async def one(tu: dict[str, Any]) -> ToolResult:
+            # Bound INSIDE the task: each concurrent call sees only its own id (A7b).
+            async with sem:
+                with bind_tool_use_id(tu["id"]):
+                    return await executor(tu["name"], tu["input"])
+
+        started = time.monotonic()
+        settled = await asyncio.gather(*(one(tu) for tu in batch), return_exceptions=True)
+        self._audit.info(
+            "tool_loop_parallel_batch",
+            round_index=round_index,
+            size=len(batch),
+            tool_names=[tu["name"] for tu in batch],
+            elapsed_ms=round((time.monotonic() - started) * 1000),
+        )
+        results: list[ToolResult] = []
+        for item in settled:
+            if isinstance(item, BaseException):
+                raise item
+            results.append(item)
+        return results
 
     def _cap_images(
         self,
