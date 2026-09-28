@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.34.0 — 2026-09-28
+
+### Added
+
+- `ToolRoundContext.assistant_text: str = ""` — the text the model wrote in the same response
+  as the round's tool_use blocks, bound for every executor invocation of that round (serial,
+  concurrent and resume paths; a resumed round carries the suspending round's text). Lets a
+  consumer surface the model's narration while the round's tools run, at zero extra token
+  cost. Model output, untrusted and unguarded: the loop applies no policy to it. Additive —
+  keyword construction without the field is unchanged. (TBP T-7154)
+
 ## v0.33.0 — 2026-09-24
 
 ### Added

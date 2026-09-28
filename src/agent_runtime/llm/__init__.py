@@ -22,7 +22,8 @@ Public surface:
   ``ResumeDecision``, ``ConfirmPredicate`` — confirm-before-dispatch (T-025a)
 - ``ParallelSafePredicate`` — opt-in concurrent tool calls (T-7092)
 - ``ToolRoundContext``, ``current_tool_round``, ``bind_tool_round`` — the executing round's
-  index / remaining tool-round budget, readable by an executor with no signature change (T-115j);
+  index / remaining tool-round budget, readable by an executor with no signature change (T-115j),
+  and the round's assistant text (T-7154);
   ``current_tool_use_id`` / ``bind_tool_use_id`` — the executing call's tool_use id (T-7092)
 
 See ``agent_runtime.llm.client.AnthropicClient.complete`` docstring for the

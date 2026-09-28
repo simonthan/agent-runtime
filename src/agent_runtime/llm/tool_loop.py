@@ -469,7 +469,9 @@ class ToolUseLoop:
         calls: list[ToolCall] = [self._call_from_dict(c) for c in rnd["calls"]]
         # T-115j — `state["rounds"]` already counts the suspending round (see _suspend's
         # docstring), so it IS this round's 1-based index; resume must not re-increment.
-        round_ctx = ToolRoundContext(round_index=rounds, max_rounds=max_rounds)
+        round_ctx = ToolRoundContext(
+            round_index=rounds, max_rounds=max_rounds, assistant_text=rnd["assistant_text"]
+        )
 
         # Resolve the pending block per the user's decision (D1).
         pending = tool_uses[pending_index]
@@ -633,7 +635,10 @@ class ToolUseLoop:
                 max_turn_image_bytes=max_turn_image_bytes,
                 # T-115j — the executor's only view of the round budget. `rounds` was
                 # incremented for THIS round on the line above, so it is the 1-based index.
-                round_ctx=ToolRoundContext(round_index=rounds, max_rounds=max_rounds),
+                # T-7154 -- plus the text the model wrote beside this round's tool calls.
+                round_ctx=ToolRoundContext(
+                    round_index=rounds, max_rounds=max_rounds, assistant_text=resp.content
+                ),
                 parallel_safe=parallel_safe,
                 max_parallel_calls=max_parallel_calls,
             )

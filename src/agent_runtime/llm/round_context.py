@@ -11,8 +11,10 @@ unconditionally and a 2-arg callable raises TypeError. Signature sniffing is wor
 the loop binds it around each executor invocation, an executor that never reads it
 behaves byte-for-byte as before, and a reader outside a loop gets None.
 
-POLICY-FREE (tool_loop.py module docstring): this publishes NUMBERS only. No
-advisory text, no "how close is close" threshold, no user messaging -- the consumer
+POLICY-FREE (tool_loop.py module docstring): this publishes FACTS about the round
+only -- its position in the budget and the text the model wrote alongside its
+tool_use blocks (T-7154). No advisory text, no "how close is close" threshold, no
+user messaging, no decision about whether that text is fit to show -- the consumer
 owns all of that. Same division as ``max_rounds`` itself, which the loop enforces
 but never chooses.
 
@@ -24,7 +26,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # ruff select=["ALL"] here: TC003 wants annotation-only stdlib imports guarded
@@ -47,10 +49,22 @@ class ToolRoundContext:
     increment for this round (tool_loop.py ``_drive``), so the first tool round
     reports ``round_index=1``. ``max_rounds`` is the cap the consumer passed to
     ``run()``/``resume()``, verbatim.
+
+    ``assistant_text`` (T-7154) is ALL text blocks of the SAME response as this round's
+    tool_use blocks, concatenated with no separator -- exactly what
+    ``ToolLoopStep.assistant_text`` later records, and ``""`` when the model wrote none.
+    It is model output: UNTRUSTED and UNGUARDED. It is written after earlier rounds'
+    tool results, so it can echo content injected through them, and it is
+    forward-looking, so it can claim an action that has not happened ("I've sent it").
+    No consumer-side output guard has seen it. A resumed round carries the suspending
+    round's text. The final answer is never a tool round, so it never appears here.
+    Defaulted so keyword construction keeps working; excluded from ``repr`` (keeps model
+    text out of logs and tracebacks) and from equality (compares numbers only, as before).
     """
 
     round_index: int
     max_rounds: int
+    assistant_text: str = field(default="", repr=False, compare=False)
 
     @property
     def rounds_remaining(self) -> int:
