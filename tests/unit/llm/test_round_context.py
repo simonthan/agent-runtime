@@ -32,6 +32,20 @@ def test_rounds_remaining_is_clamped_never_negative() -> None:
     assert ToolRoundContext(round_index=1, max_rounds=0).rounds_remaining == 0
 
 
+def test_t7154_assistant_text_defaults_to_empty() -> None:
+    """T-7154: additive field -- existing keyword construction keeps working and reads ""."""
+    ctx = ToolRoundContext(round_index=1, max_rounds=3)
+    assert ctx.assistant_text == ""
+    assert ToolRoundContext(round_index=1, max_rounds=3, assistant_text="hi").assistant_text == "hi"
+
+
+def test_t7154_assistant_text_kept_out_of_repr_and_equality() -> None:
+    """R3: model text never reaches a log line via repr, and equality stays numbers-only."""
+    ctx = ToolRoundContext(round_index=1, max_rounds=3, assistant_text="SECRET-ISH")
+    assert "SECRET-ISH" not in repr(ctx)
+    assert ctx == ToolRoundContext(round_index=1, max_rounds=3)
+
+
 def test_unbound_context_is_none() -> None:
     """The compat contract: a reader outside a loop learns nothing and changes nothing."""
     assert current_tool_round() is None

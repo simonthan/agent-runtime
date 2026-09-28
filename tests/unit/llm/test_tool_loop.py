@@ -20,6 +20,7 @@ from agent_runtime.llm.tool_loop import ExecuteDecision, InjectResultDecision, T
 from .fakes import (
     FakeAsyncAnthropic,
     FakeMessage,
+    FakeTextBlock,
     FakeToolUseBlock,
     FakeUsage,
     make_ok,
@@ -1209,6 +1210,119 @@ async def test_resume_binds_the_suspending_round_index() -> None:
     )
     assert seen == [(1, 3)]
     assert current_tool_round() is None
+
+
+@pytest.mark.asyncio
+async def test_t7154_executor_sees_round_assistant_text() -> None:
+    """T-7154: each round binds the text the model wrote alongside its tool_use blocks;
+    a round with no text binds "" (never None), and the final answer is never bound."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        make_tool_use(tool_id="tu_0", name="search", text="Let me check your inbox.")
+    )
+    sdk.messages.responses.append(make_tool_use(tool_id="tu_1", name="search"))
+    sdk.messages.responses.append(make_ok(text="FINAL ANSWER"))
+    seen: list[str] = []
+
+    async def recording(_name: str, _inp: dict) -> ToolResult:
+        ctx = current_tool_round()
+        assert ctx is not None
+        seen.append(ctx.assistant_text)
+        return ToolResult("hit")
+
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[{"name": "search", "input_schema": {}}],
+        executor=recording,
+        max_rounds=5,
+    )
+
+    assert seen == ["Let me check your inbox.", ""]
+    assert current_tool_round() is None
+
+
+@pytest.mark.asyncio
+async def test_t7154_resume_binds_the_suspending_rounds_text() -> None:
+    """T-7154: the resumed round is the suspending round, so it carries that round's text."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        make_tool_use(name="write", tool_input={"x": 1}, text="I'll save the draft.")
+    )
+    sdk.messages.responses.append(make_ok(text="done"))
+    seen: list[str] = []
+
+    async def recording(_name: str, _inp: dict) -> ToolResult:
+        ctx = current_tool_round()
+        assert ctx is not None
+        seen.append(ctx.assistant_text)
+        return ToolResult("written")
+
+    tools = [{"name": "write", "input_schema": {}}]
+    suspended = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=tools,
+        executor=recording,
+        max_rounds=4,
+        confirm=lambda n, _i: n == "write",
+    )
+    assert suspended.pending_confirmation is not None
+
+    await loop.resume(
+        state=suspended.pending_confirmation.state,
+        decision=ExecuteDecision(),
+        tools=tools,
+        executor=recording,
+        confirm=lambda _n, _i: False,
+        static_system_prefix="SYS",
+        max_rounds=4,
+    )
+    assert seen == ["I'll save the draft."]
+
+
+@pytest.mark.asyncio
+async def test_t7154_read_then_confirm_round_binds_text_on_both_sides_of_suspend() -> None:
+    """R3: a read runs BEFORE the suspend and the write runs on resume -- both see the same
+    round text (the consumer owns de-duplicating a re-shown narration, plan D3)."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    msg = _round(("t1", "read", {"k": "1"}), ("t2", "write", {"k": "2"}))
+    msg.content.insert(0, FakeTextBlock(text="Reading, then saving."))
+    sdk.messages.responses.append(msg)
+    sdk.messages.responses.append(make_ok(text="done"))
+    seen: list[str] = []
+
+    async def recording(_name: str, _inp: dict) -> ToolResult:
+        ctx = current_tool_round()
+        assert ctx is not None
+        seen.append(ctx.assistant_text)
+        return ToolResult("ok")
+
+    tools = [{"name": "read", "input_schema": {}}, {"name": "write", "input_schema": {}}]
+    suspended = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=tools,
+        executor=recording,
+        max_rounds=4,
+        confirm=lambda n, _i: n == "write",
+    )
+    assert suspended.pending_confirmation is not None
+    assert seen == ["Reading, then saving."]
+
+    await loop.resume(
+        state=suspended.pending_confirmation.state,
+        decision=ExecuteDecision(),
+        tools=tools,
+        executor=recording,
+        confirm=lambda _n, _i: False,
+        static_system_prefix="SYS",
+        max_rounds=4,
+    )
+    assert seen == ["Reading, then saving."] * 2
 
 
 @pytest.mark.asyncio
@@ -2804,6 +2918,30 @@ async def test_t7092_round_context_visible_in_every_concurrent_call():
     assert all(r is not None for r in tracker.rounds)
     assert all(r.round_index == 1 for r in tracker.rounds)
     assert all(r.max_rounds == 3 for r in tracker.rounds)
+
+
+@pytest.mark.asyncio
+async def test_t7154_round_text_visible_in_every_concurrent_call():
+    """T-7154: every call of a concurrent batch sees the same round text."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    msg = _round(("t1", "read_a", {"k": "1"}), ("t2", "read_b", {"k": "2"}))
+    msg.content.insert(0, FakeTextBlock(text="Checking both files."))
+    sdk.messages.responses.append(msg)
+    sdk.messages.responses.append(make_ok(text="done"))
+
+    tracker = _Tracker()
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=tracker,
+        max_rounds=3,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+    )
+
+    assert [r.assistant_text for r in tracker.rounds] == ["Checking both files."] * 2
 
 
 @pytest.mark.asyncio
