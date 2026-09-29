@@ -11,6 +11,7 @@ from botframework.connector.auth import AuthenticationConstants, MicrosoftAppCre
 from agent_runtime.transport.teams import TeamsAdapter, TeamsAdapterConfig
 from agent_runtime.transport.teams import _msal as _msal_module
 from agent_runtime.transport.teams._msal import BoundedAppCredentials
+from agent_runtime.transport.teams.testing import make_conversation_ref
 
 
 class _NoOpHandler:
@@ -194,6 +195,68 @@ async def test_warm_gate_mirrors_the_sdk_gate_literally(_mock_token):  # noqa: P
     blank_secret = TeamsAdapter(TeamsAdapterConfig("a", "", "t"), _NoOpHandler())
     assert await blank_secret.warm_connector_token() is True
     _mock_token.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# T-7161a -- on_invoke_activity opts into OID-only identity for message-extension invokes
+# ---------------------------------------------------------------------------
+
+
+def _invoke_ctx(name):
+    ctx = MagicMock()
+    ctx.activity = MagicMock()
+    ctx.activity.name = name
+    ctx.activity.value = {"commandId": "cmd"}
+    return ctx
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("composeExtension/fetchTask", True),
+        ("composeExtension/submitAction", True),
+        ("adaptiveCard/action", False),
+        ("signin/tokenExchange", False),
+        ("composeExtension/query", False),
+        ("", False),
+    ],
+)
+async def test_on_invoke_allows_oid_only_for_message_extension_actions_only(name, expected):
+    seen: list[bool] = []
+
+    async def _fake_resolve(_turn_context, *, allow_oid_only=False):
+        seen.append(allow_oid_only)
+
+    adapter = TeamsAdapter(TeamsAdapterConfig("a", "p", "t"), _NoOpHandler())
+    with patch("agent_runtime.transport.teams.adapter.resolve_identity", _fake_resolve):
+        result = await adapter._handler.on_invoke_activity(_invoke_ctx(name))
+
+    assert seen == [expected]
+    assert result.status == 401  # the fake resolves nothing -> fail closed as before
+
+
+async def test_on_invoke_dispatches_oid_only_ref_to_the_handler():
+    """An OID-only ref reaches the consumer as an InboundInvoke with user_email=""."""
+    events = []
+
+    class _Recording:
+        async def on_event(self, event, outbound):
+            events.append(event)
+
+    ref = make_conversation_ref(user_email="")
+    adapter = TeamsAdapter(TeamsAdapterConfig("a", "p", "t"), _Recording())
+    with patch(
+        "agent_runtime.transport.teams.adapter.resolve_identity",
+        new_callable=AsyncMock,
+        return_value=ref,
+    ):
+        result = await adapter._handler.on_invoke_activity(
+            _invoke_ctx("composeExtension/submitAction")
+        )
+
+    assert result.status == 200
+    assert events[0].name == "composeExtension/submitAction"
+    assert events[0].conversation_ref.user_email == ""
 
 
 async def test_on_message_sends_best_effort_reply_when_identity_fails():

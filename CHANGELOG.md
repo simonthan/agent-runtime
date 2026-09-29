@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.35.0 — 2026-09-29
+
+### Changed
+
+- `TeamsAdapter` accepts an **OID-only identity** (`ConversationRef.user_email == ""`) for the
+  message-extension invokes `composeExtension/fetchTask` and `composeExtension/submitAction`
+  (new constant `transport.teams.identity.OID_ONLY_INVOKE_NAMES`). These invokes fire from the
+  message overflow menu of conversations the bot is not a member of, where
+  `TeamsInfo.get_member` always fails with `BotNotInConversationRoster`, so they used to be
+  dropped with a 401 ("Unable to reach app"). The OID comes from the JWT-authenticated
+  activity's `from.aadObjectId`; with no OID the invoke is still dropped. **Consumers handling
+  those two invokes must key identity on `aad_object_id` and tolerate an empty email.** Every
+  other activity type keeps the fail-closed no-email drop. (TBP T-7161a)
+
+### Added
+
+- `resolve_identity(turn_context, *, allow_oid_only: bool = False)` — keyword-only opt-in used
+  by the adapter for the invokes above. Default unchanged. (TBP T-7161a)
+
 ## v0.34.0 — 2026-09-28
 
 ### Added
