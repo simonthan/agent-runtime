@@ -83,6 +83,70 @@ async def test_resolve_identity_fails_closed_when_graph_returns_no_email(mock_ge
     assert any("Dropping inbound activity" in r.message for r in caplog.records)
 
 
+# ---------------------------------------------------------------------------
+# T-7161a -- OID-only identity for message-extension invokes
+# ---------------------------------------------------------------------------
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_oid_only_accepted_when_allowed_and_roster_lookup_fails(mock_get_member, caplog):
+    """The live 2026-09-29 failure: the bot is not in the conversation, so get_member raises
+    BotNotInConversationRoster; from.aadObjectId is still present. With allow_oid_only the
+    ref survives with an empty email instead of a 401."""
+    mock_get_member.side_effect = RuntimeError("(BotNotInConversationRoster) not in roster")
+    caplog.set_level(logging.INFO)
+    ref = await resolve_identity(
+        _turn_context(from_aad="aad-oid-only", conversation_type="groupChat"),
+        allow_oid_only=True,
+    )
+    assert ref is not None
+    assert ref.aad_object_id == "aad-oid-only"
+    assert ref.user_email == ""
+    assert ref.conversation_type == "groupChat"
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(
+        "Accepting OID-only identity" in m and "tenant_id=tenant-test" in m for m in messages
+    )
+    assert not any("Dropping inbound activity" in m for m in messages)
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_oid_only_accepted_when_member_has_oid_but_no_email(mock_get_member):
+    mock_get_member.return_value = SimpleNamespace(aad_object_id="aad-x", email="", name="X")
+    ref = await resolve_identity(_turn_context(), allow_oid_only=True)
+    assert ref is not None
+    assert (ref.aad_object_id, ref.user_email, ref.user_display_name) == ("aad-x", "", "X")
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_oid_only_still_drops_when_no_oid_either(mock_get_member, caplog):
+    """allow_oid_only relaxes the EMAIL requirement only; with no OID the user is
+    unidentifiable and the fail-closed drop stands."""
+    mock_get_member.side_effect = RuntimeError("Graph unreachable")
+    caplog.set_level(logging.INFO)
+    ref = await resolve_identity(_turn_context(from_aad=""), allow_oid_only=True)
+    assert ref is None
+    assert any("Dropping inbound activity" in r.getMessage() for r in caplog.records)
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_oid_only_keeps_email_when_roster_lookup_succeeds(mock_get_member):
+    """In a conversation the bot IS in, the invoke keeps the resolved email."""
+    mock_get_member.return_value = SimpleNamespace(
+        aad_object_id="aad-1", email="u@example.com", name="User One"
+    )
+    ref = await resolve_identity(_turn_context(), allow_oid_only=True)
+    assert ref is not None
+    assert ref.user_email == "u@example.com"
+
+
+@patch("agent_runtime.transport.teams.identity.TeamsInfo.get_member", new_callable=AsyncMock)
+async def test_default_still_drops_oid_only_identity(mock_get_member):
+    """Regression guard: without the opt-in, an OID with no email is still dropped."""
+    mock_get_member.side_effect = RuntimeError("(BotNotInConversationRoster) not in roster")
+    assert await resolve_identity(_turn_context(from_aad="aad-oid-only")) is None
+
+
 def test_extract_tenant_id_prefers_conversation_tenant():
     """Tenant ID resolution: conversation.tenant_id wins when present."""
     activity = SimpleNamespace(

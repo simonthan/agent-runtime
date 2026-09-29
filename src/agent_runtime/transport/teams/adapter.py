@@ -34,7 +34,7 @@ from agent_runtime.transport.teams.events import (
     InboundMessage,
     InlineImageAttachment,
 )
-from agent_runtime.transport.teams.identity import resolve_identity
+from agent_runtime.transport.teams.identity import OID_ONLY_INVOKE_NAMES, resolve_identity
 from agent_runtime.transport.teams.outbound import BotFrameworkOutboundChannel
 
 if TYPE_CHECKING:
@@ -220,12 +220,15 @@ class _EventDispatchingHandler(ActivityHandler):
         await self._handler.on_event(event, BotFrameworkOutboundChannel(turn_context))
 
     async def on_invoke_activity(self, turn_context: TurnContext) -> InvokeResponse:
-        ref = await resolve_identity(turn_context)
+        name = turn_context.activity.name or ""
+        # T-7161a -- message-extension actions fire in conversations the bot is not in;
+        # accept the OID alone for exactly those invoke names (``user_email=""``).
+        ref = await resolve_identity(turn_context, allow_oid_only=name in OID_ONLY_INVOKE_NAMES)
         if ref is None:
             return InvokeResponse(status=401)
         event = InboundInvoke(
             conversation_ref=ref,
-            name=turn_context.activity.name or "",
+            name=name,
             value=(
                 turn_context.activity.value
                 if isinstance(turn_context.activity.value, dict)

@@ -9,6 +9,15 @@ Strategy:
 - Fail closed: drop the activity (return None + structured WARNING) if no
   email can be resolved. The handler is not invoked for unidentifiable
   users — they cannot be ACL-checked, billed, or audited.
+- Exception (T-7161a): a caller may pass ``allow_oid_only=True`` for the
+  message-extension invokes in ``OID_ONLY_INVOKE_NAMES``. Those invokes fire
+  in conversations the bot is NOT a member of (another person's chat, a
+  channel without the app), where ``get_member`` always fails with
+  ``BotNotInConversationRoster``. The activity is still Bot Framework
+  JWT-authenticated and ``from.aadObjectId`` is set by the Teams service, so
+  the Entra OID alone identifies the user for ACL checks; the ref then carries
+  ``user_email=""`` and the consumer must key everything on
+  ``aad_object_id``. No OID either -> still dropped.
 
 WARNING — Graph rate limits. Every inbound activity makes one Graph call.
 Microsoft caps ``/teams/{id}/members/{userId}`` at ~10k req / 10 min per tenant
@@ -18,7 +27,8 @@ hit throttling. Consumers scaling beyond a single department MUST layer a
 Redis cache keyed on ``(tenant_id, from_property.id)`` with ~15-minute TTL
 in front of ``resolve_identity``; see T-008e Open follow-ups.
 
-PII note: the structured WARNING on the drop path logs ``from_id`` (opaque
+PII note: the structured WARNING on the drop path (and the T-7161a OID-only INFO line) logs
+``from_id`` (opaque
 ``29:<base64>`` Bot Framework identifier) and ``aad_object_id`` (Entra GUID).
 Neither is direct PII per Microsoft's Teams audit guidance — both are
 operational identifiers, not personal data. Email is intentionally NOT logged.
@@ -48,6 +58,14 @@ _HTTP_CLIENT_ERROR_MIN = 400
 _HTTP_SERVER_ERROR_MIN = 500
 _RETRY_BASE_DELAY_SECONDS = 0.25
 _RETRY_JITTER_SECONDS = 0.25
+
+# T-7161a -- invokes that may resolve to an OID-only identity (``user_email=""``).
+# Message-extension action commands run from the message overflow menu of ANY
+# conversation, including ones the bot is not a member of, where the roster lookup
+# cannot succeed. Every other activity type keeps the no-email drop.
+OID_ONLY_INVOKE_NAMES: frozenset[str] = frozenset(
+    {"composeExtension/fetchTask", "composeExtension/submitAction"}
+)
 
 
 def _extract_tenant_id(activity: Any) -> str:
@@ -127,8 +145,15 @@ async def _get_member_with_retry(turn_context: TurnContext, member_id: str) -> A
         return await TeamsInfo.get_member(turn_context, member_id)
 
 
-async def resolve_identity(turn_context: TurnContext) -> ConversationRef | None:
-    """Return a populated ConversationRef or None if the user cannot be identified."""
+async def resolve_identity(
+    turn_context: TurnContext, *, allow_oid_only: bool = False
+) -> ConversationRef | None:
+    """Return a populated ConversationRef or None if the user cannot be identified.
+
+    ``allow_oid_only`` (T-7161a): when no email resolves but an Entra OID does, return a
+    ref with ``user_email=""`` instead of dropping. Callers set it ONLY for the invoke
+    names in ``OID_ONLY_INVOKE_NAMES``; the default keeps the fail-closed drop.
+    """
     activity = turn_context.activity
     from_info = activity.from_property
 
@@ -152,7 +177,21 @@ async def resolve_identity(turn_context: TurnContext) -> ConversationRef | None:
         # Only aad_object_id can come from from_property; email cannot.
         aad_object_id = getattr(from_info, "aad_object_id", "") or ""
 
-    if not email:
+    if not email and allow_oid_only and aad_object_id:
+        # tenant_id: nothing checks the activity tenant against the configured one, and the
+        # roster lookup (the only implicit check) just failed -- make a foreign-tenant invoker
+        # visible in the log.
+        logger.info(
+            "Accepting OID-only identity for invoke (name=%s from_id=%s aad_object_id=%s "
+            "tenant_id=%s conversation_type=%s) -- no email resolved; consumer keys on "
+            "aad_object_id.",
+            getattr(activity, "name", "") or "",
+            from_info.id,
+            aad_object_id,
+            _extract_tenant_id(activity),
+            getattr(activity.conversation, "conversation_type", "") or "unknown",
+        )
+    elif not email:
         conv_type = getattr(activity.conversation, "conversation_type", "") or "unknown"
         logger.warning(
             "Dropping inbound activity — no email resolved for Teams user "
