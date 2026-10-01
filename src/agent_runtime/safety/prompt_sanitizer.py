@@ -1,8 +1,9 @@
 """Defense-in-depth sanitization for user-controlled text fed to LLM prompts.
 
-Strips control chars + prompt-injection sentinels; caps length. Use at every
-boundary where user input enters an LLM prompt. Always str.replace, never
-str.format (per feedback_str_format_db_injection landmine).
+Strips control chars + prompt-injection sentinels; normalizes whitespace (line
+breaks kept only with ``keep_line_breaks=True``); caps length. Use at every boundary
+where user input enters an LLM prompt. Always str.replace, never str.format
+(per feedback_str_format_db_injection landmine).
 """
 
 import re
@@ -50,7 +51,9 @@ _PLATFORM_PROVENANCE_PREFIX = "[platform]"
 # Matches the OPENER only — deliberately. Requiring a closing `]` was tried and rejected: it
 # left three bypasses (an embedded newline, a body longer than any bound, and a simply
 # UNCLOSED `[platform …`), and in sanitize_for_llm_prompt the newline case then re-formed a
-# BYTE-IDENTICAL canonical marker, because whitespace collapse runs AFTER this substitution.
+# BYTE-IDENTICAL canonical marker, because whitespace normalization runs AFTER this
+# substitution (by default the newline becomes a space; with keep_line_breaks=True the
+# `\s*` below already spans it).
 # Killing the opener destroys the first-party frame regardless of what follows; a stray `]`
 # left behind is inert noise.
 #   \[\s*platform   a bracket that OPENS with the token
@@ -112,16 +115,58 @@ def _sub_to_fixed_point(rx: re.Pattern[str], s: str) -> str:
     return s
 
 
-def sanitize_for_llm_prompt(text: str | None, max_len: int = 2000) -> str:
+# T-7213: line breaks other than \n that str.split()/str.splitlines() honour. VT/FF and
+# \x1c-\x1f are already blanked by _strip_control_chars; NEL (U+0085), LINE SEPARATOR
+# (U+2028) and PARAGRAPH SEPARATOR (U+2029) are not control chars in that set, so they are
+# folded to \n here together with CRLF / lone CR.
+_LINE_BREAK_RE = re.compile("\r\n|[\r\x85\u2028\u2029]")
+# Any whitespace EXCEPT \n (spaces, tabs, NBSP-class and other Unicode spaces) — collapsed
+# to one space within a line.
+_INLINE_WS_RUN_RE = re.compile(r"[^\S\n]+")
+# Four or more newlines = three or more blank lines; capped at two blank lines.
+_EXCESS_BLANK_LINES_RE = re.compile(r"\n{4,}")
+
+
+def _normalize_whitespace(s: str, *, keep_line_breaks: bool) -> str:
+    r"""Collapse whitespace; keep line structure only when ``keep_line_breaks``.
+
+    Default: every whitespace run, newlines included, -> one space (one line out).
+    ``keep_line_breaks`` (TBP T-7213): CRLF / CR / NEL / LS / PS -> ``\n``; each run of
+    non-newline whitespace -> one space; trailing whitespace stripped from every line; at
+    most two consecutive blank lines; leading/trailing blank space of the whole text stripped.
+
+    Cannot manufacture a sentinel (runs AFTER the sentinel pass): it never deletes the last
+    whitespace character between two non-whitespace characters, every literal sentinel is
+    whitespace-free, and the provenance fragment's ``\s*`` matches any whitespace run, so the
+    match set over non-whitespace text is unchanged.
+    """
+    if not keep_line_breaks:
+        return " ".join(s.split())
+    s = _LINE_BREAK_RE.sub("\n", s)
+    s = "\n".join(_INLINE_WS_RUN_RE.sub(" ", line).rstrip() for line in s.split("\n"))
+    return _EXCESS_BLANK_LINES_RE.sub("\n\n\n", s).strip()
+
+
+def sanitize_for_llm_prompt(
+    text: str | None, max_len: int = 2000, *, keep_line_breaks: bool = False
+) -> str:
     """Return text safe to interpolate into an LLM prompt.
 
     - None / non-str → ""
     - NFKC-normalized; zero-width/format chars stripped
-    - Control chars → space
+    - Control chars (except \\t \\n \\r) → space
     - Injection sentinels + the `[platform]` first-party provenance prefix and its
       bracketed near-variants (case-insensitive) → space, so a user turn cannot forge
       the first-party provenance marker (T-132)
-    - Whitespace collapsed
+    - Whitespace collapsed: every run, newlines included, → one space, so the result is
+      always ONE line — safe in a one-line prompt slot (a filename, subject, id, label,
+      inline excerpt), where a newline would let the value start a prompt line of its own.
+    - ``keep_line_breaks=True`` (TBP T-7213) keeps the line structure instead, for a block
+      that is the whole message or sits on lines of its own (a chat turn, pasted
+      instructions): CRLF, CR, NEL (U+0085), LS (U+2028) and PS (U+2029) → LF; runs of
+      other whitespace within a line → one space; trailing whitespace per line dropped; at
+      most two consecutive blank lines; outer whitespace stripped. Text with no line break
+      in it gives the same output in both modes.
     - Truncated to max_len with "…(truncated)" suffix
     """
     if text is None:
@@ -129,7 +174,7 @@ def sanitize_for_llm_prompt(text: str | None, max_len: int = 2000) -> str:
     s = _normalize(str(text))
     s = _strip_control_chars(s)
     s = _sub_to_fixed_point(_SENTINEL_RE, s)
-    s = " ".join(s.split())  # collapse whitespace
+    s = _normalize_whitespace(s, keep_line_breaks=keep_line_breaks)
     if len(s) > max_len:
         # Re-neutralize the truncated head BEFORE appending the suffix: truncation can
         # manufacture a fresh sentinel by cutting a longer word short ("[platformer]"
@@ -141,7 +186,7 @@ def sanitize_for_llm_prompt(text: str | None, max_len: int = 2000) -> str:
 # Role/instruction-injection markers an indirect payload would use to escape the
 # data boundary. Narrower than _INJECTION_SENTINELS: excludes ```/{{/}} — those are
 # legitimate in tool output (code, tables, JSON), so structure is preserved here
-# (no whitespace collapse, unlike sanitize_for_llm_prompt).
+# (no whitespace normalization at all, unlike sanitize_for_llm_prompt).
 _TOOL_RESULT_SENTINELS = ("<|", "|>", "SYSTEM:", "ASSISTANT:", "USER:", "[INST]", "[/INST]")
 
 _TOOL_OUTPUT_OPEN = "<tool_output>"
@@ -172,7 +217,7 @@ def sanitize_tool_result(text: str | None, max_len: int = 8000) -> str:
     """Neutralize untrusted tool/MCP-result text before it re-enters the model.
 
     Indirect-injection complement to sanitize_for_llm_prompt. Unlike that function
-    (built for short user turns), this PRESERVES newlines/structure and keeps
+    (built for user turns), this leaves whitespace exactly as received and keeps
     ```/{{/}} — tool output is legitimately long and structured. Steps:
 
     - None -> "" (and empty/whitespace-only content -> "", no envelope) so empty
