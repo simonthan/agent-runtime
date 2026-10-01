@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.36.0 — 2026-10-01
+
+### Added
+
+- `sanitize_for_llm_prompt(..., *, keep_line_breaks: bool = False)` — keyword-only opt-in
+  that keeps the text's line structure instead of collapsing it to one line: CRLF, lone CR,
+  NEL (U+0085), LINE SEPARATOR (U+2028) and PARAGRAPH SEPARATOR (U+2029) become `\n`; each
+  run of other whitespace within a line becomes one space; trailing whitespace is dropped
+  from every line; at most two consecutive blank lines are kept; outer whitespace is
+  stripped. Control-char blanking, NFKC / zero-width folding, sentinel and `[platform]`
+  provenance stripping (T-132) and the `max_len` cap with its re-neutralized head apply
+  unchanged. Use it for a block that is a whole message or sits on lines of its own (a chat
+  turn, pasted instructions); keep the default for any value placed in a one-line prompt
+  slot (a filename, subject, id, label or inline excerpt), where a newline would let the
+  value start a prompt line of its own. **The default is unchanged byte-for-byte.** (TBP T-7213)
+
 ## v0.35.0 — 2026-09-29
 
 ### Changed
