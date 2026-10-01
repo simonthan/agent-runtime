@@ -15,6 +15,14 @@ across processes), surfaces the proposal, then calls ``resume(state=..., decisio
 once the user decides. The loop stays policy-free: it never learns the approval UX,
 the persistence, or which tools are writes. With ``confirm=None`` (the default) the loop
 behaves byte-for-byte as before — the regression guarantee.
+
+Empty-reply recovery (T-7219): with ``ToolUseLoop(empty_final_nudge=...)`` set, a model
+call that comes back EMPTY after at least one committed tool round (no content blocks,
+or an ``end_turn`` with no text and no tool call) gets ONE recovery call: no tools, the
+caller's nudge appended as a text block to the trailing user turn. Still empty ->
+``final_text == ""`` with ``stop_reason == EMPTY_RESPONSE_STOP_REASON`` (or
+``"cap_exhausted"`` when the round cap was reached), ``steps`` intact, instead of an
+``LLMResponseError`` that discards every round. Default ``None`` = byte-for-byte unchanged.
 """
 
 from __future__ import annotations
@@ -27,12 +35,14 @@ from typing import Any, cast
 
 from agent_runtime.llm.client import AnthropicClient, assemble_history_messages
 from agent_runtime.llm.compaction import estimate_tokens
+from agent_runtime.llm.errors import LLMResponseError
 from agent_runtime.llm.models import LLMImage
 from agent_runtime.llm.round_context import ToolRoundContext, bind_tool_round, bind_tool_use_id
 from agent_runtime.logging import AuditLogger, NullAuditLogger
 from agent_runtime.safety.prompt_sanitizer import repair_clipped_tool_result
 
 __all__ = [
+    "EMPTY_RESPONSE_STOP_REASON",
     "ConfirmPredicate",
     "ExecuteDecision",
     "InjectResultDecision",
@@ -201,7 +211,9 @@ class ToolLoopResult:
     approval and the caller must surface it and call `resume()` (check this FIRST)."""
 
     final_text: str
-    stop_reason: str  # last stop_reason, "cap_exhausted", or "pending_confirmation"
+    # last stop_reason, "cap_exhausted", "pending_confirmation", or (T-7219, opt-in)
+    # EMPTY_RESPONSE_STOP_REASON
+    stop_reason: str
     cap_exhausted: bool
     steps: tuple[ToolLoopStep, ...]
     input_tokens: int
@@ -272,10 +284,51 @@ def _tool_result_content(call: ToolCall) -> str | list[dict[str, Any]]:
     return parts
 
 
+# T-7219 -- ToolLoopResult.stop_reason when a model call after a tool round came back empty
+# and the one recovery call (see ToolUseLoop's `empty_final_nudge`) was empty too.
+EMPTY_RESPONSE_STOP_REASON = "empty_response"
+
+
+def _is_empty_reply(resp: Any) -> bool:
+    """T-7219 -- a parsed reply that ended the turn with nothing: `end_turn`, no tool call,
+    no non-whitespace text. `max_tokens` / `refusal` are left to the caller as before."""
+    return resp.stop_reason == "end_turn" and not resp.tool_use and not resp.content.strip()
+
+
+def _with_trailing_user_text(messages: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:
+    """T-7219 -- a COPY of `messages` whose last user turn ends with one more text block.
+
+    After a committed round the last message is the user turn holding the tool_result
+    blocks; the text goes after them in that same turn (the API combines consecutive user
+    turns anyway, so this is the explicit form of Anthropic's "add a continuation prompt in
+    a new user message" advice for an empty end_turn). Any other tail gets a new user turn.
+    The live list is never mutated."""
+    block = {"type": "text", "text": text}
+    last = messages[-1] if messages else None
+    if last is not None and last.get("role") == "user":
+        content = last.get("content")
+        if isinstance(content, str):
+            parts: list[dict[str, Any]] = [{"type": "text", "text": content}] if content else []
+        else:
+            parts = list(content or [])
+        return [*messages[:-1], {**last, "content": [*parts, block]}]
+    return [*messages, {"role": "user", "content": [block]}]
+
+
 class ToolUseLoop:
-    def __init__(self, *, client: AnthropicClient, audit_logger: AuditLogger | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        client: AnthropicClient,
+        audit_logger: AuditLogger | None = None,
+        empty_final_nudge: str | None = None,
+    ) -> None:
+        """`empty_final_nudge` (T-7219) opts into empty-reply recovery (see the module
+        docstring). The text is the consumer's -- the loop stays policy-free about wording.
+        None or "" = off = byte-for-byte unchanged (regression guarantee)."""
         self._client = client
         self._audit: AuditLogger = audit_logger or NullAuditLogger()
+        self._empty_final_nudge: str | None = empty_final_nudge or None
 
     async def run(
         self,
@@ -312,7 +365,13 @@ class ToolUseLoop:
         BEFORE PATH A/B classification — a suspended turn is neither A nor B.
 
         `max_rounds=N` issues up to N+1 SDK calls (N tool rounds + 1 final no-tools
-        call). With `confirm=None` (default) behaviour is byte-for-byte unchanged.
+        call), plus at most ONE empty-reply recovery call when the loop was built with
+        `empty_final_nudge` (T-7219). With `confirm=None` (default) behaviour is
+        byte-for-byte unchanged.
+
+        CONTRACT (T-7219): with `empty_final_nudge` set, `final_text` MAY be empty with
+        `stop_reason == EMPTY_RESPONSE_STOP_REASON` (`cap_exhausted` False): a model call
+        after a tool round returned nothing twice. `steps` carries every round that ran.
 
         `cache_history=True` marks the last history message with a ``cache_control``
         ephemeral breakpoint so Anthropic caches the stable history prefix across
@@ -566,7 +625,7 @@ class ToolUseLoop:
             max_parallel_calls=max_parallel_calls,
         )
 
-    async def _drive(
+    async def _drive(  # noqa: C901 -- T-7219 empty-reply exits; same as _resolve_round
         self,
         *,
         system_blocks: list[dict[str, Any]],
@@ -602,13 +661,19 @@ class ToolUseLoop:
         the loop only handles injection mechanics."""
         wrap_up_text: str | None = None
         cap_reached = False
+        # T-7219 -- why a model call after a tool round came back empty ("no_content" =
+        # LLMResponseError, "empty_text" = end_turn with nothing), and which call it was.
+        empty_cause: str | None = None
+        empty_stage = "round"
         while rounds < max_rounds:
             # T-284 — check wrap-up hook before each LLM call
             if pre_completion_hook is not None and wrap_up_text is None:
                 wrap_up_text = pre_completion_hook()
                 if wrap_up_text is not None:
                     break
-            resp = await self._client.complete_messages(
+            resp, empty_cause = await self._call_or_empty(
+                rounds,
+                agg,
                 system_blocks=system_blocks,
                 messages=messages,
                 tools=tools,
@@ -616,7 +681,8 @@ class ToolUseLoop:
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
-            self._accumulate(agg, resp)
+            if empty_cause is not None:
+                break
             if resp.stop_reason != "tool_use" or not resp.tool_use:
                 return self._result(
                     resp.content, resp.stop_reason, cap_exhausted=False, steps=steps, agg=agg
@@ -677,18 +743,134 @@ class ToolUseLoop:
             # Preserve existing audit event — monitors key off this.
             self._audit.warning("tool_loop_cap_exhausted", rounds=rounds, max_rounds=max_rounds)
 
-        final = await self._client.complete_messages(
+        if empty_cause is None:
+            final, empty_cause = await self._call_or_empty(
+                rounds,
+                agg,
+                system_blocks=effective_system,
+                messages=messages,
+                tools=None,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            if empty_cause is None:
+                return self._result(
+                    final.content,
+                    "cap_exhausted" if cap_reached else final.stop_reason,
+                    cap_exhausted=cap_reached,
+                    steps=steps,
+                    agg=agg,
+                )
+            empty_stage = "final"
+        return await self._recover_empty_final(
             system_blocks=effective_system,
             messages=messages,
-            tools=None,
+            rounds=rounds,
+            max_rounds=max_rounds,
+            cause=empty_cause,
+            stage=empty_stage,
+            cap_reached=cap_reached,
+            steps=steps,
+            agg=agg,
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
         )
-        self._accumulate(agg, final)
+
+    async def _call_or_empty(
+        self, rounds: int, agg: dict[str, int], **call_kwargs: Any
+    ) -> tuple[Any, str | None]:
+        """One model call. Returns (response, None), or (response-or-None, cause) when the
+        reply is EMPTY and recovery applies (T-7219): "no_content" for the LLMResponseError
+        `_parse_response` raises on a content-less reply, "empty_text" for an end_turn with
+        nothing in it. With recovery off (or no round committed yet) both behave as before:
+        the error raises and the empty reply is returned as an answer."""
+        try:
+            resp = await self._client.complete_messages(**call_kwargs)
+        except LLMResponseError:
+            if not self._recovers_empty(rounds):
+                raise
+            return None, "no_content"
+        self._accumulate(agg, resp)
+        if self._recovers_empty(rounds) and _is_empty_reply(resp):
+            return resp, "empty_text"
+        return resp, None
+
+    def _recovers_empty(self, rounds: int) -> bool:
+        """T-7219 -- recovery is on, and at least one tool round has been committed (an
+        empty reply with no round behind it loses nothing and still raises)."""
+        return self._empty_final_nudge is not None and rounds > 0
+
+    async def _recover_empty_final(
+        self,
+        *,
+        system_blocks: list[dict[str, Any]],
+        messages: list[dict[str, Any]],
+        rounds: int,
+        max_rounds: int,
+        cause: str,
+        stage: str,
+        cap_reached: bool,
+        steps: list[ToolLoopStep],
+        agg: dict[str, int],
+        model: str | None,
+        max_tokens: int | None,
+        temperature: float | None,
+    ) -> ToolLoopResult:
+        """T-7219 -- the ONE recovery call after an empty reply: no tools, the consumer's
+        nudge after the last tool results. Re-sending the same request would not help --
+        the model has already decided its turn is over (and the default temperature is 0).
+        A non-empty reply is returned as the turn's answer; an empty one (either kind)
+        becomes final_text="" with EMPTY_RESPONSE_STOP_REASON. Any other LLMError raises."""
+        nudge = cast("str", self._empty_final_nudge)
+        self._audit.warning(
+            "tool_loop_empty_reply_retry",
+            rounds=rounds,
+            max_rounds=max_rounds,
+            cause=cause,
+            stage=stage,
+        )
+        try:
+            retry = await self._client.complete_messages(
+                system_blocks=system_blocks,
+                messages=_with_trailing_user_text(messages, nudge),
+                tools=None,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+        except LLMResponseError:
+            retry = None
+        if retry is not None:
+            self._accumulate(agg, retry)
+        if retry is None or _is_empty_reply(retry):
+            self._audit.error(
+                "tool_loop_empty_reply",
+                rounds=rounds,
+                max_rounds=max_rounds,
+                cause=cause,
+                stage=stage,
+                recovered=False,
+            )
+            return self._result(
+                "",
+                "cap_exhausted" if cap_reached else EMPTY_RESPONSE_STOP_REASON,
+                cap_exhausted=cap_reached,
+                steps=steps,
+                agg=agg,
+            )
+        self._audit.info(
+            "tool_loop_empty_reply",
+            rounds=rounds,
+            max_rounds=max_rounds,
+            cause=cause,
+            stage=stage,
+            recovered=True,
+        )
         return self._result(
-            final.content,
-            "cap_exhausted" if cap_reached else final.stop_reason,
+            retry.content,
+            "cap_exhausted" if cap_reached else retry.stop_reason,
             cap_exhausted=cap_reached,
             steps=steps,
             agg=agg,

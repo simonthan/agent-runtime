@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.37.0 — 2026-10-01
+
+### Added
+
+- `ToolUseLoop(..., empty_final_nudge: str | None = None)` — opt-in recovery for a model
+  call that comes back EMPTY after at least one committed tool round: no content blocks
+  (`LLMResponseError("response has no content blocks")` / "no text or tool_use blocks"),
+  or an `end_turn` with no text and no tool call. The loop makes ONE recovery call with
+  no tools and the consumer's nudge appended as a text block after the last tool results
+  (re-sending the identical request does not help: the model has already ended its
+  turn). A reply with text becomes the turn's answer. Empty again -> `final_text == ""`
+  with `stop_reason == EMPTY_RESPONSE_STOP_REASON` (`"empty_response"`, new export), or
+  `"cap_exhausted"` when the round cap was reached, with `steps` intact -- instead of an
+  `LLMResponseError` that discarded every round. Applies to `run()` and `resume()`, to an
+  in-loop call and to the forced final call. An empty reply with NO tool round behind it
+  still raises; `max_tokens` / `refusal` replies are untouched. Audit:
+  `tool_loop_empty_reply_retry` (warning) and `tool_loop_empty_reply` (`recovered=`).
+  Notes: the recovery call reads the rounds from the prompt cache only when the empty reply
+  was the forced final call (both are no-tools requests); after an in-loop empty reply (tools
+  were offered) the no-tools recovery request has a different prefix and is billed uncached.
+  A content-less reply raises before its usage is read, so its tokens are not in
+  `input_tokens` / `output_tokens` (true before this release for the one call; the recovery
+  can add a second). An `LLMResponseError` with no usable blocks for another stop reason
+  (e.g. thinking-only output) is also treated as empty. Any other `LLMError` on the recovery
+  call (API error, rate limit) still raises.
+  **Default `None` = byte-for-byte unchanged.** (TBP T-7219)
+
 ## v0.36.0 — 2026-10-01
 
 ### Added
