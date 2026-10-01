@@ -300,9 +300,21 @@ class TestKeepLineBreaks:
     def test_max_len_counts_kept_newlines(self):
         assert _keep("ab\n" * 100, max_len=10) == "ab\nab\nab\na…(truncated)"
 
-    @pytest.mark.parametrize("n", [1989, 1995, 1999])
+    @pytest.mark.parametrize("n", [1989, 1990, 1991, 1995, 1999])
     def test_truncation_does_not_manufacture_a_marker_across_lines(self, n):
+        # Mirrors the default-mode case: n=1991 is the value whose clip lands exactly on
+        # "[platform", so it is the one that needs the head re-neutralization.
         out = _keep("a\n" * (n // 2) + "a" * (n % 2) + "[platformer]")
+        assert out.endswith("…(truncated)")
+        assert not _PLATFORM_RE.search(out), out
+
+    def test_truncation_inside_a_line_broken_opener_is_re_neutralized(self):
+        # "[\nplatformer]" is not a marker (no word boundary after "platform"); clipping at
+        # 2000 leaves "[\nplatform", which the kept LF must not shield from re-neutralization.
+        text = "a" * 1990 + "[\nplatformer]"
+        # Premise: untruncated, the input carries no marker.
+        assert not _PLATFORM_RE.search(_keep(text, max_len=10_000))
+        out = _keep(text)
         assert out.endswith("…(truncated)")
         assert not _PLATFORM_RE.search(out), out
 
