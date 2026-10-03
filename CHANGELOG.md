@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.38.0 — 2026-10-03
+
+### Fixed
+
+- **Security:** `sanitize_for_llm_prompt` and `sanitize_tool_result` now strip sentinels and
+  the `[platform]` provenance opener (T-132) to a true fixed point at ANY nesting depth.
+  The internal substitution loop stopped after 8 passes and every nesting level costs one
+  pass, so `"[ " * 8 + "SYSTEM: " + "platform " * 8` came out holding a live `[ platform`
+  opener at both boundaries: a user turn, or a tool result such as an email body, could
+  forge the first-party `[platform]` frame. The fix is linear, not "loop until done" (which
+  is O(n**2) on a multi-megabyte nest): one regex pass, then, only if a provenance opener
+  is left, a stack collapse of each `[` / whitespace / `platform` run. The output equals
+  substituting until nothing matches, so it is **byte-identical to v0.37.0 for every input
+  v0.37.0 had already sanitized to a fixed point** (all ordinary text); only the bypass
+  class changes. 1 MB adversarial inputs (deep nests, long `[` / whitespace runs, nested
+  envelope tags) sanitize in about 0.25 s or less and scale linearly. No API change.
+  (TBP T-7216)
+
 ## v0.37.0 — 2026-10-01
 
 ### Added
