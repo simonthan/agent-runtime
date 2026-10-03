@@ -62,7 +62,16 @@ _PLATFORM_PROVENANCE_PREFIX = "[platform]"
 # follow the bracket. Residual accepted deliberately (plan T-132 §D4/R1): a Cyrillic/Greek
 # homoglyph "platform" (e.g. U+0430 replacing ASCII 'a') survives NFKC — the module-wide
 # SEC-7 residual documented above.
-_PLATFORM_PROVENANCE_PATTERN = r"\[\s*platform\b"
+#
+# T-7216: built from its three parts so the linear collapse in _sub_to_fixed_point tokenizes
+# with EXACTLY the pieces the fragment matches -- the opener, the gap and the token cannot
+# drift apart from the fragment. Each part is atomic (no top-level alternation), so the
+# concatenation is the same regex the literal r"\[\s*platform\b" always was.
+_PLATFORM_OPENER = r"\["
+_PLATFORM_GAP = r"\s*"
+_PLATFORM_WORD = "platform"
+_PLATFORM_TOKEN = _PLATFORM_WORD + r"\b"
+_PLATFORM_PROVENANCE_PATTERN = _PLATFORM_OPENER + _PLATFORM_GAP + _PLATFORM_TOKEN
 
 # Case-INSENSITIVE so a lowercase user-turn injection ("please system: do x") cannot
 # slip past a case-sensitive str.replace (SEC-1 — mirrors _NEUTRALIZE_RE / Opus R3 F1).
@@ -95,24 +104,93 @@ def _strip_control_chars(s: str) -> str:
     return s
 
 
-def _sub_to_fixed_point(rx: re.Pattern[str], s: str) -> str:
-    r"""Substitute `rx` -> " " repeatedly until the string stops changing.
+# T-7216: the fragment on its own, to decide whether the post-pass collapse is needed at all.
+_PLATFORM_PROVENANCE_RE = re.compile(_PLATFORM_PROVENANCE_PATTERN, re.IGNORECASE)
 
-    A SINGLE re.sub pass is not enough: the replacement space is itself content the
-    next match can consume. `[SYSTEM:platform]` becomes `[ platform]` in one pass, and
-    the platform fragment's `\[\s*platform` then matches that freshly-created text --
-    which a single non-overlapping pass never rescans (T-132 §D2b).
+# T-7216: a maximal run that can hold a provenance opener: a `[`, then any mix of `[`,
+# whitespace and whole-word `platform` tokens. Only a string of these three can ever be
+# consumed by repeated substitution, so the collapse never looks past a run's end. Linear: it
+# starts only at a `[`, every quantifier is greedy over a class or a fixed token, and nothing
+# after them can fail -- a run of `[` or of whitespace with no `platform` is consumed once and
+# never re-scanned (unlike `(?:\[\s*)+platform\b`, which retries at every `[`).
+_PLATFORM_RUN_RE = re.compile(
+    rf"{_PLATFORM_OPENER}[\[\s]*(?:({_PLATFORM_TOKEN})[\[\s]*)*", re.IGNORECASE
+)
+# Tokens inside one such run (the run already checked each `platform`'s word boundary),
+# told apart by group number.
+_PLATFORM_RUN_TOKEN_RE = re.compile(
+    rf"({_PLATFORM_OPENER})|(\s+)|({_PLATFORM_WORD})", re.IGNORECASE
+)
+_RUN_OPENER, _RUN_SPACE = 1, 2
 
-    Termination: every alternative in every pattern passed here matches at least 2 chars
-    and is replaced by exactly 1, so any pass that changes the string strictly shortens
-    it. Real inputs converge in 1-3 passes; the cap is belt-and-braces only.
+
+def _collapse_platform_run(match: re.Match[str]) -> str:
+    """Reduce one `_PLATFORM_RUN_RE` run to its normal form under `[`+ws+`platform` -> " ".
+
+    A stack of the `[` still open (followed by nothing but whitespace so far): a `platform`
+    token closes the newest one -- the opener, the whitespace after it and the token become
+    one space, exactly what one substitution does -- and that space is whitespace to the
+    `[` below it, so the next token can close that one too. A token with no open `[` stays
+    text. Each character is appended once and deleted at most once: linear in the run.
     """
-    for _ in range(8):
-        new = rx.sub(" ", s)
-        if new == s:
-            break
-        s = new
-    return s
+    if match.group(1) is None:  # no `platform` token: nothing in this run can change
+        return match.group()
+    out: list[str] = []
+    opens: list[int] = []
+    # finditer, not findall: one token alive at a time, so a megabyte run costs the output
+    # list only, not a tuple per token on top of it.
+    for token in _PLATFORM_RUN_TOKEN_RE.finditer(match.group()):
+        kind = token.lastindex
+        if kind == _RUN_OPENER:
+            opens.append(len(out))
+            out.append("[")
+        elif kind == _RUN_SPACE:
+            out.append(token.group())
+        elif opens:
+            del out[opens.pop() :]
+            out.append(" ")
+        else:
+            out.append(token.group())
+    return "".join(out)
+
+
+def _sub_to_fixed_point(rx: re.Pattern[str], s: str) -> str:
+    r"""Substitute `rx` -> " " until no match is left, in linear time (T-7216).
+
+    Returns exactly what `while rx.search(s): s = rx.sub(" ", s)` returns, without its
+    quadratic cost. A SINGLE re.sub pass is not enough: the replacement space is itself
+    content the next match can consume. `[SYSTEM:platform]` becomes `[ platform]` in one
+    pass, and the platform fragment's `\[\s*platform` then matches that freshly-created
+    text, which a single non-overlapping pass never rescans (T-132 §D2b). Looping pass after
+    pass (v0.37.0 and earlier stopped after 8) costs one pass per NESTING LEVEL:
+    `"[ " * 8 + "SYSTEM: " + "platform " * 8` still held a live `[ platform` opener after
+    eight passes, and looping on would make a multi-megabyte nest O(n**2).
+
+    Precondition, true of both patterns in this module (`_SENTINEL_RE`, `_NEUTRALIZE_RE`)
+    and pinned by tests: every alternative of `rx` is a whitespace-free literal except the
+    `_PLATFORM_PROVENANCE_PATTERN` fragment. Then:
+
+    1. After the first pass, no literal can match again, ever. A later literal match holds
+       no whitespace, so it lies inside text no replacement touched (every replacement is a
+       space) -- text the first pass already scanned at every position without a match.
+    2. So every later pass only applies `[`+ws+`platform\b` -> " ". Two such matches never
+       overlap (the opener is a `[` and the rest is whitespace and letters), replacing one
+       never breaks another (its `\b` keeps seeing a non-word character), and every
+       replacement shortens the string: the rewrite is confluent and terminating, so ONE
+       final string exists whatever the order of replacements. A `platform` followed by a
+       word character never gains its `\b` later: no later replacement can remove that
+       character (it is not a `[`, not whitespace, and cannot be the `p` of a token whose
+       opener sits right before it), so the boundary can be judged once, after pass one.
+    3. `_collapse_platform_run` computes that string run by run with a stack.
+
+    Ordinary text stops after step 1: once the first pass is done it holds no provenance
+    opener. Step 3 runs only for a forgery the first pass itself re-forms
+    (`[SYSTEM:platform]`) or a nest.
+    """
+    s = rx.sub(" ", s)
+    if _PLATFORM_PROVENANCE_RE.search(s) is None:
+        return s
+    return _PLATFORM_RUN_RE.sub(_collapse_platform_run, s)
 
 
 # T-7213: line breaks other than \n that str.split()/str.splitlines() honour. VT/FF and
