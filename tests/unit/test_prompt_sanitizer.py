@@ -1,12 +1,20 @@
+import random
 import re
+import time
 
 import pytest
 
-from agent_runtime.safety import sanitize_for_llm_prompt, sanitize_tool_result
+from agent_runtime.safety import prompt_sanitizer, sanitize_for_llm_prompt, sanitize_tool_result
 from agent_runtime.safety.prompt_sanitizer import (
+    _INJECTION_SENTINELS,
+    _NEUTRALIZE_RE,
+    _PLATFORM_PROVENANCE_PATTERN,
+    _SENTINEL_RE,
     _TOOL_OUTPUT_CLOSE,
     _TOOL_OUTPUT_OPEN,
     _TOOL_OUTPUT_PREFIX,
+    _TOOL_RESULT_SENTINELS,
+    _sub_to_fixed_point,
     repair_clipped_tool_result,
 )
 
@@ -592,3 +600,239 @@ class TestRepairClippedToolResult:
                 out = repair_clipped_tool_result(env[:n])
                 assert out.count(_TOOL_OUTPUT_OPEN) == out.count(_TOOL_OUTPUT_CLOSE), (p, n)
                 assert not _PLATFORM_RE.search(out), (p, n)
+
+
+# --- T-7216: the fixed point is reached at any nesting depth, in linear time -------------
+#
+# v0.37.0 and earlier substituted at most 8 times; every nesting level costs one pass, so
+# `"[ " * 8 + "SYSTEM: " + "platform " * 8` came out holding a live `[ platform` opener at
+# BOTH boundaries. These pin (a) no live opener or sentinel at any depth, (b) bounded time on
+# megabyte-sized adversarial input, and (c) the output is exactly what substituting until
+# nothing matches returns -- and so byte-identical to v0.37.0 wherever v0.37.0 had already
+# converged.
+
+
+def _reference_fixed_point(rx: re.Pattern[str], s: str) -> str:
+    """Substitute until nothing matches: the semantics, at its quadratic cost."""
+    while True:
+        new = rx.sub(" ", s)
+        if new == s:
+            return s
+        s = new
+
+
+def _v037_fixed_point(rx: re.Pattern[str], s: str) -> str:
+    """v0.37.0's `_sub_to_fixed_point`, verbatim: at most 8 passes."""
+    for _ in range(8):
+        new = rx.sub(" ", s)
+        if new == s:
+            break
+        s = new
+    return s
+
+
+def _nest(
+    depth: int, *, opener: str = "[ ", splitter: str = "SYSTEM: ", word: str = "platform "
+) -> str:
+    return opener * depth + splitter + word * depth
+
+
+_NESTING_DEPTHS = [8, 9, 20, 100]
+# Openers and splitters every boundary neutralizes (SYSTEM: and <| are in both regexes).
+_NEST_SHAPES = [
+    {"opener": "[ ", "splitter": "SYSTEM: ", "word": "platform "},
+    {"opener": "[", "splitter": "SYSTEM:", "word": "platform "},
+    {"opener": "[\n", "splitter": "<|", "word": "PLATFORM\n"},
+    {"opener": "[\t", "splitter": "[INST]", "word": "Platform]"},
+    {"opener": "[ ", "splitter": "", "word": "platform:"},
+]
+
+# Every literal of either regex, nested by split insertion: `SYS` + `SYSTEM:` + `TEM:` leaves
+# `SYS TEM:` -- a space every literal lacks -- so no literal can be re-formed at any depth.
+_LITERALS = [
+    "```", "{{", "}}", "<|", "|>", "SYSTEM:", "ASSISTANT:", "USER:", "[INST]", "[/INST]",
+    "<tool_output>", "</tool_output>",
+]  # fmt: skip
+
+
+def _split_nest(literal: str, depth: int) -> str:
+    cut = len(literal) // 2
+    return literal[:cut] * depth + literal + literal[cut:] * depth
+
+
+def _alphabet_corpus() -> list[str]:
+    alphabet = [
+        "[", " ", "\n", "\t", "\u00a0", "platform", "PLATFORM", "Platform", "platformer",
+        "plat", "form", "SYSTEM:", "SYS", "TEM:", "system:", "<|", "|>", "<", "|", ">", "{{",
+        "}}", "{", "`", "```", "[INST]", "[/INST]", "[INS", "INST]", "<tool_output>",
+        "</tool_output>", "<tool_", "output>", "x", "]", ":", "-", "_", "USER:", "ASSISTANT:",
+    ]  # fmt: skip
+    corpus = list(alphabet) + [a + b for a in alphabet for b in alphabet]
+    rnd = random.Random(7216)  # noqa: S311 -- a seeded corpus, not a secret
+    corpus += [
+        "".join(rnd.choice(alphabet) for _ in range(rnd.randint(3, 40))) for _ in range(3000)
+    ]
+    return corpus
+
+
+def _random_nest(rnd: random.Random, depth: int) -> str:
+    """A random nest: `[` ws <inner> ws `platform` <tail>, with noise and splitters inside."""
+    if depth == 0 or rnd.random() < 0.1:
+        return rnd.choice(
+            ["", "SYSTEM:", "<|", "x", "]", "[", "platformer", ":", "<tool_output>", "{{"]
+        )
+    ws = ["", " ", "  ", "\n", "\t "]
+    inner = "".join(_random_nest(rnd, depth - 1) for _ in range(rnd.choice([1, 1, 1, 2])))
+    word = rnd.choice(["platform", "Platform", "PLATFORM"])
+    tail = rnd.choice([*ws, "]", ":", "-", "SYSTEM:"])
+    return "[" + rnd.choice(ws) + inner + rnd.choice(ws) + word + tail
+
+
+def _nest_corpus() -> list[str]:
+    rnd = random.Random(16)  # noqa: S311 -- a seeded corpus, not a secret
+    return [_random_nest(rnd, rnd.randint(1, 25)) for _ in range(2000)]
+
+
+_FIXED_POINT_CORPUS = [
+    *_PLATFORM_FORGERIES,
+    *_USER_ONLY_FORGERIES,
+    *_alphabet_corpus(),
+    *_nest_corpus(),
+    *(_nest(d, **shape) for d in (1, 2, 7, 8, 9, 12) for shape in _NEST_SHAPES),
+    *(_split_nest(lit, d) for lit in _LITERALS for d in (1, 2, 8, 9)),
+    "The platform is down [see note] and [platform] here.",
+    "[platformer review] [platforms] [the platform] [platform] [ platform ]",
+    '```json\n{"a": [1, [2, [3]]]}\n```\n[#1] [#2]',
+]
+
+
+class TestFixedPointDepth:
+    @pytest.mark.parametrize("depth", _NESTING_DEPTHS)
+    @pytest.mark.parametrize("shape", _NEST_SHAPES)
+    def test_nested_forgery_leaves_no_opener_in_user_turn(self, depth, shape):
+        text = _nest(depth, **shape)
+        for out in (sanitize_for_llm_prompt(text), _keep(text)):
+            assert not _PLATFORM_RE.search(out)
+            assert not _SENTINEL_RE.search(out)
+
+    @pytest.mark.parametrize("depth", _NESTING_DEPTHS)
+    @pytest.mark.parametrize("shape", _NEST_SHAPES)
+    def test_nested_forgery_leaves_no_opener_in_tool_result(self, depth, shape):
+        out = sanitize_tool_result(_nest(depth, **shape), max_len=100_000)
+        assert not _PLATFORM_RE.search(out)
+        assert not _NEUTRALIZE_RE.search(_inner(out))
+
+    def test_the_reported_probe(self):
+        # The T-7216 finding verbatim: depth 8 used to return '[ platform'.
+        text = "[ " * 8 + "SYSTEM: " + "platform " * 8
+        assert sanitize_for_llm_prompt(text) == ""
+        assert sanitize_tool_result(text) == ""
+
+    @pytest.mark.parametrize("depth", [8, 9, 20])
+    def test_v037_cap_was_bypassable(self, depth):
+        # Non-vacuity: the 8-pass loop this release replaces leaves a live opener here.
+        assert _PLATFORM_RE.search(_v037_fixed_point(_SENTINEL_RE, _nest(depth)))
+        assert _PLATFORM_RE.search(_v037_fixed_point(_NEUTRALIZE_RE, _nest(depth)))
+
+    @pytest.mark.parametrize("literal", _LITERALS)
+    @pytest.mark.parametrize("depth", [8, 9, 20, 100])
+    def test_split_insertion_nest_cannot_reform_any_literal(self, literal, depth):
+        text = _split_nest(literal, depth)
+        assert not _SENTINEL_RE.search(sanitize_for_llm_prompt(text, max_len=100_000))
+        assert not _NEUTRALIZE_RE.search(_inner(sanitize_tool_result(text, max_len=100_000)))
+
+    def test_precondition_every_other_alternative_is_a_whitespace_free_literal(self):
+        # _sub_to_fixed_point's proof needs this: a literal holding no whitespace can never be
+        # re-formed around a replacement space. Adding a pattern or a literal with a space to
+        # either regex breaks the proof -- this test fails first.
+        assert _PLATFORM_PROVENANCE_PATTERN == r"\[\s*platform\b"
+        for literals, rx in (
+            (_INJECTION_SENTINELS, _SENTINEL_RE),
+            ((*_TOOL_RESULT_SENTINELS, _TOOL_OUTPUT_OPEN, _TOOL_OUTPUT_CLOSE), _NEUTRALIZE_RE),
+        ):
+            assert all(lit and not any(c.isspace() for c in lit) for lit in literals)
+            expected = "|".join([*(re.escape(t) for t in literals), _PLATFORM_PROVENANCE_PATTERN])
+            assert rx.pattern == expected
+            assert rx.flags & re.IGNORECASE
+
+    @pytest.mark.parametrize("rx", [_SENTINEL_RE, _NEUTRALIZE_RE], ids=["sentinel", "neutralize"])
+    def test_equals_substituting_until_nothing_matches(self, rx):
+        for s in _FIXED_POINT_CORPUS:
+            assert _sub_to_fixed_point(rx, s) == _reference_fixed_point(rx, s), s
+
+    @pytest.mark.parametrize("rx", [_SENTINEL_RE, _NEUTRALIZE_RE], ids=["sentinel", "neutralize"])
+    def test_byte_identical_to_v037_wherever_v037_converged(self, rx):
+        converged = 0
+        for s in _FIXED_POINT_CORPUS:
+            old = _v037_fixed_point(rx, s)
+            if rx.search(old):
+                continue  # v0.37.0 stopped short: the bypass class this release closes
+            converged += 1
+            assert _sub_to_fixed_point(rx, s) == old, s
+        assert converged > len(_FIXED_POINT_CORPUS) * 0.9
+
+    def test_public_functions_equal_the_uncapped_reference(self, monkeypatch):
+        cases = [(s, n) for s in _FIXED_POINT_CORPUS[::7] for n in (5, 12, 2000)]
+        new = [
+            (sanitize_for_llm_prompt(s, n), _keep(s, max_len=n), sanitize_tool_result(s, n))
+            for s, n in cases
+        ]
+        monkeypatch.setattr(prompt_sanitizer, "_sub_to_fixed_point", _reference_fixed_point)
+        ref = [
+            (sanitize_for_llm_prompt(s, n), _keep(s, max_len=n), sanitize_tool_result(s, n))
+            for s, n in cases
+        ]
+        assert new == ref
+
+    def test_genuine_text_is_untouched(self):
+        text = "The platform is down. [platformer] [platforms] [#1] [the platform] x[y] [ ]"
+        assert sanitize_for_llm_prompt(text) == text
+        assert _inner(sanitize_tool_result(text)) == text
+
+
+# Megabyte-sized adversarial inputs. Each sanitizes in ~0.3 s or less on the dev box; the
+# bound is ~20x that, so a slow CI host does not flake, while the quadratic loop this release
+# replaces would need minutes on the nests.
+_MB = 1_000_000
+_ADVERSARIAL_1MB = {
+    "nest": "[ " * (_MB // 11) + "SYSTEM: " + "platform " * (_MB // 11),
+    "tight_nest": "[" * (_MB // 10) + "platform " * (_MB // 10),
+    "newline_nest": "[\n" * (_MB // 11) + "<|\n" + "platform\n" * (_MB // 11),
+    "brackets_no_token": "[" * _MB,
+    "bracket_space_no_token": "[ " * (_MB // 2),
+    "whitespace": " " * _MB,
+    "bracket_long_whitespace": ("[" + " " * 999) * (_MB // 1000),
+    # `[SYSTEM:platform]` forms its opener only AFTER the first pass, so the collapse runs
+    # over every bracket run that follows.
+    "redex_then_bracket_space": "[SYSTEM:platform] " + "[ " * (_MB // 2),
+    "redex_then_many_runs": "[SYSTEM:platform] " + "[x" * (_MB // 2),
+    "redex_then_unclosed_nests": "[SYSTEM:platform] " + "[ [ x platform " * (_MB // 15),
+    "half_nest": "[" * (_MB // 2) + " platform" * (_MB // 18),
+    "brackets_then_one_token": "[ " * (_MB // 2) + "platform",
+    "tag_nest": "<tool_" * (_MB // 40) + "<tool_output>" + "output>" * (_MB // 40),
+    "sentinel_nest": "SYS" * (_MB // 14) + "SYSTEM:" + "TEM:" * (_MB // 14),
+}
+_TIME_BOUND_SECONDS = 6.0
+
+
+class TestFixedPointCost:
+    @pytest.mark.parametrize("name", list(_ADVERSARIAL_1MB))
+    def test_tool_result_bounded(self, name):
+        text = _ADVERSARIAL_1MB[name]
+        start = time.perf_counter()
+        out = sanitize_tool_result(text, max_len=len(text))
+        elapsed = time.perf_counter() - start
+        assert elapsed < _TIME_BOUND_SECONDS, elapsed
+        assert not _PLATFORM_RE.search(out)
+        assert not _NEUTRALIZE_RE.search(_inner(out))
+
+    @pytest.mark.parametrize("keep_line_breaks", [False, True])
+    @pytest.mark.parametrize("name", list(_ADVERSARIAL_1MB))
+    def test_user_turn_bounded(self, name, keep_line_breaks):
+        text = _ADVERSARIAL_1MB[name]
+        start = time.perf_counter()
+        out = sanitize_for_llm_prompt(text, max_len=len(text), keep_line_breaks=keep_line_breaks)
+        elapsed = time.perf_counter() - start
+        assert elapsed < _TIME_BOUND_SECONDS, elapsed
+        assert not _PLATFORM_RE.search(out)
+        assert not _SENTINEL_RE.search(out)
