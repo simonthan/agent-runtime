@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.39.0 — 2026-10-05
+
+### Added
+
+- `ToolUseLoop.run(..., first_tool_choice: dict | None = None)` — the API `tool_choice` for
+  the FIRST model call of that run only (e.g. `{"type": "tool", "name": "search"}`). Every
+  later call (further tool rounds, the no-tools forced-final call, a T-7219 empty-reply
+  recovery call, and `resume()`) keeps the API default (auto), so a forced choice can never
+  loop. Not used when the run makes no tool-round call (`max_rounds=0`, or the
+  `pre_completion_hook` fires before the first call). A `{"type": "tool"}` choice must name
+  a tool in `tools`; otherwise `ValueError` before any model call (with empty `tools` any
+  other choice is ignored). Default `None` is
+  byte-for-byte unchanged. (TBP T-7254a: a guard re-run whose nudge named the tool still
+  answered with zero tool calls.)
+- `AnthropicClient.complete_messages(..., tool_choice: dict | None = None)` — passed
+  verbatim to the SDK, and only together with a non-empty `tools`. `None` omits it.
+  Caching: a changed `tool_choice` keeps the tools and system caches and misses the
+  messages cache for that call, and the run's next (auto) call cannot read the messages
+  cache the forced call wrote, so a forced run pays two messages-cache writes. Models that reject forced tool use (`{"type": "tool"}` /
+  `{"type": "any"}`; Claude Opus 5.5, Claude Sonnet 5.5, Claude Fable 5.1, Claude Mythos
+  5.1) answer 400, raised as `LLMAPIError`: the consumer gates the choice by model.
+
 ## v0.38.0 — 2026-10-03
 
 ### Fixed

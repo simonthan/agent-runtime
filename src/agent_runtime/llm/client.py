@@ -158,6 +158,7 @@ class AnthropicClient:
         max_tokens: int | None = None,
         temperature: float | None = None,
         model: str | None = None,
+        tool_choice: dict[str, Any] | None = None,
     ) -> ClaudeResponse:
         """Low-level single SDK round over a caller-assembled message list.
 
@@ -165,6 +166,15 @@ class AnthropicClient:
         full list (history + tool rounds) with raw content blocks. `tools`, when
         present, is passed verbatim to the SDK. Does error-mapping + parse +
         cache-not-written hint. `ToolUseLoop` drives this; `complete()` wraps it.
+
+        `tool_choice` (v0.39.0, TBP T-7254a) is passed verbatim to the SDK, and only
+        together with a non-empty `tools` (with no tools there is nothing to choose;
+        the forced-final call passes none). None omits the param: byte-for-byte
+        unchanged. A changed tool_choice keeps the tools + system cache and misses the
+        messages cache for that call; the next call with a different choice cannot read
+        the messages cache this one wrote.
+        Some models reject a forced choice (`{"type": "tool"}` / `{"type": "any"}`)
+        with a 400, which surfaces as `LLMAPIError` -- the consumer gates by model.
         """
         chosen_model = model or self._default_model
         chosen_max_tokens = max_tokens if max_tokens is not None else self._default_max_tokens
@@ -183,6 +193,8 @@ class AnthropicClient:
             create_kwargs["temperature"] = chosen_temperature
         if tools:
             create_kwargs["tools"] = tools
+            if tool_choice is not None:
+                create_kwargs["tool_choice"] = tool_choice
 
         # Request-start audit lives HERE (not in complete()) so every loop round
         # emits a paired start/response event — complete() must NOT also log it,

@@ -295,6 +295,18 @@ def _is_empty_reply(resp: Any) -> bool:
     return resp.stop_reason == "end_turn" and not resp.tool_use and not resp.content.strip()
 
 
+def _check_first_tool_choice(choice: dict[str, Any] | None, tools: list[dict[str, Any]]) -> None:
+    """T-7254a -- a `{"type": "tool"}` first_tool_choice must name a tool the run sends.
+    Fails before any model call: the API would 400 the request, after the caller had
+    already paid for nothing."""
+    if choice is None or choice.get("type") != "tool":
+        return
+    name = choice.get("name")
+    if not any(t.get("name") == name for t in tools or ()):
+        msg = f"first_tool_choice names a tool not in tools: {name!r}"
+        raise ValueError(msg)
+
+
 def _with_trailing_user_text(messages: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:
     """T-7219 -- a COPY of `messages` whose last user turn ends with one more text block.
 
@@ -354,6 +366,7 @@ class ToolUseLoop:
         pre_completion_hook: PreCompletionHook | None = None,
         parallel_safe: ParallelSafePredicate | None = None,
         max_parallel_calls: int | None = None,
+        first_tool_choice: dict[str, Any] | None = None,
     ) -> ToolLoopResult:
         """Run the fenced loop. `max_rounds` caps model turns that return
         stop_reason=='tool_use'. Returns once the model stops requesting tools, the
@@ -417,7 +430,20 @@ class ToolUseLoop:
         the preceding parallel-safe blocks of the same round have finished — `confirm`
         must not depend on their side effects. `parallel_safe` may be consulted for any
         block (confirm-flagged ones included) and more than once per block — it must be
-        pure and side-effect-free; `confirm` always wins."""
+        pure and side-effect-free; `confirm` always wins.
+
+        `first_tool_choice` (v0.39.0, TBP T-7254a) is the API `tool_choice` for the FIRST
+        model call of this run only -- e.g. `{"type": "tool", "name": "search"}` makes that
+        call a call of `search`. Every later call (tool rounds, the forced final, an
+        empty-reply recovery, and `resume()`) keeps the API default (auto), so a forced
+        choice can never loop. It is not used when the run makes no tool-round call
+        (`max_rounds=0`, or the `pre_completion_hook` fires before the first call). A
+        `{"type": "tool"}` choice must name a tool in `tools` (ValueError otherwise, raised
+        before any model call); with empty `tools` any other choice is ignored. Some
+        models reject a forced choice with a 400 (`LLMAPIError`); the consumer decides
+        per model. Default None = byte-for-byte
+        unchanged (regression guarantee)."""
+        _check_first_tool_choice(first_tool_choice, tools)
         system_blocks = self._build_system_blocks(static_system_prefix, dynamic_system_suffix)
         first_user: list[dict[str, Any]] = []
         if retrieval_block:
@@ -455,6 +481,7 @@ class ToolUseLoop:
             pre_completion_hook=pre_completion_hook,
             parallel_safe=parallel_safe,
             max_parallel_calls=max_parallel_calls,
+            first_tool_choice=first_tool_choice,
         )
 
     async def resume(
@@ -648,6 +675,7 @@ class ToolUseLoop:
         pre_completion_hook: PreCompletionHook | None = None,
         parallel_safe: ParallelSafePredicate | None = None,
         max_parallel_calls: int | None = None,
+        first_tool_choice: dict[str, Any] | None = None,
     ) -> ToolLoopResult:
         """Shared round engine. `while rounds < max_rounds` (correct at the
         max_rounds=0 boundary — zero tool rounds, straight to the forced answer).
@@ -671,6 +699,13 @@ class ToolUseLoop:
                 wrap_up_text = pre_completion_hook()
                 if wrap_up_text is not None:
                     break
+            # T-7254a -- the forced choice rides the run's FIRST call only (rounds == 0 is
+            # never reached again: resume() enters with rounds >= 1 and passes no choice).
+            choice = (
+                {"tool_choice": first_tool_choice}
+                if first_tool_choice is not None and rounds == 0
+                else {}
+            )
             resp, empty_cause = await self._call_or_empty(
                 rounds,
                 agg,
@@ -680,6 +715,7 @@ class ToolUseLoop:
                 model=model,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                **choice,
             )
             if empty_cause is not None:
                 break
