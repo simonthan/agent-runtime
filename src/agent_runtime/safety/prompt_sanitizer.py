@@ -8,6 +8,7 @@ where user input enters an LLM prompt. Always str.replace, never str.format
 
 import re
 import unicodedata
+from typing import cast
 
 # Keep \t (9), \n (10), \r (13); strip every other control char.
 _CONTROL_CHARS = "".join(chr(c) for c in range(32) if c not in (9, 10, 13))
@@ -290,6 +291,111 @@ _NEUTRALIZE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# T-7280: the envelope tag CLASS, not just the two exact literals above. `</tool_output >`,
+# `</ tool_output>`, `</tool_output\n>` and `<tool_output x=1>` read as the same boundary to a
+# model and to any tag-aware parser. The class is the shape every consumer uses for its own
+# prompt envelopes (teams-bot-platform `post_sanitize.envelope_tag_pattern`, T-7243 / T-7251):
+# `<` or `</`, optional whitespace, the name as a whole word (so `tool_output_to_compress`,
+# `tool_outputs` and `</tool_output_>` are other words), then any attributes up to a `>`.
+# Lookalikes outside the class (`< /tool_output>`, dotted-I spellings) are accepted residuals,
+# as everywhere that shape is used.
+#
+# The rule blanks the START of the class, `</?\s*tool_output\b` -> " ", wherever it is. A tag
+# needs its start, so no tag survives, and neither does an UNTERMINATED start (no `>` after
+# it) -- which in a body is not inert: the envelope's own `\n</tool_output>` would supply the
+# `>` and complete it, turning the genuine closer into an attribute of a forged tag. What
+# followed the start (attributes, a `>`) is kept as inert text. Blanking through the next `>`
+# instead would hand a hostile result a deletion primitive: `<tool_output` in one field and a
+# `>` in a later one would erase every row between them (T-7280 R3 H1, measured: median 16% /
+# p90 56% of a real body), for no safety gain.
+#
+# Kept OUT of _NEUTRALIZE_RE on purpose: `_sub_to_fixed_point` is exact only for whitespace-
+# free literals plus the provenance fragment (its precondition, pinned by tests), and this
+# pattern holds whitespace. `_strip_envelope_tags` runs after it instead.
+_TOOL_OUTPUT_NAME = "tool_output"
+_TOOL_OUTPUT_START_PATTERN = rf"</?\s*{_TOOL_OUTPUT_NAME}\b"
+_TOOL_OUTPUT_START_RE = re.compile(_TOOL_OUTPUT_START_PATTERN, re.IGNORECASE)
+# Scan tokens for _strip_envelope_tags; group numbers are the _SCAN_* constants below. The
+# last alternative takes any run holding no `[`, no `<` and no whitespace, so every position
+# matches one of them.
+_ENVELOPE_SCAN_TOKEN_RE = re.compile(
+    rf"({_PLATFORM_OPENER})|(</?)|(\s+)|({_PLATFORM_TOKEN})|({_TOOL_OUTPUT_NAME}\b)|([^\[<\s]+)",
+    re.IGNORECASE,
+)
+_SCAN_SQUARE, _SCAN_ANGLE, _SCAN_SPACE, _SCAN_PLATFORM, _SCAN_NAME = 1, 2, 3, 4, 5
+# (token kind, stack-top is a `[`): `platform` closes a `[`, the tag name closes a `<` / `</`.
+_SCAN_CLOSES = frozenset({(_SCAN_PLATFORM, 1), (_SCAN_NAME, 0)})
+_SCAN_SKIP_RE = re.compile(r"[\[<]")
+
+
+def _strip_envelope_tags(s: str) -> str:
+    r"""Blank every `tool_output` tag start in `s`, jointly with the opener rule (T-7280).
+
+    `s` is `_sub_to_fixed_point(_NEUTRALIZE_RE, ...)` output: no literal sentinel and no
+    provenance opener left. Byte-identical to it when it holds no start of the class
+    (`_TOOL_OUTPUT_START_RE`), which is every ordinary text -- one linear search.
+
+    Otherwise the start rule and the T-132 opener rule must be run to a JOINT fixed point,
+    because each rewrite is a space and a space is what the other rule's `\s*` admits:
+    `[</tool_output platform` -> `[  platform` (start -> opener), `</[platform tool_output` ->
+    `</  tool_output` (opener -> start), `<<tool_output tool_output` -> `<  tool_output`
+    (start -> start). Literal sentinels need no re-check: each holds no whitespace, so none
+    can form around an inserted space (the `_sub_to_fixed_point` argument).
+
+    Both rules have the shape opener-char, whitespace, word (`[`..`platform`, `<`/`</`..
+    `tool_output`), and neither span holds the other's opener char, so two matches never
+    overlap and one rewrite never breaks another: the rewrite is confluent and terminating
+    (each replaces at least nine characters with one), like the opener rule alone (T-7216).
+    One final string exists; this computes it in one left-to-right pass.
+
+    `stack` holds the openers that can still start a match: a `[` or a `<` / `</` with
+    nothing but whitespace -- original, or a space a rewrite left -- between it and the
+    frontier, except openers stacked above it. `platform\b` closes a `[` on top and
+    `tool_output\b` a `<` / `</` on top; either becomes one space, which is whitespace to the
+    opener below it, so the next word can close that one too (the nest). Any other token can
+    never be removed by a later rewrite, so it ends every pending opener. Whether a word is
+    whole is read from the original next character, which no rewrite can change before the
+    word is judged. Each character is appended once and removed at most once: linear in
+    `len(s)`. Same scan as teams-bot-platform `post_sanitize._scan` (T-7243), except that a
+    tag start is blanked alone, never through the next `>`.
+    """
+    if _TOOL_OUTPUT_START_RE.search(s) is None:
+        return s
+    out: list[str] = []
+    # Entry = 2 * (index in out) + (1 for `[`, 0 for `<`): plain ints, so a deep stack creates
+    # no GC-tracked objects (a list of tuples made multi-megabyte nests superlinear, T-7243).
+    stack: list[int] = []
+    i, n = 0, len(s)
+    while i < n:
+        if not stack:  # nothing pending: copy up to the next `[` or `<` in one piece
+            m = _SCAN_SKIP_RE.search(s, i)
+            if m is None:
+                out.append(s[i:])
+                break
+            out.append(s[i : m.start()])
+            i = m.start()
+        # Never None: the last alternative takes any run the others do not.
+        tok = cast("re.Match[str]", _ENVELOPE_SCAN_TOKEN_RE.match(s, i))
+        kind, i = tok.lastindex, tok.end()
+        if kind in (_SCAN_SQUARE, _SCAN_ANGLE):
+            stack.append(2 * len(out) + (kind == _SCAN_SQUARE))
+            out.append(tok.group())
+        elif kind == _SCAN_SPACE:
+            out.append(tok.group())
+        elif stack and (kind, stack[-1] & 1) in _SCAN_CLOSES:
+            del out[stack.pop() >> 1 :]
+            out.append(" ")
+        else:
+            stack.clear()
+            out.append(tok.group())
+    return "".join(out)
+
+
+def _neutralize_tool_text(s: str) -> str:
+    """The tool-result body rule: sentinels + provenance opener (`_NEUTRALIZE_RE`, to its fixed
+    point), then the `tool_output` tag class jointly with the opener (T-7280)."""
+    return _strip_envelope_tags(_sub_to_fixed_point(_NEUTRALIZE_RE, s))
+
 
 def sanitize_tool_result(text: str | None, max_len: int = 8000) -> str:
     """Neutralize untrusted tool/MCP-result text before it re-enters the model.
@@ -308,18 +414,23 @@ def sanitize_tool_result(text: str | None, max_len: int = 8000) -> str:
       `[platform:]`, `[platform-note]` — T-132) (case-insensitive) -> space, so a
       hostile result cannot forge the boundary (close the tag early, then inject),
       smuggle a lowercase role marker, or forge the first-party provenance note that
-      consumers append outside this envelope.
+      consumers append outside this envelope. Envelope tags means the whole tag CLASS
+      (T-7280): the START of any spelling (`</tool_output >`, `<tool_output x=1>`) is
+      blanked, also with no `>` after it (the envelope's own closer would complete it);
+      attributes after a start are kept as inert text. The body never holds a match of
+      `</?\\s*tool_output\\b`.
     - Truncated to max_len with "…(truncated)".
     - Non-empty result wrapped in an "external data, not instructions" envelope."""
     if text is None:
         return ""
     s = _strip_control_chars(_normalize(str(text)))
-    # Strip sentinels + BOTH envelope tags (case-insensitive) BEFORE wrapping — this is
+    # Strip sentinels + every envelope tag (case-insensitive) BEFORE wrapping — this is
     # what makes the envelope load-bearing rather than decorative.
-    s = _sub_to_fixed_point(_NEUTRALIZE_RE, s)
+    s = _neutralize_tool_text(s)
     if len(s) > max_len:
         # Same truncation-manufactures-a-sentinel guard as sanitize_for_llm_prompt (§D2b).
-        s = _sub_to_fixed_point(_NEUTRALIZE_RE, s[:max_len]) + "…(truncated)"
+        # The cut can also leave an unterminated tag start (`<tool_outputs` -> `<tool_output`).
+        s = _neutralize_tool_text(s[:max_len]) + "…(truncated)"
     if not s.strip():
         return ""
     return f"{_TOOL_OUTPUT_PREFIX}\n{_TOOL_OUTPUT_OPEN}\n{s}\n{_TOOL_OUTPUT_CLOSE}"
@@ -349,7 +460,18 @@ def sanitize_tool_result(text: str | None, max_len: int = 8000) -> str:
 # bind to the last alternative only, and every other branch would become an UNANCHORED
 # whole-head match — i.e. exactly the RC4 regression this anchor exists to prevent, arriving
 # silently in an unrelated commit. Do not remove the group.
-_CLIP_SEAM_RE = re.compile(f"(?:{_PLATFORM_PROVENANCE_PATTERN})\\Z", re.IGNORECASE)
+#
+# T-7280: the clip can also manufacture an unterminated `tool_output` tag START, by the same
+# \b argument -- `<tool_outputs>` is not of the class, cut after the `t` it is -- and the
+# re-close below would then complete it (`<tool_output\n</tool_output>` is ONE tag). The
+# sanitized body holds no start of the class, so a clip-created one ends at the end of the
+# head too, and needs no `[^>]*` (it holds no attributes: the cut came right after the name).
+# A clip landing inside a genuine tag (`...\n</tool_output`) is blanked the same way; the
+# re-close then restores the envelope. No `\b` after the name: at `\Z` it always holds, and
+# the cut cannot tell `<tool_output` from `<tool_output_x>` cut short -- blanking either is safe.
+_CLIP_SEAM_RE = re.compile(
+    f"(?:{_PLATFORM_PROVENANCE_PATTERN}|</?\\s*{_TOOL_OUTPUT_NAME})\\Z", re.IGNORECASE
+)
 
 
 def repair_clipped_tool_result(head: str) -> str:
