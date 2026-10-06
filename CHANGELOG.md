@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.40.0 — 2026-10-06
+
+### Fixed
+
+- **Security:** `sanitize_tool_result` now neutralizes the whole `tool_output` envelope tag
+  CLASS inside a result, not only the exact `<tool_output>` / `</tool_output>` literals.
+  `</tool_output >`, `</ tool_output>`, `</tool_output\n>`, `<tool_output x=1>` (any case,
+  any whitespace after `<` / `</`, any attributes) passed through v0.39.0 and could close the
+  envelope early, and an UNTERMINATED `<tool_output foo` was completed by the envelope's own
+  `\n</tool_output>`. Every START of the class (`</?\s*tool_output\b`) is now blanked to a
+  space; what followed it (attributes, a `>`) stays as inert text, so a hostile result cannot
+  use the rule to delete the rows between a start and a later `>`. Run jointly with the
+  `[platform` opener rule (stripping one can re-form the other), to the one fixed point, in
+  linear time. A result body never holds a match of `</?\s*tool_output\b`. Words that only
+  begin with the name (`tool_output_to_compress`, `tool_outputs`, `</tool_output_>`) and
+  `< /tool_output>` are untouched. **Byte-identical to v0.39.0 for every input in which no
+  start of the class appears, before or after the `max_len` cut** (all ordinary text: 0 of
+  5,165 stored production tool results changed). No API change. (TBP T-7280a)
+- `repair_clipped_tool_result` also blanks a `tool_output` tag start a clip leaves at the end
+  of the head (`<tool_outputs>` cut to `<tool_output`, or a genuine closer cut before its
+  `>`), before it re-closes the envelope -- the re-close would otherwise complete it.
+  `\Z`-anchored like the existing seam rule, so genuine notes after the envelope are kept.
+
 ## v0.39.0 — 2026-10-05
 
 ### Added
