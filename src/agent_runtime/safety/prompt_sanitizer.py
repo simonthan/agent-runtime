@@ -13,15 +13,71 @@ from typing import cast
 # Keep \t (9), \n (10), \r (13); strip every other control char.
 _CONTROL_CHARS = "".join(chr(c) for c in range(32) if c not in (9, 10, 13))
 
-# Zero-width / format chars an attacker splices INTO a sentinel to break literal
-# matching (e.g. a U+200B between 's' and 'ystem:'). Stripped during normalization,
-# after NFKC folds full-width / homoglyph variants (full-width "SYSTEM:" -> ASCII
-# "SYSTEM:"). Covers U+200B..U+200F, U+2060 (word joiner), U+FEFF (BOM / zero-width
-# no-break space). Residual limit (SEC-7): NFKC does not fold every confusable
-# (Cyrillic/Greek look-alikes survive), so this raises the bar without being a
-# complete homoglyph defense; the tool_output envelope stays the primary boundary
-# for tool output.
-_ZERO_WIDTH_RE = re.compile("[\u200b-\u200f\u2060\ufeff]")
+# Invisible chars an attacker splices INTO a sentinel to break literal matching (e.g. a
+# U+200B between 's' and 'ystem:', a soft hyphen in "SYS\u00adTEM:"). Stripped during
+# normalization, after NFKC folds full-width / homoglyph variants (full-width "SYSTEM:" ->
+# ASCII "SYSTEM:"). Residual limit (SEC-7): NFKC does not fold every confusable
+# (Cyrillic/Greek look-alikes survive), so this raises the bar without being a complete
+# homoglyph defense; the tool_output envelope stays the primary boundary for tool output.
+#
+# T-7244: the class is Unicode Default_Ignorable_Code_Point (DerivedCoreProperties.txt,
+# unchanged 15.0 -> 16.0): every code point a renderer shows as nothing. Through v0.40.0 it
+# was only U+200B..U+200F, U+2060 and U+FEFF, so a soft hyphen (U+00AD), the invisible math
+# operators (U+2061..U+2064), U+180E, U+034F, the bidi controls and the U+E0000 tag block
+# (which also spells hidden ASCII) split a sentinel just as well and passed both sanitizers.
+# None of these is whitespace, and NFKC turns no other code point into one of them except
+# U+3164 / U+FFA0 -> U+1160, itself in the class, so stripping after NFKC leaves none.
+#
+# Variation selectors (the Unicode Variation_Selector property: U+180B..U+180D, U+180F,
+# U+FE00..U+FE0F, U+E0100..U+E01EF) are default-ignorable too, but after an emoji or a CJK
+# ideograph they pick its glyph ("\u26a0\ufe0f" is the emoji warning sign, not the text one),
+# and tbp persists the sanitized user turn its history view shows. So a selector is KEPT
+# only when the nearest earlier character that is not in the class is a base that takes
+# one -- `_VARIATION_SELECTOR_BASES`: emoji-style symbols, CJK ideographs, Mongolian -- and
+# stripped everywhere else, at the very start included. An allow-list, not a deny-list, on
+# purpose (T-7244 R3 H1): a sentinel, opener or tag start is not just ASCII plus whitespace
+# to the IGNORECASE regexes that match it -- U+0130, U+0131, U+017F and U+212A fold to
+# ASCII letters, and tbp's no-NFKC strip sites read full-width letters and Unicode dashes
+# (the notification `---` boundary) -- so "keep after anything non-ASCII" left splices
+# open. No base is ASCII, whitespace, a dash tbp's `---` boundary reads (U+1806 and U+3030
+# are dashes but not in that set), case-folds to ASCII or NFKC-folds to text
+# holding ASCII (pinned by tests; that is why U+00A9 / U+00AE are in and U+2122, U+2139,
+# U+203C, U+2049, U+24C2 are out), so no base can sit inside a sentinel.
+#
+# One regex: the first alternative takes a whole run of the class whose first character
+# does not follow a base (the two-character lookbehind reads the character before the run,
+# then the run's first; class members are listed in it too, so a selector left after a
+# base's stripped invisibles is judged by that base, not by the stripped neighbour); the
+# second takes every member but the selectors anywhere else. Opening each alternative with
+# the class lets the engine skip text that holds no member. Linear: each run is consumed
+# once.
+#
+# Module-private but imported by name by teams-bot-platform (skills_runtime,
+# notification_drillin), which strips with `_ZERO_WIDTH_RE.sub("", text)` on paths that do
+# not NFKC: keep it one regex whose `.sub("", ...)` is the whole strip.
+_VARIATION_SELECTORS = "\u180b-\u180d\u180f\ufe00-\ufe0f\U000e0100-\U000e01ef"
+_INVISIBLE_EXCEPT_VARIATION_SELECTORS = (
+    "\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180e\u200b-\u200f\u202a-\u202e"
+    "\u2060-\u206f\u3164\ufeff\uffa0\ufff0-\ufff8\U0001bca0-\U0001bca3"
+    "\U0001d173-\U0001d17a\U000e0000-\U000e00ff\U000e01f0-\U000e0fff"
+)
+_INVISIBLE = _INVISIBLE_EXCEPT_VARIATION_SELECTORS + _VARIATION_SELECTORS
+# Emoji-presentation bases outside the emoji blocks (Unicode emoji-variation-sequences.txt,
+# minus the ASCII keycap bases and the NFKC-to-ASCII ones), the emoji blocks (minus the
+# enclosed alphanumerics NFKC folds to ASCII, U+1F100..U+1F16C and U+1F190), CJK
+# ideographs (ideographic variation sequences) and the Mongolian block (free variation
+# selectors).
+_VARIATION_SELECTOR_BASES = (
+    "\u00a9\u00ae\u2194-\u2199\u21a9\u21aa\u231a\u231b\u2328\u23cf\u23e9-\u23f3"
+    "\u23f8-\u23fa\u25aa\u25ab\u25b6\u25c0\u25fb-\u25fe\u2600-\u27bf\u2934\u2935"
+    "\u2b05-\u2b07\u2b1b\u2b1c\u2b50\u2b55\u3030\u303d\u3297\u3299"
+    "\U0001f000-\U0001f0ff\U0001f16d-\U0001f18f\U0001f191-\U0001faff"
+    "\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003ffff\u1800-\u18af"
+)
+_ZERO_WIDTH_RE = re.compile(
+    rf"[{_INVISIBLE}](?<![{_VARIATION_SELECTOR_BASES}{_INVISIBLE}].)[{_INVISIBLE}]*"
+    rf"|[{_INVISIBLE_EXCEPT_VARIATION_SELECTORS}]+"
+)
 
 _INJECTION_SENTINELS = (
     "```",
@@ -94,8 +150,8 @@ _SENTINEL_RE = re.compile(
 
 
 def _normalize(s: str) -> str:
-    """NFKC-fold and strip zero-width/format chars so sentinel matching sees
-    canonical text (SEC-7). Run BEFORE control-char and sentinel handling."""
+    """NFKC-fold and strip invisible chars (`_ZERO_WIDTH_RE`) so sentinel matching sees
+    canonical text (SEC-7, T-7244). Run BEFORE control-char and sentinel handling."""
     return _ZERO_WIDTH_RE.sub("", unicodedata.normalize("NFKC", s))
 
 
@@ -232,7 +288,8 @@ def sanitize_for_llm_prompt(
     """Return text safe to interpolate into an LLM prompt.
 
     - None / non-str → ""
-    - NFKC-normalized; zero-width/format chars stripped
+    - NFKC-normalized; invisible (Unicode default-ignorable) chars stripped -- variation
+      selectors only after a base that takes one: emoji, CJK, Mongolian (T-7244)
     - Control chars (except \\t \\n \\r) → space
     - Injection sentinels + the `[platform]` first-party provenance prefix and its
       bracketed near-variants (case-insensitive) → space, so a user turn cannot forge
@@ -406,8 +463,9 @@ def sanitize_tool_result(text: str | None, max_len: int = 8000) -> str:
 
     - None -> "" (and empty/whitespace-only content -> "", no envelope) so empty
       tool returns stay empty for the caller.
-    - NFKC-normalized; zero-width/format chars stripped (SEC-7) so full-width /
-      zero-width-laced sentinels fold to canonical form before matching.
+    - NFKC-normalized; invisible (Unicode default-ignorable) chars stripped -- variation
+      selectors only after a base that takes one (SEC-7, T-7244) -- so
+      full-width / invisible-laced sentinels fold to canonical form before matching.
     - Control chars (except \\t \\n \\r) -> space.
     - Role/instruction sentinels + envelope tags + the `[platform]` first-party
       provenance prefix **and its bracketed near-variants** (`[ platform ]`,
