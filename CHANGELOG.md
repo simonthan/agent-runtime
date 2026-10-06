@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.41.0 — 2026-10-06
+
+### Changed
+
+- **Security:** the invisible-character strip that `sanitize_for_llm_prompt` and
+  `sanitize_tool_result` run first (`_ZERO_WIDTH_RE`, after NFKC) now covers every Unicode
+  `Default_Ignorable_Code_Point`, not only U+200B..U+200F, U+2060 and U+FEFF. A soft hyphen
+  (U+00AD), the invisible math operators (U+2061..U+2064), U+180E, U+034F, U+061C, the bidi
+  embedding / override / isolate controls, the Hangul fillers and the U+E0000 tag block
+  (which also spells hidden ASCII) split a sentinel just as well (`SYS\u00adTEM:`,
+  `[\u00adplatform]`, `</tool\u00ad_output>`) and passed both sanitizers unchanged.
+  **Variation selectors** (U+FE00..U+FE0F, U+E0100..U+E01EF, U+180B..U+180D, U+180F) are
+  kept only after a base that takes one -- an allow-list of emoji-style symbols, CJK
+  ideographs and Mongolian (`_VARIATION_SELECTOR_BASES`; none is ASCII, whitespace, a dash,
+  folds to ASCII under IGNORECASE or under NFKC) -- and stripped everywhere else, so
+  `\u26a0\ufe0f` stays the emoji warning sign while a selector after a letter
+  (`[\u0131\ufe0fNST]`), a dash or at the very start goes. A selector on an ASCII base is
+  dropped (`#\ufe0f\u20e3` -> `#\u20e3`). **Byte change:** output changes for
+  any input holding one of the newly stripped code points (the characters are removed), and
+  nowhere else. Measured on teams-bot-platform production data (2026-07-30..2026-10-06): 19 of
+  5,184 stored tool-result bodies (soft hyphens, U+034F e-mail preheader padding, variation
+  selector on an ASCII base); 0 of 1,272 user turns (every stored selector follows a base);
+  none re-forms a sentinel once stripped.
+  `_ZERO_WIDTH_RE` keeps its name and stays one regex whose `.sub("", text)` is the whole
+  strip (consumers import it). No API change. (TBP T-7244a)
+
 ## v0.40.0 — 2026-10-06
 
 ### Fixed
