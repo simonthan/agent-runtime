@@ -39,7 +39,8 @@ _CONTROL_CHARS = "".join(chr(c) for c in range(32) if c not in (9, 10, 13))
 # to the IGNORECASE regexes that match it -- U+0130, U+0131, U+017F and U+212A fold to
 # ASCII letters, and tbp's no-NFKC strip sites read full-width letters and Unicode dashes
 # (the notification `---` boundary) -- so "keep after anything non-ASCII" left splices
-# open. No base is ASCII, whitespace, a dash, case-folds to ASCII or NFKC-folds to text
+# open. No base is ASCII, whitespace, a dash tbp's `---` boundary reads (U+1806 and U+3030
+# are dashes but not in that set), case-folds to ASCII or NFKC-folds to text
 # holding ASCII (pinned by tests; that is why U+00A9 / U+00AE are in and U+2122, U+2139,
 # U+203C, U+2049, U+24C2 are out), so no base can sit inside a sentinel.
 #

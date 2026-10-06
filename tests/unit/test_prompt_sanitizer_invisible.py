@@ -5,9 +5,9 @@ hyphen (U+00AD), an invisible math operator (U+2061..U+2064), U+180E, U+034F, a 
 or a U+E0000 tag character spliced into a sentinel (`SYS\\u00adTEM:`, `[\\u00adplatform]`,
 `</tool\\u00ad_output>`) passed both sanitizers unchanged. These pin: the class is exactly
 Default_Ignorable_Code_Point; every member spliced into every neutralized literal is
-neutralized at both boundaries; variation selectors are kept after a non-ASCII character
-(emoji / CJK glyph choice) and stripped after an ASCII one; text holding no newly stripped
-code point is byte-identical to v0.40.0; the strip is linear.
+neutralized at both boundaries; variation selectors are kept only after an allow-listed base
+(emoji / CJK / Mongolian glyph choice) and stripped everywhere else; text holding no newly
+stripped code point is byte-identical to v0.40.0; the strip is linear.
 """
 
 import random
@@ -174,13 +174,13 @@ class TestClass:
 
     def test_a_mixed_run_after_an_ascii_char_goes_whole(self):
         assert ps._ZERO_WIDTH_RE.sub("", f"S{_MIXED_RUN}{_MIXED_RUN}YS") == "SYS"
-        # After a non-ASCII char only the variation selectors of the run stay, in order.
+        # After an allow-listed base only the variation selectors of the run stay, in order.
         assert ps._ZERO_WIDTH_RE.sub("", f"\u2764{_MIXED_RUN}x") == "\u2764\ufe0f\u180bx"
 
     def test_matches_the_per_character_rule_on_random_text(self):
         # The rule the regex implements, one character at a time: drop every member except a
-        # variation selector, and drop that too when the nearest earlier non-member exists
-        # and is ASCII or whitespace.
+        # variation selector, and drop that too unless the nearest earlier non-member exists
+        # and is an allow-listed base (`_VARIATION_SELECTOR_BASES`).
         def reference(text: str) -> str:
             out, base = [], None
             for ch in text:

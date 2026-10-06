@@ -13,10 +13,11 @@
   `[\u00adplatform]`, `</tool\u00ad_output>`) and passed both sanitizers unchanged.
   **Variation selectors** (U+FE00..U+FE0F, U+E0100..U+E01EF, U+180B..U+180D, U+180F) are
   kept only after a base that takes one -- an allow-list of emoji-style symbols, CJK
-  ideographs and Mongolian (`_VARIATION_SELECTOR_BASES`; none is ASCII, whitespace, a dash,
+  ideographs and Mongolian (`_VARIATION_SELECTOR_BASES`; none is ASCII, whitespace, a dash
+  that tbp's `---` notification boundary reads,
   folds to ASCII under IGNORECASE or under NFKC) -- and stripped everywhere else, so
   `\u26a0\ufe0f` stays the emoji warning sign while a selector after a letter
-  (`[\u0131\ufe0fNST]`), a dash or at the very start goes. A selector on an ASCII base is
+  (`[\u0131\ufe0fNST]`), an em dash or at the very start goes. A selector on an ASCII base is
   dropped (`#\ufe0f\u20e3` -> `#\u20e3`). **Byte change:** output changes for
   any input holding one of the newly stripped code points (the characters are removed), and
   nowhere else. Measured on teams-bot-platform production data (2026-07-30..2026-10-06): 19 of
