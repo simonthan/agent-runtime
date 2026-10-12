@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.42.0 — 2026-10-12
+
+### Added
+
+- `ToolUseLoop.run(..., stop_after_round: StopAfterRoundHook | None = None)` (and the same
+  keyword on `resume()`): a consumer hook called after every COMMITTED tool round. `None` =
+  carry on; a string ends the run at once with that string as `final_text` and
+  `stop_reason == CONSUMER_STOP_REASON` (`"consumer_stop"`, exported) -- no further model
+  call, not even the cap's no-tools forced-final call, and `cap_exhausted` stays False when
+  the stopping round was the last one the cap allowed. The run then made exactly
+  `len(steps)` model calls. The hook runs before the next iteration's `pre_completion_hook`
+  check, is never consulted before the first round commits or after a round that suspended,
+  and on `resume()` runs once the resumed round commits. Audit: `tool_loop_consumer_stop`
+  (info, `rounds`, `max_rounds`). Default `None` = byte-for-byte unchanged. Use: a consumer
+  whose terminal tool has already recorded the run's result (TBP order staging made one
+  discarded model call per step after its sink tool, 6-11% of model time). (TBP T-7423a)
+
 ## v0.41.0 — 2026-10-06
 
 ### Changed

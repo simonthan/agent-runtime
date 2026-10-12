@@ -23,6 +23,8 @@ Public surface:
 - ``ParallelSafePredicate`` — opt-in concurrent tool calls (T-7092)
 - ``EMPTY_RESPONSE_STOP_REASON`` — stop_reason of a turn whose model call came back empty
   after a tool round, twice (``ToolUseLoop(empty_final_nudge=...)``, T-7219)
+- ``StopAfterRoundHook``, ``CONSUMER_STOP_REASON`` — end a run right after a committed tool
+  round with no further model call (``run(..., stop_after_round=...)``, T-7423a)
 - ``ToolRoundContext``, ``current_tool_round``, ``bind_tool_round`` — the executing round's
   index / remaining tool-round budget, readable by an executor with no signature change (T-115j),
   and the round's assistant text (T-7154);
@@ -68,6 +70,7 @@ from agent_runtime.llm.round_context import (
     current_tool_use_id,
 )
 from agent_runtime.llm.tool_loop import (
+    CONSUMER_STOP_REASON,
     EMPTY_RESPONSE_STOP_REASON,
     ConfirmPredicate,
     ExecuteDecision,
@@ -76,6 +79,7 @@ from agent_runtime.llm.tool_loop import (
     PendingConfirmation,
     PreCompletionHook,
     ResumeDecision,
+    StopAfterRoundHook,
     ToolCall,
     ToolExecutor,
     ToolLoopResult,
@@ -87,6 +91,7 @@ from agent_runtime.llm.tool_loop import (
 __all__ = [
     "ANTHROPIC_IMAGE_MEDIA_TYPES",
     "ANTI_RETRACTION_INSTRUCTIONS",
+    "CONSUMER_STOP_REASON",
     "EMPTY_RESPONSE_STOP_REASON",
     "GROUNDED_DELIVERY_INSTRUCTIONS",
     "AnthropicClient",
@@ -108,6 +113,7 @@ __all__ = [
     "PendingConfirmation",
     "PreCompletionHook",
     "ResumeDecision",
+    "StopAfterRoundHook",
     "ToolCall",
     "ToolExecutor",
     "ToolLoopResult",
