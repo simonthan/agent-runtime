@@ -23,6 +23,12 @@ caller's nudge appended as a text block to the trailing user turn. Still empty -
 ``final_text == ""`` with ``stop_reason == EMPTY_RESPONSE_STOP_REASON`` (or
 ``"cap_exhausted"`` when the round cap was reached), ``steps`` intact, instead of an
 ``LLMResponseError`` that discards every round. Default ``None`` = byte-for-byte unchanged.
+
+Consumer stop (TBP T-7423a): ``run(..., stop_after_round=hook)`` / ``resume(...)`` call
+``hook()`` after every committed tool round. ``None`` = carry on; a string = the consumer's
+work is done, so the loop returns AT ONCE with that string as ``final_text`` and
+``stop_reason == CONSUMER_STOP_REASON`` -- no further model call, not even the no-tools
+forced-final one. Default ``None`` = byte-for-byte unchanged.
 """
 
 from __future__ import annotations
@@ -42,6 +48,7 @@ from agent_runtime.logging import AuditLogger, NullAuditLogger
 from agent_runtime.safety.prompt_sanitizer import repair_clipped_tool_result
 
 __all__ = [
+    "CONSUMER_STOP_REASON",
     "EMPTY_RESPONSE_STOP_REASON",
     "ConfirmPredicate",
     "ExecuteDecision",
@@ -50,6 +57,7 @@ __all__ = [
     "PendingConfirmation",
     "PreCompletionHook",
     "ResumeDecision",
+    "StopAfterRoundHook",
     "ToolCall",
     "ToolExecutor",
     "ToolLoopResult",
@@ -134,6 +142,13 @@ ParallelSafePredicate = Callable[[str, dict[str, Any]], bool]
 # Returns None to proceed normally, or a string to inject as a system
 # instruction for a forced-final call (no further tool rounds).
 PreCompletionHook = Callable[[], str | None]
+# T-7423a: optional hook invoked after each COMMITTED tool round (every tool_use of the round
+# has its tool_result). Returns None to carry on, or a string to end the run right there:
+# that string becomes `final_text`, stop_reason is CONSUMER_STOP_REASON, and no further model
+# call is made. Consumer policy (e.g. "my terminal tool has succeeded"); must not raise --
+# an exception propagates out of run()/resume() and the rounds' ToolLoopResult (and so the
+# consumer's token accounting for them) is lost.
+StopAfterRoundHook = Callable[[], str | None]
 
 # T-7092: a bound below 2 means serial — `1` is a legitimate "off", not an error.
 _MIN_PARALLEL_CALLS = 2
@@ -211,8 +226,8 @@ class ToolLoopResult:
     approval and the caller must surface it and call `resume()` (check this FIRST)."""
 
     final_text: str
-    # last stop_reason, "cap_exhausted", "pending_confirmation", or (T-7219, opt-in)
-    # EMPTY_RESPONSE_STOP_REASON
+    # last stop_reason, "cap_exhausted", "pending_confirmation", (T-7219, opt-in)
+    # EMPTY_RESPONSE_STOP_REASON, or (T-7423a, opt-in) CONSUMER_STOP_REASON
     stop_reason: str
     cap_exhausted: bool
     steps: tuple[ToolLoopStep, ...]
@@ -287,6 +302,11 @@ def _tool_result_content(call: ToolCall) -> str | list[dict[str, Any]]:
 # T-7219 -- ToolLoopResult.stop_reason when a model call after a tool round came back empty
 # and the one recovery call (see ToolUseLoop's `empty_final_nudge`) was empty too.
 EMPTY_RESPONSE_STOP_REASON = "empty_response"
+
+# T-7423a -- ToolLoopResult.stop_reason when the consumer's `stop_after_round` hook ended the
+# run after a committed tool round. The run made exactly one model call per round in `steps`
+# (no final call), and `final_text` is the hook's own string, never model output.
+CONSUMER_STOP_REASON = "consumer_stop"
 
 
 def _is_empty_reply(resp: Any) -> bool:
@@ -367,6 +387,7 @@ class ToolUseLoop:
         parallel_safe: ParallelSafePredicate | None = None,
         max_parallel_calls: int | None = None,
         first_tool_choice: dict[str, Any] | None = None,
+        stop_after_round: StopAfterRoundHook | None = None,
     ) -> ToolLoopResult:
         """Run the fenced loop. `max_rounds` caps model turns that return
         stop_reason=='tool_use'. Returns once the model stops requesting tools, the
@@ -442,7 +463,17 @@ class ToolUseLoop:
         before any model call); with empty `tools` any other choice is ignored. Some
         models reject a forced choice with a 400 (`LLMAPIError`); the consumer decides
         per model. Default None = byte-for-byte
-        unchanged (regression guarantee)."""
+        unchanged (regression guarantee).
+
+        `stop_after_round` (v0.42.0, TBP T-7423a) is called after every COMMITTED tool round
+        (the round's tool_results are in `messages` and its step is in `steps`), before any
+        further model call, the `pre_completion_hook` and the cap's forced-final call. None =
+        carry on. A string ends the run at once: `final_text` is that string (the consumer's
+        own text, never model output), `stop_reason` is CONSUMER_STOP_REASON, `cap_exhausted`
+        is False even when that round was the last one the cap allowed, and the run made
+        exactly `len(steps)` model calls. Never called before the first round commits, nor
+        after a round that suspended. `resume()` takes the same hook (re-supply it, like the
+        other callables). Default None = byte-for-byte unchanged (regression guarantee)."""
         _check_first_tool_choice(first_tool_choice, tools)
         system_blocks = self._build_system_blocks(static_system_prefix, dynamic_system_suffix)
         first_user: list[dict[str, Any]] = []
@@ -482,6 +513,7 @@ class ToolUseLoop:
             parallel_safe=parallel_safe,
             max_parallel_calls=max_parallel_calls,
             first_tool_choice=first_tool_choice,
+            stop_after_round=stop_after_round,
         )
 
     async def resume(
@@ -505,6 +537,7 @@ class ToolUseLoop:
         pre_completion_hook: PreCompletionHook | None = None,
         parallel_safe: ParallelSafePredicate | None = None,
         max_parallel_calls: int | None = None,
+        stop_after_round: StopAfterRoundHook | None = None,
     ) -> ToolLoopResult:
         """Resume a loop suspended by a confirm-required tool. `state` is the opaque
         dict from `PendingConfirmation.state` (may have been JSON round-tripped through
@@ -536,7 +569,10 @@ class ToolUseLoop:
 
         `parallel_safe` / `max_parallel_calls` mirror `run()` (T-7092) and must be
         re-supplied on every call. The pending ExecuteDecision call itself always runs
-        alone."""
+        alone.
+
+        `stop_after_round` mirrors `run()` (T-7423a) and must be re-supplied on every call: it
+        is consulted once the resumed round commits, before any further model call."""
         # cache_history: no param — the run()-time history marker rides state["messages"].
         system_blocks = self._build_system_blocks(static_system_prefix, dynamic_system_suffix)
         messages: list[dict[str, Any]] = state["messages"]
@@ -629,6 +665,9 @@ class ToolUseLoop:
             calls=round_outcome.calls,
             cache_tool_rounds=cache_tool_rounds,
         )
+        stopped = self._consumer_stop(stop_after_round, rounds, max_rounds, steps, agg)
+        if stopped is not None:
+            return stopped
         return await self._drive(
             system_blocks=system_blocks,
             messages=messages,
@@ -650,9 +689,10 @@ class ToolUseLoop:
             pre_completion_hook=pre_completion_hook,
             parallel_safe=parallel_safe,
             max_parallel_calls=max_parallel_calls,
+            stop_after_round=stop_after_round,
         )
 
-    async def _drive(  # noqa: C901 -- T-7219 empty-reply exits; same as _resolve_round
+    async def _drive(  # noqa: C901, PLR0912 -- T-7219 empty-reply exits, T-7423a consumer stop
         self,
         *,
         system_blocks: list[dict[str, Any]],
@@ -676,6 +716,7 @@ class ToolUseLoop:
         parallel_safe: ParallelSafePredicate | None = None,
         max_parallel_calls: int | None = None,
         first_tool_choice: dict[str, Any] | None = None,
+        stop_after_round: StopAfterRoundHook | None = None,
     ) -> ToolLoopResult:
         """Shared round engine. `while rounds < max_rounds` (correct at the
         max_rounds=0 boundary — zero tool rounds, straight to the forced answer).
@@ -686,7 +727,11 @@ class ToolUseLoop:
         (b) the string is appended as an uncached system block to the forced-final
         call so the model sees the wrap-up instruction.
         Policy-free: the hook owns the threshold check and the instruction text;
-        the loop only handles injection mechanics."""
+        the loop only handles injection mechanics.
+
+        T-7423a: `stop_after_round` is consulted right after each `_commit_round` here (and
+        in `resume()` after the resumed round commits), so it runs before the next loop
+        iteration's `pre_completion_hook` check and before the cap's forced-final call."""
         wrap_up_text: str | None = None
         cap_reached = False
         # T-7219 -- why a model call after a tool round came back empty ("no_content" =
@@ -763,6 +808,9 @@ class ToolUseLoop:
                 calls=outcome.calls,
                 cache_tool_rounds=cache_tool_rounds,
             )
+            stopped = self._consumer_stop(stop_after_round, rounds, max_rounds, steps, agg)
+            if stopped is not None:
+                return stopped
         else:
             cap_reached = True
 
@@ -1398,6 +1446,24 @@ class ToolUseLoop:
             assistant_text=d["assistant_text"],
             tool_calls=tuple(cls._call_from_dict(c) for c in d["tool_calls"]),
         )
+
+    def _consumer_stop(
+        self,
+        hook: StopAfterRoundHook | None,
+        rounds: int,
+        max_rounds: int,
+        steps: list[ToolLoopStep],
+        agg: dict[str, int],
+    ) -> ToolLoopResult | None:
+        """T-7423a -- ask the consumer's `stop_after_round` hook, after a committed round,
+        whether the run is done. None = carry on (also when no hook was supplied)."""
+        if hook is None:
+            return None
+        text = hook()
+        if text is None:
+            return None
+        self._audit.info("tool_loop_consumer_stop", rounds=rounds, max_rounds=max_rounds)
+        return self._result(text, CONSUMER_STOP_REASON, cap_exhausted=False, steps=steps, agg=agg)
 
     @staticmethod
     def _result(
