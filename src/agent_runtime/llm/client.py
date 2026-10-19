@@ -28,10 +28,12 @@ defense is auditable.
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, Protocol
 
-from anthropic import APIError, RateLimitError
+import httpx
+from anthropic import APIError, APIStatusError, RateLimitError
 
 from agent_runtime.llm.errors import (
     LLMAPIError,
@@ -39,9 +41,17 @@ from agent_runtime.llm.errors import (
     LLMResponseError,
 )
 from agent_runtime.llm.models import ClaudeResponse, History, LLMImage, ToolUseBlock
+from agent_runtime.llm.streaming import (
+    StreamListener,
+    TextDelta,
+    ToolUseStarted,
+    guard_listener,
+)
 from agent_runtime.logging import AuditLogger, NullAuditLogger
 
 __all__ = ["AnthropicClient", "assemble_history_messages"]
+
+logger = logging.getLogger(__name__)
 
 
 _CACHE_MIN_TOKENS: dict[str, int] = {
@@ -53,6 +63,12 @@ _CACHE_MIN_TOKENS: dict[str, int] = {
     "claude-haiku-": 2048,
 }
 _DEFAULT_CACHE_HINT = 1024
+
+# T-316b -- HTTP statuses on which a STREAMING request is retried once without streaming.
+# If that retry succeeds, the endpoint takes the request but not the stream (a proxy or a
+# passthrough without SSE), so the client stops streaming for its lifetime
+# (`llm_stream_unsupported`). Never 429 / 5xx / timeouts: those are not about streaming.
+_STREAM_FALLBACK_STATUSES = frozenset({400, 404, 405, 406, 415, 501})
 
 
 def _cache_threshold_hint(model: str) -> tuple[int, bool]:
@@ -107,10 +123,60 @@ def _mark_cache_control(content: Any) -> Any:
     return content
 
 
+async def _forward_event(event: Any, on_stream: StreamListener) -> bool:
+    """T-316b -- one raw SDK stream event as a listener event: a text delta, or the start of
+    a tool_use block. Every other event (message/usage/stop, thinking, json deltas) is not
+    reported. True = something was handed to the listener (it may be on a screen now)."""
+    etype = getattr(event, "type", None)
+    if etype == "content_block_delta":
+        delta = getattr(event, "delta", None)
+        if getattr(delta, "type", None) == "text_delta":
+            text = getattr(delta, "text", "") or ""
+            if text:
+                await on_stream(TextDelta(text=text))
+                return True
+    elif etype == "content_block_start":
+        block = getattr(event, "content_block", None)
+        if getattr(block, "type", None) == "tool_use":
+            await on_stream(ToolUseStarted(name=getattr(block, "name", "") or ""))
+            return True
+    return False
+
+
+class _IncompleteStreamError(Exception):
+    """T-316b -- the stream ended (cleanly, from the transport's view) before `message_stop`:
+    a proxy cut it. `messages.create` can never return such a body, so neither may we."""
+
+
+class _NoStreamError(Exception):
+    """T-316b -- this endpoint does not stream: refused with `status` before any event, or
+    answered with no stream event at all (status None)."""
+
+    def __init__(self, status: int | None) -> None:
+        super().__init__(f"no stream (status={status})")
+        self.status = status
+
+
+def _stream_error_type(exc: APIError) -> str | None:
+    """The `error.type` of an error the API sent INSIDE a stream (`event: error`), e.g.
+    "overloaded_error" / "rate_limit_error". Such errors arrive on a 200 response, so their
+    HTTP status no longer says what they are."""
+    body = getattr(exc, "body", None)
+    error = body.get("error") if isinstance(body, dict) else None
+    etype = error.get("type") if isinstance(error, dict) else None
+    return etype if isinstance(etype, str) else None
+
+
 class _AnthropicMessages(Protocol):
-    """Structural Protocol for the SDK's ``client.messages`` attribute."""
+    """Structural Protocol for the SDK's ``client.messages`` attribute.
+
+    ``stream`` (T-316b) is used only when the client streams (``stream_transport=True`` or
+    an ``on_stream`` listener); it returns the SDK's async context manager whose stream
+    yields raw events and ends with ``get_final_message()``."""
 
     async def create(self, **kwargs: Any) -> Any: ...
+
+    def stream(self, **kwargs: Any) -> Any: ...
 
 
 class _AnthropicAPI(Protocol):
@@ -142,12 +208,23 @@ class AnthropicClient:
         default_max_tokens: int = 4096,
         default_temperature: float | None = 0.0,
         audit_logger: AuditLogger | None = None,
+        stream_transport: bool = False,
     ) -> None:
+        """`stream_transport` (v0.43.0, T-316b): send EVERY call as a streaming request and
+        assemble the response from the stream, so a long output never waits on one HTTP
+        read (the SDK's read timeout then bounds the gap between events, not the whole
+        response). The returned `ClaudeResponse` is the same as a non-streaming call's.
+        Default False = byte-for-byte unchanged (`messages.create`). A call that passes an
+        `on_stream` listener streams either way."""
         self._client = client
         self._default_model = default_model
         self._default_max_tokens = default_max_tokens
         self._default_temperature = default_temperature
         self._audit: AuditLogger = audit_logger or NullAuditLogger()
+        self._stream_transport = stream_transport
+        # T-316b -- latched True when a streaming request failed and the same request then
+        # succeeded without streaming: this endpoint cannot stream, stop trying.
+        self._stream_unsupported = False
 
     async def complete_messages(
         self,
@@ -159,6 +236,7 @@ class AnthropicClient:
         temperature: float | None = None,
         model: str | None = None,
         tool_choice: dict[str, Any] | None = None,
+        on_stream: StreamListener | None = None,
     ) -> ClaudeResponse:
         """Low-level single SDK round over a caller-assembled message list.
 
@@ -175,6 +253,12 @@ class AnthropicClient:
         the messages cache this one wrote.
         Some models reject a forced choice (`{"type": "tool"}` / `{"type": "any"}`)
         with a 400, which surfaces as `LLMAPIError` -- the consumer gates by model.
+
+        `on_stream` (v0.43.0, T-316b) receives `TextDelta` / `ToolUseStarted` events while the
+        response is generated (see `agent_runtime.llm.streaming` for the contract). Passing
+        it makes this call a streaming request; the return value and error mapping are the
+        same as without it. None (default) with `stream_transport=False` = byte-for-byte
+        unchanged.
         """
         chosen_model = model or self._default_model
         chosen_max_tokens = max_tokens if max_tokens is not None else self._default_max_tokens
@@ -203,19 +287,44 @@ class AnthropicClient:
             "llm_request_start", model=chosen_model, has_tools=bool(tools), n_messages=len(messages)
         )
         start = time.monotonic()
+        streaming = (self._stream_transport or on_stream is not None) and (
+            not self._stream_unsupported
+        )
         try:
-            raw = await self._client.messages.create(**create_kwargs)
+            if streaming:
+                raw = await self._create_streamed(
+                    create_kwargs, guard_listener(on_stream, self._audit), chosen_model
+                )
+            else:
+                raw = await self._client.messages.create(**create_kwargs)
         except RateLimitError as exc:
             status_code = getattr(exc, "status_code", None)
             self._audit.warning("llm_rate_limited", model=chosen_model, status_code=status_code)
             raise LLMRateLimitError(f"{type(exc).__name__}: status={status_code}") from exc
         except APIError as exc:
             status_code = getattr(exc, "status_code", None)
+            if _stream_error_type(exc) == "rate_limit_error":  # T-316b: an in-stream 429
+                self._audit.warning("llm_rate_limited", model=chosen_model, status_code=429)
+                raise LLMRateLimitError(f"{type(exc).__name__}: status=429") from exc
             error_type = type(exc).__name__
             self._audit.error(
                 "llm_api_error", model=chosen_model, error_type=error_type, status_code=status_code
             )
             raise LLMAPIError(f"{error_type}: status={status_code}") from exc
+        except (httpx.TransportError, httpx.StreamError, _IncompleteStreamError) as exc:
+            # T-316b -- a streamed body is read AFTER the SDK's send(), so a connection that
+            # drops or stalls mid-stream reaches us as a raw httpx error (the SDK maps only
+            # errors inside send()); and a stream cut before message_stop is no answer at all.
+            # Both map exactly like the API errors above.
+            error_type = (
+                "IncompleteStream"
+                if isinstance(exc, _IncompleteStreamError)
+                else type(exc).__name__
+            )
+            self._audit.error(
+                "llm_api_error", model=chosen_model, error_type=error_type, status_code=None
+            )
+            raise LLMAPIError(f"{error_type}: status=None") from exc
 
         duration_ms = int((time.monotonic() - start) * 1000)
         response = self._parse_response(raw)
@@ -244,6 +353,78 @@ class AnthropicClient:
             )
         return response
 
+    async def _create_streamed(
+        self,
+        create_kwargs: dict[str, Any],
+        on_stream: StreamListener | None,
+        model: str,
+    ) -> Any:
+        """T-316b -- one streaming request, assembled into the SDK's final Message (the same
+        object `messages.create` returns, so `_parse_response` is shared). Forwards text
+        deltas and tool_use starts to `on_stream` (already guarded).
+
+        - This endpoint does not stream (a `_STREAM_FALLBACK_STATUSES` error before any event,
+          or a 2xx with no stream event: a proxy that ignored `stream: true`): ONE retry
+          without streaming; a successful retry latches streaming off for this client.
+        - A failure AFTER the stream started (a dropped connection, a stall past the read
+          timeout, an error event such as overloaded_error) used to be retried by the SDK
+          inside send(); the streamed body is read after send(), so the SDK no longer does.
+          It is retried here ONCE -- only when the client allows retries (max_retries > 0)
+          and nothing has been handed to the listener yet (text on a screen is never
+          re-generated). Otherwise it propagates to `complete_messages`' mapping.
+        - A stream that ends before `message_stop` raises (mapped to LLMAPIError): a cut
+          stream is not an answer."""
+        retry_left = (getattr(self._client, "max_retries", 0) or 0) > 0
+        while True:
+            progress = {"started": False, "forwarded": False}
+            try:
+                return await self._stream_once(create_kwargs, on_stream, progress)
+            except _NoStreamError as exc:
+                raw = await self._client.messages.create(**create_kwargs)
+                self._stream_unsupported = True
+                self._audit.error("llm_stream_unsupported", model=model, status_code=exc.status)
+                # The stdlib line too: a consumer that wires no audit logger still sees it.
+                logger.error(  # noqa: TRY400 -- an expected degrade, not a crash: no traceback
+                    "llm_stream_unsupported model=%s status_code=%s", model, exc.status
+                )
+                return raw
+            except (APIStatusError, httpx.TransportError, httpx.StreamError) as exc:
+                # before any event the SDK's own retry loop already ran (the error came out
+                # of send()); after a forwarded event the text may be on a screen
+                if not retry_left or not progress["started"] or progress["forwarded"]:
+                    raise
+                retry_left = False
+                self._audit.warning("llm_stream_retry", model=model, error_type=type(exc).__name__)
+
+    async def _stream_once(
+        self,
+        create_kwargs: dict[str, Any],
+        on_stream: StreamListener | None,
+        progress: dict[str, bool],
+    ) -> Any:
+        """One streaming attempt (see `_create_streamed`). `progress["started"]` turns True at
+        the first event, `progress["forwarded"]` once the listener has been handed anything."""
+        seen_event = False
+        saw_stop = False
+        try:
+            async with self._client.messages.stream(**create_kwargs) as stream:
+                async for event in stream:
+                    seen_event = progress["started"] = True
+                    if getattr(event, "type", None) == "message_stop":
+                        saw_stop = True
+                    if on_stream is not None and await _forward_event(event, on_stream):
+                        progress["forwarded"] = True
+                if not seen_event:
+                    raise _NoStreamError(None)
+                if not saw_stop:
+                    raise _IncompleteStreamError
+                return await stream.get_final_message()
+        except APIStatusError as exc:
+            status = getattr(exc, "status_code", None)
+            if not seen_event and status in _STREAM_FALLBACK_STATUSES:
+                raise _NoStreamError(status) from exc
+            raise
+
     async def complete(
         self,
         *,
@@ -259,6 +440,7 @@ class AnthropicClient:
         max_tokens: int | None = None,
         temperature: float | None = None,
         model: str | None = None,
+        on_stream: StreamListener | None = None,
     ) -> ClaudeResponse:
         """Send a completion request with ``cache_control`` ephemeral breakpoints.
 
@@ -285,6 +467,8 @@ class AnthropicClient:
 
         NOTE: llm_request_start is emitted inside complete_messages (Sonnet F4) —
         do NOT re-add it here or single-shot calls double-log.
+
+        ``on_stream`` (v0.43.0, T-316b) is forwarded to ``complete_messages`` -- see there.
         """
         system_blocks: list[dict[str, Any]] = [
             {"type": "text", "text": static_system_prefix, "cache_control": {"type": "ephemeral"}}
@@ -320,6 +504,7 @@ class AnthropicClient:
             max_tokens=max_tokens,
             temperature=temperature,
             model=model,
+            **({"on_stream": on_stream} if on_stream is not None else {}),
         )
 
     def _parse_response(self, raw: Any) -> ClaudeResponse:

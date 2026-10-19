@@ -29,6 +29,10 @@ Public surface:
   index / remaining tool-round budget, readable by an executor with no signature change (T-115j),
   and the round's assistant text (T-7154);
   ``current_tool_use_id`` / ``bind_tool_use_id`` — the executing call's tool_use id (T-7092)
+- ``StreamListener`` and its events ``ModelCallStarted`` / ``TextDelta`` / ``ToolUseStarted`` /
+  ``ModelCallEnded`` (``StreamEvent``) — the model's text while it is generated, from
+  ``complete(on_stream=...)`` / ``complete_messages(on_stream=...)`` / ``ToolUseLoop.run`` /
+  ``resume`` (TBP T-316b); ``AnthropicClient(stream_transport=True)`` streams every call
 
 See ``agent_runtime.llm.client.AnthropicClient.complete`` docstring for the
 two-breakpoint cache contract (static system prefix + per-turn retrieval block).
@@ -68,6 +72,14 @@ from agent_runtime.llm.round_context import (
     bind_tool_use_id,
     current_tool_round,
     current_tool_use_id,
+)
+from agent_runtime.llm.streaming import (
+    ModelCallEnded,
+    ModelCallStarted,
+    StreamEvent,
+    StreamListener,
+    TextDelta,
+    ToolUseStarted,
 )
 from agent_runtime.llm.tool_loop import (
     CONSUMER_STOP_REASON,
@@ -109,11 +121,16 @@ __all__ = [
     "LLMRateLimitError",
     "LLMResponseError",
     "Message",
+    "ModelCallEnded",
+    "ModelCallStarted",
     "ParallelSafePredicate",
     "PendingConfirmation",
     "PreCompletionHook",
     "ResumeDecision",
     "StopAfterRoundHook",
+    "StreamEvent",
+    "StreamListener",
+    "TextDelta",
     "ToolCall",
     "ToolExecutor",
     "ToolLoopResult",
@@ -122,6 +139,7 @@ __all__ = [
     "ToolRoundContext",
     "ToolUseBlock",
     "ToolUseLoop",
+    "ToolUseStarted",
     "WorkingMemory",
     "bind_tool_round",
     "bind_tool_use_id",

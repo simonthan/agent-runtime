@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.43.0 — 2026-10-19
+
+### Added
+
+- **Streaming model calls.** `AnthropicClient.complete_messages(..., on_stream=listener)` and
+  `complete(..., on_stream=listener)` send the request with `messages.stream()` and call the
+  listener with `TextDelta(text)` for each piece of text and `ToolUseStarted(name)` when a
+  tool_use block begins. `AnthropicClient(stream_transport=True)` streams EVERY call (no
+  listener needed), so a long output never waits on one HTTP read: the SDK's read timeout
+  then bounds the gap between stream events, not the whole response. The returned
+  `ClaudeResponse` and the error mapping (`LLMRateLimitError` / `LLMAPIError` /
+  `LLMResponseError`) are the same as a non-streaming call's. An error mid-stream maps the
+  same way and is not retried. A streaming request refused with 400 / 404 / 405 / 406 / 415 /
+  501 before any event, or answered 2xx with NO stream event (an endpoint or proxy that
+  ignored `stream: true` and sent plain JSON), is retried ONCE without streaming; when that
+  retry succeeds the
+  client stops streaming for its lifetime and logs `llm_stream_unsupported` (error,
+  `model`, `status_code`; audit AND a stdlib `agent_runtime.llm.client` line, so a consumer
+  that wires no audit logger still sees it) -- an endpoint or proxy that cannot stream degrades to the old
+  transport instead of failing every call. (TBP T-316b)
+- Streaming failure semantics (T-316b review): a connection that drops or stalls AFTER the
+  stream started surfaces from httpx outside the SDK's mapping; it is now mapped to
+  `LLMAPIError` (audit `llm_api_error`, `error_type` = the httpx class). A stream that ends
+  before `message_stop` raises `LLMAPIError("IncompleteStream: ...")` -- a cut stream is never
+  returned as an answer. An `event: error` inside the stream whose type is `rate_limit_error`
+  maps to `LLMRateLimitError`. Because the SDK's own retry covers only `send()`, a failure
+  after the stream started is retried ONCE here (audit `llm_stream_retry`, warning) -- only
+  when the SDK client allows retries (`max_retries > 0`) and nothing has been handed to the
+  listener yet; text that may be on a screen is never re-generated.
+- `ToolUseLoop.run(..., on_stream=listener)` / `resume(..., on_stream=listener)`: every model
+  call of the run streams and is bracketed by `ModelCallStarted(round_index, tools_offered)`
+  and `ModelCallEnded(stop_reason)` (`stop_reason=None` when the call raised).
+  `tools_offered=False` marks the forced-final call and the empty-reply recovery call, whose
+  text can only be the answer. The ToolLoopResult is unchanged.
+- New module `agent_runtime.llm.streaming` (events re-exported from `agent_runtime.llm`). A
+  listener runs inline in the read loop and must return quickly; one that raises is
+  detached for the rest of the run and logged once (`llm_stream_listener_failed`, warning,
+  `error_type`, `event`; audit and stdlib), never fatal.
+- Teams streaming: `BotFrameworkOutboundChannel.send_stream_activity(text=, stream_type=,
+  stream_id=None, sequence=None)` sends one Teams streaming request (`STREAM_TYPE_INFORMATIVE`
+  / `STREAM_TYPE_STREAMING` typing activities with a `streaminfo` entity and
+  `streamSequence`; `STREAM_TYPE_FINAL` message activity without one) and returns the stream
+  id the first request is assigned. A Connector HTTP error raises `TeamsStreamRejected`
+  (`status`, `code`, `message`, `user_cancelled` for the documented 403 a user's Stop
+  produces). It is not part of the `OutboundChannel` Protocol: consumers probe for it, and
+  Teams allows it in 1:1 chats only (the caller checks the conversation type).
+
+Default (no `on_stream`, `stream_transport=False`) is byte-for-byte unchanged: the loop
+passes `on_stream` to `complete_messages` only when a listener was given, so client doubles
+and wrappers without the keyword keep working.
+
 ## v0.42.0 — 2026-10-12
 
 ### Added
