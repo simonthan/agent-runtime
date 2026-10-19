@@ -40,13 +40,20 @@ from agent_runtime.transport.teams.images import (
     download_inline_image,
 )
 from agent_runtime.transport.teams.outbound import (
+    STREAM_TYPE_FINAL,
+    STREAM_TYPE_INFORMATIVE,
+    STREAM_TYPE_STREAMING,
     BotFrameworkOutboundChannel,
     OutboundChannel,
     SignInResource,
+    TeamsStreamRejected,
 )
 from agent_runtime.transport.teams.protocol import TeamsHandler
 
 __all__ = [
+    "STREAM_TYPE_FINAL",
+    "STREAM_TYPE_INFORMATIVE",
+    "STREAM_TYPE_STREAMING",
     "BotFrameworkCredentials",
     "BotFrameworkOutboundChannel",
     "ConversationRef",
@@ -64,6 +71,7 @@ __all__ = [
     "TeamsAdapter",
     "TeamsAdapterConfig",
     "TeamsHandler",
+    "TeamsStreamRejected",
     "conversation_ref_from_dict",
     "conversation_ref_to_dict",
     "download_inline_image",

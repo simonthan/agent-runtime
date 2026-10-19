@@ -29,6 +29,11 @@ Consumer stop (TBP T-7423a): ``run(..., stop_after_round=hook)`` / ``resume(...)
 work is done, so the loop returns AT ONCE with that string as ``final_text`` and
 ``stop_reason == CONSUMER_STOP_REASON`` -- no further model call, not even the no-tools
 forced-final one. Default ``None`` = byte-for-byte unchanged.
+
+Streaming (TBP T-316b): ``run(..., on_stream=listener)`` / ``resume(...)`` stream every model
+call and report ``ModelCallStarted`` / ``TextDelta`` / ``ToolUseStarted`` / ``ModelCallEnded``
+events (``agent_runtime.llm.streaming``). The result is unchanged. Default ``None`` =
+byte-for-byte unchanged.
 """
 
 from __future__ import annotations
@@ -44,6 +49,12 @@ from agent_runtime.llm.compaction import estimate_tokens
 from agent_runtime.llm.errors import LLMResponseError
 from agent_runtime.llm.models import LLMImage
 from agent_runtime.llm.round_context import ToolRoundContext, bind_tool_round, bind_tool_use_id
+from agent_runtime.llm.streaming import (
+    ModelCallEnded,
+    ModelCallStarted,
+    StreamListener,
+    guard_listener,
+)
 from agent_runtime.logging import AuditLogger, NullAuditLogger
 from agent_runtime.safety.prompt_sanitizer import repair_clipped_tool_result
 
@@ -388,6 +399,7 @@ class ToolUseLoop:
         max_parallel_calls: int | None = None,
         first_tool_choice: dict[str, Any] | None = None,
         stop_after_round: StopAfterRoundHook | None = None,
+        on_stream: StreamListener | None = None,
     ) -> ToolLoopResult:
         """Run the fenced loop. `max_rounds` caps model turns that return
         stop_reason=='tool_use'. Returns once the model stops requesting tools, the
@@ -473,7 +485,17 @@ class ToolUseLoop:
         is False even when that round was the last one the cap allowed, and the run made
         exactly `len(steps)` model calls. Never called before the first round commits, nor
         after a round that suspended. `resume()` takes the same hook (re-supply it, like the
-        other callables). Default None = byte-for-byte unchanged (regression guarantee)."""
+        other callables). Default None = byte-for-byte unchanged (regression guarantee).
+
+        `on_stream` (v0.43.0, TBP T-316b) makes every model call of this run a streaming
+        request and reports its events: `ModelCallStarted(round_index, tools_offered)` before
+        the call, then `TextDelta` / `ToolUseStarted` as the response is generated, then
+        `ModelCallEnded(stop_reason)` (None when the call raised). Every call is reported: tool
+        rounds, the forced-final call (`tools_offered=False`) and an empty-reply recovery
+        (`tools_offered=False`). The listener must return quickly; a raising listener is
+        detached and logged (`llm_stream_listener_failed`), never fatal. The returned
+        ToolLoopResult is the same as without it. `resume()` takes the same listener (re-supply
+        it). Default None = byte-for-byte unchanged (regression guarantee)."""
         _check_first_tool_choice(first_tool_choice, tools)
         system_blocks = self._build_system_blocks(static_system_prefix, dynamic_system_suffix)
         first_user: list[dict[str, Any]] = []
@@ -514,6 +536,7 @@ class ToolUseLoop:
             max_parallel_calls=max_parallel_calls,
             first_tool_choice=first_tool_choice,
             stop_after_round=stop_after_round,
+            on_stream=guard_listener(on_stream, self._audit),
         )
 
     async def resume(
@@ -538,6 +561,7 @@ class ToolUseLoop:
         parallel_safe: ParallelSafePredicate | None = None,
         max_parallel_calls: int | None = None,
         stop_after_round: StopAfterRoundHook | None = None,
+        on_stream: StreamListener | None = None,
     ) -> ToolLoopResult:
         """Resume a loop suspended by a confirm-required tool. `state` is the opaque
         dict from `PendingConfirmation.state` (may have been JSON round-tripped through
@@ -572,7 +596,10 @@ class ToolUseLoop:
         alone.
 
         `stop_after_round` mirrors `run()` (T-7423a) and must be re-supplied on every call: it
-        is consulted once the resumed round commits, before any further model call."""
+        is consulted once the resumed round commits, before any further model call.
+
+        `on_stream` mirrors `run()` (T-316b): the continuation's model calls are reported; the
+        resolved pending call itself makes no model call."""
         # cache_history: no param — the run()-time history marker rides state["messages"].
         system_blocks = self._build_system_blocks(static_system_prefix, dynamic_system_suffix)
         messages: list[dict[str, Any]] = state["messages"]
@@ -690,6 +717,7 @@ class ToolUseLoop:
             parallel_safe=parallel_safe,
             max_parallel_calls=max_parallel_calls,
             stop_after_round=stop_after_round,
+            on_stream=guard_listener(on_stream, self._audit),
         )
 
     async def _drive(  # noqa: C901, PLR0912 -- T-7219 empty-reply exits, T-7423a consumer stop
@@ -717,6 +745,7 @@ class ToolUseLoop:
         max_parallel_calls: int | None = None,
         first_tool_choice: dict[str, Any] | None = None,
         stop_after_round: StopAfterRoundHook | None = None,
+        on_stream: StreamListener | None = None,
     ) -> ToolLoopResult:
         """Shared round engine. `while rounds < max_rounds` (correct at the
         max_rounds=0 boundary — zero tool rounds, straight to the forced answer).
@@ -754,6 +783,7 @@ class ToolUseLoop:
             resp, empty_cause = await self._call_or_empty(
                 rounds,
                 agg,
+                on_stream,
                 system_blocks=system_blocks,
                 messages=messages,
                 tools=tools,
@@ -831,6 +861,7 @@ class ToolUseLoop:
             final, empty_cause = await self._call_or_empty(
                 rounds,
                 agg,
+                on_stream,
                 system_blocks=effective_system,
                 messages=messages,
                 tools=None,
@@ -860,10 +891,34 @@ class ToolUseLoop:
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
+            on_stream=on_stream,
         )
 
+    async def _complete(
+        self, rounds: int, on_stream: StreamListener | None, **call_kwargs: Any
+    ) -> Any:
+        """One `complete_messages` call. With a listener (T-316b): bracketed by
+        ModelCallStarted / ModelCallEnded, and the listener rides the call (only when set, so
+        a client double without the keyword keeps working when streaming is off)."""
+        if on_stream is None:
+            return await self._client.complete_messages(**call_kwargs)
+        await on_stream(
+            ModelCallStarted(round_index=rounds, tools_offered=bool(call_kwargs.get("tools")))
+        )
+        try:
+            resp = await self._client.complete_messages(**call_kwargs, on_stream=on_stream)
+        except Exception:
+            await on_stream(ModelCallEnded(stop_reason=None))
+            raise
+        await on_stream(ModelCallEnded(stop_reason=resp.stop_reason))
+        return resp
+
     async def _call_or_empty(
-        self, rounds: int, agg: dict[str, int], **call_kwargs: Any
+        self,
+        rounds: int,
+        agg: dict[str, int],
+        on_stream: StreamListener | None = None,
+        **call_kwargs: Any,
     ) -> tuple[Any, str | None]:
         """One model call. Returns (response, None), or (response-or-None, cause) when the
         reply is EMPTY and recovery applies (T-7219): "no_content" for the LLMResponseError
@@ -871,7 +926,7 @@ class ToolUseLoop:
         nothing in it. With recovery off (or no round committed yet) both behave as before:
         the error raises and the empty reply is returned as an answer."""
         try:
-            resp = await self._client.complete_messages(**call_kwargs)
+            resp = await self._complete(rounds, on_stream, **call_kwargs)
         except LLMResponseError:
             if not self._recovers_empty(rounds):
                 raise
@@ -901,6 +956,7 @@ class ToolUseLoop:
         model: str | None,
         max_tokens: int | None,
         temperature: float | None,
+        on_stream: StreamListener | None = None,
     ) -> ToolLoopResult:
         """T-7219 -- the ONE recovery call after an empty reply: no tools, the consumer's
         nudge after the last tool results. Re-sending the same request would not help --
@@ -916,7 +972,9 @@ class ToolUseLoop:
             stage=stage,
         )
         try:
-            retry = await self._client.complete_messages(
+            retry = await self._complete(
+                rounds,
+                on_stream,
                 system_blocks=system_blocks,
                 messages=_with_trailing_user_text(messages, nudge),
                 tools=None,

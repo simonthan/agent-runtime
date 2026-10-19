@@ -7,7 +7,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from botbuilder.schema import Activity, ActivityTypes, Attachment
+from botbuilder.schema import Activity, ActivityTypes, Attachment, Entity
 
 from agent_runtime.safety import mask_telemetry
 
@@ -31,6 +31,81 @@ _OAUTH_CARD_CONTENT_TYPE = "application/vnd.microsoft.card.oauth"
 # this call a cache hit) and well under the redelivery window. Read from the module global
 # at call time so tests can patch it.
 _SIGN_IN_RESOURCE_TIMEOUT_SECONDS = 10.0
+
+
+# T-316b -- Teams streaming (https://learn.microsoft.com/microsoftteams/platform/bots/streaming-ux):
+# 1:1 chats only, one open stream per chat, about one request per second, and a stream must
+# end within two minutes. `informative` / `streaming` requests are TYPING activities that
+# carry `streamSequence` (1, 2, 3, ... per stream); the closing request is a MESSAGE activity
+# with `streamType: final` and no sequence. The first request's response id IS the stream id.
+STREAM_TYPE_INFORMATIVE = "informative"
+STREAM_TYPE_STREAMING = "streaming"
+STREAM_TYPE_FINAL = "final"
+_STREAM_TYPES = frozenset({STREAM_TYPE_INFORMATIVE, STREAM_TYPE_STREAMING, STREAM_TYPE_FINAL})
+_HTTP_FORBIDDEN = 403
+
+
+class _StreamInfoEntity(Entity):
+    """The `streaminfo` entity. botbuilder's `Entity` serializes `type` only (msrest drops
+    unknown keys), so the stream fields need their own attribute map."""
+
+    _attribute_map = {  # noqa: RUF012 -- msrest reads this class attribute by name
+        "type": {"key": "type", "type": "str"},
+        "stream_id": {"key": "streamId", "type": "str"},
+        "stream_type": {"key": "streamType", "type": "str"},
+        "stream_sequence": {"key": "streamSequence", "type": "int"},
+    }
+
+    def __init__(
+        self,
+        *,
+        stream_id: str | None = None,
+        stream_type: str | None = None,
+        stream_sequence: int | None = None,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(type="streaminfo", **kwargs)
+        self.stream_id = stream_id
+        self.stream_type = stream_type
+        self.stream_sequence = stream_sequence
+
+
+class TeamsStreamRejected(Exception):  # noqa: N818 -- a refusal, not a programming error
+    """The Connector refused a streaming request (T-316b). `status` is the HTTP status (None
+    when unknown), `code` the service error code (e.g. "ContentStreamNotAllowed") and
+    `message` its message. `user_cancelled` is the documented 403 for a user who pressed
+    Stop; every later request on that stream is refused the same way."""
+
+    def __init__(self, *, status: int | None, code: str | None, message: str) -> None:
+        super().__init__(f"{status} {code}: {message}")
+        self.status = status
+        self.code = code
+        self.message = message
+
+    @property
+    def user_cancelled(self) -> bool:
+        return self.status == _HTTP_FORBIDDEN and "canceled by user" in self.message.lower()
+
+
+def _stream_rejection(exc: Exception) -> TeamsStreamRejected | None:
+    """A Connector HTTP error as a TeamsStreamRejected; None for anything else (a network
+    failure, a programming error), which the caller re-raises unchanged. Duck-typed on the
+    msrest `ErrorResponseException` shape (`.response.status_code` -- or `.status` under the
+    aiohttp sender -- and `.error.error.code`)."""
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is None:  # msrest's aiohttp sender: an aiohttp.ClientResponse has `.status`
+        status = getattr(response, "status", None)
+    if not isinstance(status, int):
+        return None
+    inner = getattr(getattr(exc, "error", None), "error", None)
+    code = getattr(inner, "code", None)
+    message = getattr(inner, "message", None) or ""
+    return TeamsStreamRejected(
+        status=status,
+        code=code if isinstance(code, str) else None,
+        message=mask_telemetry(str(message)),
+    )
 
 
 @dataclass(frozen=True)
@@ -145,6 +220,60 @@ class BotFrameworkOutboundChannel:
 
     async def send_typing(self) -> None:
         await self._turn_context.send_activity(Activity(type=ActivityTypes.typing))
+
+    async def send_stream_activity(
+        self,
+        *,
+        text: str,
+        stream_type: str,
+        stream_id: str | None = None,
+        sequence: int | None = None,
+    ) -> str | None:
+        """One Teams streaming request (T-316b). NOT part of the `OutboundChannel` Protocol:
+        consumers probe for it, and only a Teams 1:1 conversation may use it (the caller
+        checks the conversation type).
+
+        - `informative` / `streaming`: a typing activity with `text` and `sequence` (1 on the
+          first request of a stream, +1 per request). `streaming` text is the WHOLE answer so
+          far, never a delta (Teams rejects text that drops what it already showed).
+        - `final`: the message activity that ends the stream; `sequence` must be None.
+
+        `stream_id` is None on the first request and the returned id after it. Returns the
+        id the Connector assigned (the stream id, on the first request), else None. Raises
+        `TeamsStreamRejected` when the Connector answers with an HTTP error (403
+        `ContentStreamNotAllowed` for a user Stop, the two-minute limit, too-large text;
+        400 / 429), and `ValueError` for an unknown `stream_type` or a sequence on `final`.
+        Pace requests yourself (about one per second) and send them one at a time."""
+        final = stream_type == STREAM_TYPE_FINAL
+        if (
+            stream_type not in _STREAM_TYPES
+            or (final and sequence is not None)
+            or (not final and (sequence is None or sequence < 1))
+        ):
+            msg = f"bad stream request: type={stream_type!r} sequence={sequence!r}"
+            raise ValueError(msg)
+        entity = _StreamInfoEntity(
+            stream_id=stream_id, stream_type=stream_type, stream_sequence=sequence
+        )
+        activity = Activity(
+            type=ActivityTypes.message if final else ActivityTypes.typing,
+            text=text,
+            entities=[entity],
+        )
+        try:
+            response = await self._turn_context.send_activity(activity)
+        except Exception as exc:
+            rejected = _stream_rejection(exc)
+            if rejected is None:
+                raise
+            logger.warning(
+                "teams stream request refused status=%s code=%s type=%s",
+                rejected.status,
+                rejected.code,
+                stream_type,
+            )
+            raise rejected from exc
+        return getattr(response, "id", None) or None
 
     async def get_sign_in_resource(self, *, connection_name: str) -> SignInResource | None:
         """Fetch a token-service sign-in resource for the current turn's user via the
