@@ -293,3 +293,40 @@ async def test_in_stream_rate_limit_error_maps_to_rate_limit() -> None:
         await _client(fake).complete_messages(
             system_blocks=SYSTEM, messages=MSGS, on_stream=_Collect()
         )
+
+
+# -- iav review (T-316b) M1 / M2: failures after the stream opened, before the first event --------
+
+
+async def test_an_error_event_before_the_first_event_is_retried_once() -> None:
+    """An `event: error` (overloaded) arriving as the FIRST event is read from the body after
+    the SDK's send(), so the SDK never retried it; nothing was shown, so it is retried here."""
+    fake = FakeAsyncAnthropic()
+    fake.max_retries = 1
+    fake.messages.responses.extend([make_ok(text="lost"), make_ok(text="second try")])
+    fake.messages.stream_mid_exceptions.append((0, _in_stream_error("overloaded_error")))
+    audit = RecordingAudit()
+    resp = await _client(fake, stream_transport=True, audit_logger=audit).complete_messages(
+        system_blocks=SYSTEM, messages=MSGS
+    )
+    assert resp.content == "second try"
+    assert len(fake.messages.stream_requests) == 2
+    assert [e[1] for e in audit.events].count("llm_stream_retry") == 1
+
+
+async def test_an_empty_event_stream_is_an_error_not_a_latch() -> None:
+    """A real event stream cut before its first event (empty SSE body, or pings only) is a
+    transient failure, not an endpoint that cannot stream: it maps to LLMAPIError and the
+    client keeps streaming."""
+    fake = FakeAsyncAnthropic()
+    fake.messages.stream_empty_sse = 1
+    fake.messages.responses.append(make_ok(text="next"))
+    audit = RecordingAudit()
+    client = _client(fake, stream_transport=True, audit_logger=audit)
+    with pytest.raises(LLMAPIError, match="IncompleteStream"):
+        await client.complete_messages(system_blocks=SYSTEM, messages=MSGS)
+    assert "llm_stream_unsupported" not in [e[1] for e in audit.events]
+    assert len(fake.messages.captured_requests) == 1  # no plain-JSON fallback request
+    # not latched: the next call streams again
+    assert (await client.complete_messages(system_blocks=SYSTEM, messages=MSGS)).content == "next"
+    assert len(fake.messages.stream_requests) == 2

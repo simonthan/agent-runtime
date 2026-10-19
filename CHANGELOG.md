@@ -13,8 +13,9 @@
   `ClaudeResponse` and the error mapping (`LLMRateLimitError` / `LLMAPIError` /
   `LLMResponseError`) are the same as a non-streaming call's. An error mid-stream maps the
   same way and is not retried. A streaming request refused with 400 / 404 / 405 / 406 / 415 /
-  501 before any event, or answered 2xx with NO stream event (an endpoint or proxy that
-  ignored `stream: true` and sent plain JSON), is retried ONCE without streaming; when that
+  501 before any event, or answered 2xx with NO stream event and a non-SSE content-type (an
+  endpoint or proxy that ignored `stream: true` and sent plain JSON), is retried ONCE without
+  streaming; when that
   retry succeeds the
   client stops streaming for its lifetime and logs `llm_stream_unsupported` (error,
   `model`, `status_code`; audit AND a stdlib `agent_runtime.llm.client` line, so a consumer
@@ -24,9 +25,11 @@
   stream started surfaces from httpx outside the SDK's mapping; it is now mapped to
   `LLMAPIError` (audit `llm_api_error`, `error_type` = the httpx class). A stream that ends
   before `message_stop` raises `LLMAPIError("IncompleteStream: ...")` -- a cut stream is never
-  returned as an answer. An `event: error` inside the stream whose type is `rate_limit_error`
+  returned as an answer; an SSE response with no event at all (cut before its first event, or
+  pings only) is such a cut too, never a reason to stop streaming. An `event: error` inside the stream whose type is `rate_limit_error`
   maps to `LLMRateLimitError`. Because the SDK's own retry covers only `send()`, a failure
-  after the stream started is retried ONCE here (audit `llm_stream_retry`, warning) -- only
+  after the stream opened (including an error event or a stall before the first event) is
+  retried ONCE here (audit `llm_stream_retry`, warning) -- only
   when the SDK client allows retries (`max_retries > 0`) and nothing has been handed to the
   listener yet; text that may be on a screen is never re-generated.
 - `ToolUseLoop.run(..., on_stream=listener)` / `resume(..., on_stream=listener)`: every model

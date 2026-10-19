@@ -148,6 +148,15 @@ class _IncompleteStreamError(Exception):
     a proxy cut it. `messages.create` can never return such a body, so neither may we."""
 
 
+def _is_event_stream(stream: Any) -> bool:
+    """T-316b -- whether the streamed response really is SSE (the SDK's `AsyncMessageStream`
+    exposes its `httpx.Response`). Unknown counts as not SSE (the fallback)."""
+    response = getattr(stream, "response", None)
+    headers = getattr(response, "headers", None)
+    content_type = headers.get("content-type", "") if headers is not None else ""
+    return "text/event-stream" in str(content_type).lower()
+
+
 class _NoStreamError(Exception):
     """T-316b -- this endpoint does not stream: refused with `status` before any event, or
     answered with no stream event at all (status None)."""
@@ -389,8 +398,8 @@ class AnthropicClient:
                 )
                 return raw
             except (APIStatusError, httpx.TransportError, httpx.StreamError) as exc:
-                # before any event the SDK's own retry loop already ran (the error came out
-                # of send()); after a forwarded event the text may be on a screen
+                # before the stream opened the SDK's own retry loop already ran (the error
+                # came out of send()); after a forwarded event the text may be on a screen
                 if not retry_left or not progress["started"] or progress["forwarded"]:
                     raise
                 retry_left = False
@@ -402,19 +411,29 @@ class AnthropicClient:
         on_stream: StreamListener | None,
         progress: dict[str, bool],
     ) -> Any:
-        """One streaming attempt (see `_create_streamed`). `progress["started"]` turns True at
-        the first event, `progress["forwarded"]` once the listener has been handed anything."""
+        """One streaming attempt (see `_create_streamed`). `progress["started"]` turns True once
+        the stream is open (headers received: anything after this is read from the body, which
+        the SDK's retry never covered), `progress["forwarded"]` once the listener has been
+        handed anything.
+
+        No event at all: a body that is not an event stream (a proxy answered plain JSON)
+        means this endpoint cannot stream (`_NoStreamError`, fallback + latch); an event
+        stream with no event (cut before its first event, or pings only) is a transient cut
+        (`_IncompleteStreamError`), never a latch."""
         seen_event = False
         saw_stop = False
         try:
             async with self._client.messages.stream(**create_kwargs) as stream:
+                progress["started"] = True
                 async for event in stream:
-                    seen_event = progress["started"] = True
+                    seen_event = True
                     if getattr(event, "type", None) == "message_stop":
                         saw_stop = True
                     if on_stream is not None and await _forward_event(event, on_stream):
                         progress["forwarded"] = True
                 if not seen_event:
+                    if _is_event_stream(stream):
+                        raise _IncompleteStreamError
                     raise _NoStreamError(None)
                 if not saw_stop:
                     raise _IncompleteStreamError
@@ -497,6 +516,9 @@ class AnthropicClient:
         )
         messages.append({"role": "user", "content": user_content})
 
+        stream_kwargs: dict[str, Any] = {}
+        if on_stream is not None:  # only when set: test doubles may lack the keyword
+            stream_kwargs["on_stream"] = on_stream
         return await self.complete_messages(
             system_blocks=system_blocks,
             messages=messages,
@@ -504,7 +526,7 @@ class AnthropicClient:
             max_tokens=max_tokens,
             temperature=temperature,
             model=model,
-            **({"on_stream": on_stream} if on_stream is not None else {}),
+            **stream_kwargs,
         )
 
     def _parse_response(self, raw: Any) -> ClaudeResponse:

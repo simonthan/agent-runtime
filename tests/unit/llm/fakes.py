@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx
+
 
 @dataclass(frozen=True)
 class FakeUsage:
@@ -83,7 +85,10 @@ class _FakeStream:
         exc: Exception | None,
         *,
         truncate: bool = False,
+        content_type: str = "text/event-stream",
     ) -> None:
+        # the SDK's AsyncMessageStream exposes the httpx response (T-316b review M2)
+        self.response = httpx.Response(200, headers={"content-type": content_type})
         self._message = message
         self._events = stream_events(message) if message is not None else []
         if truncate:
@@ -120,6 +125,9 @@ class _FakeStreamManager:
             raise owner.stream_open_exceptions.pop(0)
         if owner.stream_no_events:
             owner.stream_no_events -= 1
+            return _FakeStream(None, None, None, content_type="application/json")
+        if owner.stream_empty_sse:
+            owner.stream_empty_sse -= 1
             return _FakeStream(None, None, None)
         fail_after, exc = (None, None)
         if owner.stream_mid_exceptions:
@@ -142,7 +150,8 @@ class FakeMessages:
     error before any event); ``stream_mid_exceptions`` are ``(event_index, exc)`` pairs that
     raise mid-stream. ``stream_no_events`` = how many next streams end with NO event (an
     endpoint that ignored ``stream: true`` and answered plain JSON). ``stream_truncated`` = how
-    many next streams end before ``message_stop``. Every request (create or stream) lands in
+    many next streams end before ``message_stop``. ``stream_empty_sse`` = how many next streams
+    are a real event stream (SSE content-type) that ends with no event (a cut body). Every request (create or stream) lands in
     ``captured_requests``; streamed ones also in ``stream_requests``."""
 
     responses: list[FakeMessage] = field(default_factory=list)
@@ -153,6 +162,7 @@ class FakeMessages:
     stream_mid_exceptions: list[tuple[int, Exception]] = field(default_factory=list)
     stream_no_events: int = 0
     stream_truncated: int = 0
+    stream_empty_sse: int = 0
 
     async def create(self, **kwargs: Any) -> FakeMessage:
         self.captured_requests.append(kwargs)
