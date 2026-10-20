@@ -24,6 +24,13 @@ caught, logged once as ``llm_stream_listener_failed`` and the listener is detach
 rest of the run -- a consumer bug never fails the model call. ``CancelledError`` propagates.
 The events carry no policy: the loop still returns the same ``ToolLoopResult``, and the
 consumer still decides what to show (its post-processing of the final text is unchanged).
+
+``PromptUsage`` (v0.44.0, TBP T-7624) is NOT a stream event: it goes to a separate, synchronous
+``on_usage`` callback of ``AnthropicClient.complete_messages`` so that reporting it never
+changes what counts as handed to a screen (a stream event does: see the client's one retry
+after the stream started). A streamed call reports it once per attempt, when the response
+starts (``message_start``), so a consumer can account for the prompt of a call that is then
+cancelled or fails and never returns a ``ClaudeResponse``.
 """
 
 from __future__ import annotations
@@ -41,10 +48,12 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ModelCallEnded",
     "ModelCallStarted",
+    "PromptUsage",
     "StreamEvent",
     "StreamListener",
     "TextDelta",
     "ToolUseStarted",
+    "UsageListener",
     "guard_listener",
 ]
 
@@ -84,6 +93,21 @@ class ModelCallEnded:
 
 StreamEvent = ModelCallStarted | TextDelta | ToolUseStarted | ModelCallEnded
 StreamListener = Callable[[StreamEvent], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class PromptUsage:
+    """v0.44.0 (TBP T-7624) -- the prompt side of a streamed call's usage, as the endpoint
+    reports it when the response starts (``message_start``). ``input_tokens`` is the uncached
+    part, as in ``ClaudeResponse``; the three counts add up to the whole prompt. The output
+    count is not known until the response ends, so it is not here."""
+
+    input_tokens: int
+    cache_creation_input_tokens: int
+    cache_read_input_tokens: int
+
+
+UsageListener = Callable[[PromptUsage], None]
 
 
 class _GuardedListener:
