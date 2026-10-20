@@ -33,6 +33,8 @@ Public surface:
   ``ModelCallEnded`` (``StreamEvent``) — the model's text while it is generated, from
   ``complete(on_stream=...)`` / ``complete_messages(on_stream=...)`` / ``ToolUseLoop.run`` /
   ``resume`` (TBP T-316b); ``AnthropicClient(stream_transport=True)`` streams every call
+- ``PromptUsage`` / ``UsageListener`` — a streamed call's prompt usage, reported when the
+  response starts (``complete_messages(on_usage=...)``, TBP T-7624)
 
 See ``agent_runtime.llm.client.AnthropicClient.complete`` docstring for the
 two-breakpoint cache contract (static system prefix + per-turn retrieval block).
@@ -76,10 +78,12 @@ from agent_runtime.llm.round_context import (
 from agent_runtime.llm.streaming import (
     ModelCallEnded,
     ModelCallStarted,
+    PromptUsage,
     StreamEvent,
     StreamListener,
     TextDelta,
     ToolUseStarted,
+    UsageListener,
 )
 from agent_runtime.llm.tool_loop import (
     CONSUMER_STOP_REASON,
@@ -126,6 +130,7 @@ __all__ = [
     "ParallelSafePredicate",
     "PendingConfirmation",
     "PreCompletionHook",
+    "PromptUsage",
     "ResumeDecision",
     "StopAfterRoundHook",
     "StreamEvent",
@@ -140,6 +145,7 @@ __all__ = [
     "ToolUseBlock",
     "ToolUseLoop",
     "ToolUseStarted",
+    "UsageListener",
     "WorkingMemory",
     "bind_tool_round",
     "bind_tool_use_id",

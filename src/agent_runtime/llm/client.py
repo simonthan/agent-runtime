@@ -42,9 +42,11 @@ from agent_runtime.llm.errors import (
 )
 from agent_runtime.llm.models import ClaudeResponse, History, LLMImage, ToolUseBlock
 from agent_runtime.llm.streaming import (
+    PromptUsage,
     StreamListener,
     TextDelta,
     ToolUseStarted,
+    UsageListener,
     guard_listener,
 )
 from agent_runtime.logging import AuditLogger, NullAuditLogger
@@ -141,6 +143,26 @@ async def _forward_event(event: Any, on_stream: StreamListener) -> bool:
             await on_stream(ToolUseStarted(name=getattr(block, "name", "") or ""))
             return True
     return False
+
+
+def _report_prompt_usage(event: Any, on_usage: UsageListener, audit: AuditLogger) -> None:
+    """v0.44.0 (TBP T-7624) -- hand a `message_start` event's prompt usage to `on_usage`. A
+    missing usage reports nothing; a raising callback is logged (`llm_usage_listener_failed`,
+    warning; audit and stdlib) and never fails the call. Not a stream event: the client's
+    one retry after the stream started still counts only what the stream listener was given."""
+    usage = getattr(getattr(event, "message", None), "usage", None)
+    if usage is None:
+        return
+    reported = PromptUsage(
+        input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+        cache_creation_input_tokens=int(getattr(usage, "cache_creation_input_tokens", 0) or 0),
+        cache_read_input_tokens=int(getattr(usage, "cache_read_input_tokens", 0) or 0),
+    )
+    try:
+        on_usage(reported)
+    except Exception as exc:  # noqa: BLE001 -- a consumer bug must never fail the call
+        audit.warning("llm_usage_listener_failed", error_type=type(exc).__name__)
+        logger.warning("llm_usage_listener_failed error_type=%s", type(exc).__name__)
 
 
 class _IncompleteStreamError(Exception):
@@ -246,6 +268,7 @@ class AnthropicClient:
         model: str | None = None,
         tool_choice: dict[str, Any] | None = None,
         on_stream: StreamListener | None = None,
+        on_usage: UsageListener | None = None,
     ) -> ClaudeResponse:
         """Low-level single SDK round over a caller-assembled message list.
 
@@ -268,6 +291,12 @@ class AnthropicClient:
         it makes this call a streaming request; the return value and error mapping are the
         same as without it. None (default) with `stream_transport=False` = byte-for-byte
         unchanged.
+
+        `on_usage` (v0.44.0, TBP T-7624) is called synchronously with the `PromptUsage` the
+        endpoint reports when a STREAMED response starts (once per attempt), so a consumer
+        can account for a call that is cancelled or fails before it returns. It never makes
+        a call stream, never changes the request, and a raising callback never fails the
+        call. A call that is not streamed never calls it.
         """
         chosen_model = model or self._default_model
         chosen_max_tokens = max_tokens if max_tokens is not None else self._default_max_tokens
@@ -302,7 +331,10 @@ class AnthropicClient:
         try:
             if streaming:
                 raw = await self._create_streamed(
-                    create_kwargs, guard_listener(on_stream, self._audit), chosen_model
+                    create_kwargs,
+                    guard_listener(on_stream, self._audit),
+                    chosen_model,
+                    on_usage=on_usage,
                 )
             else:
                 raw = await self._client.messages.create(**create_kwargs)
@@ -367,6 +399,8 @@ class AnthropicClient:
         create_kwargs: dict[str, Any],
         on_stream: StreamListener | None,
         model: str,
+        *,
+        on_usage: UsageListener | None = None,
     ) -> Any:
         """T-316b -- one streaming request, assembled into the SDK's final Message (the same
         object `messages.create` returns, so `_parse_response` is shared). Forwards text
@@ -387,7 +421,7 @@ class AnthropicClient:
         while True:
             progress = {"started": False, "forwarded": False}
             try:
-                return await self._stream_once(create_kwargs, on_stream, progress)
+                return await self._stream_once(create_kwargs, on_stream, progress, on_usage)
             except _NoStreamError as exc:
                 raw = await self._client.messages.create(**create_kwargs)
                 self._stream_unsupported = True
@@ -410,6 +444,7 @@ class AnthropicClient:
         create_kwargs: dict[str, Any],
         on_stream: StreamListener | None,
         progress: dict[str, bool],
+        on_usage: UsageListener | None = None,
     ) -> Any:
         """One streaming attempt (see `_create_streamed`). `progress["started"]` turns True once
         the stream is open (headers received: anything after this is read from the body, which
@@ -427,8 +462,11 @@ class AnthropicClient:
                 progress["started"] = True
                 async for event in stream:
                     seen_event = True
-                    if getattr(event, "type", None) == "message_stop":
+                    etype = getattr(event, "type", None)
+                    if etype == "message_stop":
                         saw_stop = True
+                    elif etype == "message_start" and on_usage is not None:
+                        _report_prompt_usage(event, on_usage, self._audit)  # T-7624
                     if on_stream is not None and await _forward_event(event, on_stream):
                         progress["forwarded"] = True
                 if not seen_event:

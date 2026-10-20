@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
+
+if TYPE_CHECKING:
+    import asyncio
 
 
 @dataclass(frozen=True)
@@ -58,12 +61,13 @@ class FakeStreamEvent:
     type: str
     delta: Any = None
     content_block: Any = None
+    message: Any = None  # T-7624: message_start carries the message (its usage)
 
 
 def stream_events(message: FakeMessage, *, chunk: int = 4) -> list[FakeStreamEvent]:
     """The raw events a streamed `message` would arrive as: text blocks in `chunk`-char
     deltas, a content_block_start per block, framed by message_start / message_stop."""
-    events = [FakeStreamEvent(type="message_start")]
+    events = [FakeStreamEvent(type="message_start", message=message)]
     for block in message.content:
         events.append(FakeStreamEvent(type="content_block_start", content_block=block))
         text = getattr(block, "text", None)
@@ -86,6 +90,7 @@ class _FakeStream:
         *,
         truncate: bool = False,
         content_type: str = "text/event-stream",
+        pause: tuple[int, asyncio.Event] | None = None,
     ) -> None:
         # the SDK's AsyncMessageStream exposes the httpx response (T-316b review M2)
         self.response = httpx.Response(200, headers={"content-type": content_type})
@@ -95,12 +100,15 @@ class _FakeStream:
             self._events = self._events[:-1]  # the body ends before message_stop
         self._fail_after = fail_after
         self._exc = exc
+        self._pause = pause
 
     def __aiter__(self) -> Any:
         return self._iter()
 
     async def _iter(self) -> Any:
         for i, event in enumerate(self._events):
+            if self._pause is not None and i == self._pause[0]:
+                await self._pause[1].wait()  # T-7624: a response still being generated
             if self._fail_after is not None and i == self._fail_after:
                 assert self._exc is not None
                 raise self._exc
@@ -135,7 +143,9 @@ class _FakeStreamManager:
         truncate = owner.stream_truncated > 0
         if truncate:
             owner.stream_truncated -= 1
-        return _FakeStream(owner.responses.pop(0), fail_after, exc, truncate=truncate)
+        pause = owner.stream_pause
+        owner.stream_pause = None
+        return _FakeStream(owner.responses.pop(0), fail_after, exc, truncate=truncate, pause=pause)
 
     async def __aexit__(self, *exc_info: object) -> None:
         return None
@@ -151,7 +161,9 @@ class FakeMessages:
     raise mid-stream. ``stream_no_events`` = how many next streams end with NO event (an
     endpoint that ignored ``stream: true`` and answered plain JSON). ``stream_truncated`` = how
     many next streams end before ``message_stop``. ``stream_empty_sse`` = how many next streams
-    are a real event stream (SSE content-type) that ends with no event (a cut body). Every request (create or stream) lands in
+    are a real event stream (SSE content-type) that ends with no event (a cut body).
+    ``stream_pause`` = ``(event_index, asyncio.Event)``: the next stream waits on the event
+    before yielding that index (T-7624). Every request (create or stream) lands in
     ``captured_requests``; streamed ones also in ``stream_requests``."""
 
     responses: list[FakeMessage] = field(default_factory=list)
@@ -163,6 +175,7 @@ class FakeMessages:
     stream_no_events: int = 0
     stream_truncated: int = 0
     stream_empty_sse: int = 0
+    stream_pause: tuple[int, asyncio.Event] | None = None
 
     async def create(self, **kwargs: Any) -> FakeMessage:
         self.captured_requests.append(kwargs)

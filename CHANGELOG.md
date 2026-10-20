@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.44.0 — 2026-10-19
+
+### Added
+
+- **Prompt usage at stream start.** `AnthropicClient.complete_messages(..., on_usage=callback)`
+  calls `callback(PromptUsage(input_tokens, cache_creation_input_tokens,
+  cache_read_input_tokens))` once per streamed attempt, when the response starts
+  (`message_start`), so a consumer can account for the prompt of a call it cancels or that
+  fails before returning a `ClaudeResponse` (TBP T-7624: a user's Stop cancels the running
+  turn). Synchronous; a raising callback is logged (`llm_usage_listener_failed`, warning;
+  audit and stdlib) and never fails the call. It never makes a call stream and never changes
+  the request: a call that is not streamed (no `stream_transport`, no `on_stream`, or a client
+  latched off by `llm_stream_unsupported`) never calls it. Usage is not a stream event, so the
+  one retry after the stream started (v0.43.0) still counts only what the stream listener was
+  handed. `PromptUsage` / `UsageListener` are exported from `agent_runtime.llm`.
+
+Default (no `on_usage`) is byte-for-byte unchanged.
+
 ## v0.43.0 — 2026-10-19
 
 ### Added
