@@ -100,11 +100,16 @@ class PromptUsage:
     """v0.44.0 (TBP T-7624) -- the prompt side of a streamed call's usage, as the endpoint
     reports it when the response starts (``message_start``). ``input_tokens`` is the uncached
     part, as in ``ClaudeResponse``; the three counts add up to the whole prompt. The output
-    count is not known until the response ends, so it is not here."""
+    count is not known until the response ends, so it is not here.
+
+    ``cache_creation_1h_input_tokens`` / ``cache_creation_5m_input_tokens`` (v0.45.0, TBP
+    T-7683) split the cache write by TTL, as ``ClaudeResponse``'s fields of the same name."""
 
     input_tokens: int
     cache_creation_input_tokens: int
     cache_read_input_tokens: int
+    cache_creation_1h_input_tokens: int = 0
+    cache_creation_5m_input_tokens: int = 0
 
 
 UsageListener = Callable[[PromptUsage], None]

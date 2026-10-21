@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.45.0 — 2026-10-21
+
+### Added
+
+- **Opt-in 1-hour TTL on the static-prefix breakpoint.** `AnthropicClient.complete(...)`,
+  `ToolUseLoop.run(...)` and `ToolUseLoop.resume(...)` take `prefix_cache_ttl="1h"`, which
+  sends breakpoint 1 (the `static_system_prefix` block) as
+  `{"type": "ephemeral", "ttl": "1h"}` on every model call of the call / run (TBP T-7683;
+  ARCHITECTURE.md §4 #5 re-opened narrowly by the user 2026-10-21). The retrieval (BP2),
+  history (BP3) and moving tool-round markers stay 5 minutes: the API requires a longer-TTL
+  entry to come before any shorter one, and breakpoint 1 is the first marker (tools carry
+  none -- a caller asking for 1h must not mark a tool with a 5-minute `cache_control`).
+  `resume()` rebuilds the system blocks, so re-supply the value there. Any value other than
+  `None` / `"1h"` raises `ValueError` before any model call.
+- **Cache write split by TTL.** `ClaudeResponse`, `ToolLoopResult` (summed over the run's
+  calls; continuation-only after `resume()`, like the other counts) and `PromptUsage` carry
+  `cache_creation_1h_input_tokens` / `cache_creation_5m_input_tokens`, read from
+  `usage.cache_creation`, so a consumer can price a 1-hour write at 2x base input (a
+  5-minute write is 1.25x). Both are 0 when the endpoint sends no breakdown; they then do
+  not add up to `cache_creation_input_tokens`. `llm_response_success` logs
+  `cache_creation_1h_input_tokens`.
+
+Default (`prefix_cache_ttl=None`) is byte-for-byte unchanged: the same request bodies, and a
+suspended run's `state["agg"]` keeps exactly its four counts.
+
 ## v0.44.0 — 2026-10-19
 
 ### Added

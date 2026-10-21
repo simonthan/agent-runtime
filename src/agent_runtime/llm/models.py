@@ -79,6 +79,12 @@ class ClaudeResponse:
     """Frozen result of a successful ``complete()`` call.
 
     Cache fields are 0 when no cache write/read happened.
+
+    ``cache_creation_1h_input_tokens`` / ``cache_creation_5m_input_tokens`` (v0.45.0, TBP
+    T-7683) split ``cache_creation_input_tokens`` by TTL, as the endpoint reports it in
+    ``usage.cache_creation``. A 1-hour write costs 2x base input, a 5-minute write 1.25x.
+    Both are 0 when the endpoint sent no breakdown; then they do not add up to
+    ``cache_creation_input_tokens``.
     """
 
     content: str
@@ -88,7 +94,9 @@ class ClaudeResponse:
     output_tokens: int
     cache_creation_input_tokens: int
     cache_read_input_tokens: int
-    # MUST be the LAST field — all 7 preceding fields are non-defaulted;
-    # a defaulted field can only follow them (slots=True + defaulted field
-    # is valid — defaults live on the class, not the instance dict).
+    # Defaulted fields come after the 7 non-defaulted ones (slots=True + defaulted field
+    # is valid — defaults live on the class, not the instance dict). Append new
+    # defaulted fields at the end so positional construction keeps working.
     tool_use: tuple[ToolUseBlock, ...] = ()
+    cache_creation_1h_input_tokens: int = 0
+    cache_creation_5m_input_tokens: int = 0
