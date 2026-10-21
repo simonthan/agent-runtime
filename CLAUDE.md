@@ -72,14 +72,18 @@ and must stay clean — keep them passing `select = ["ALL"]` without exceptions.
 Code comments cite decisions like `ARCH §4 #5`, `D4a`/`D4b`/`D5`, and task IDs
 `T-XXX`. These live in `teams-bot-platform`'s docs/tasks, not here. Treat them as
 stable invariants — e.g. `ARCH §4 #4` mandates session keying by `(user_id, bot_id)`;
-`ARCH §4 #5` mandates the two-cache-breakpoint LLM contract. Don't change behavior a
+`ARCH §4 #5` mandates the cache-breakpoint LLM contract. Don't change behavior a
 comment pins to such a decision without surfacing it.
 
 ## Module-specific invariants
 
-- **`llm/client.py` — two-cache-breakpoint contract.** Every request carries exactly
-  two `cache_control: {type: ephemeral}` breakpoints: one on `static_system_prefix`
-  (system), one on `retrieval_block` (user). Cache hits require a **byte-identical**
+- **`llm/client.py` — cache-breakpoint contract.** Every request carries a
+  `cache_control: {type: ephemeral}` breakpoint on `static_system_prefix` (system) and
+  one on `retrieval_block` (user), plus the opt-in history (`cache_history`) and
+  tool-round (`cache_tool_rounds`) markers. All are 5-minute entries, except that a
+  caller may ask for a 1-hour breakpoint 1 (`prefix_cache_ttl="1h"`, v0.45.0, TBP
+  T-7683); breakpoint 1 is the only marker that may be 1-hour, because a longer TTL must
+  come before any shorter one. Cache hits require a **byte-identical**
   prefix *and* identical `model` across turns; a per-call `model=` override fragments
   the cache and fires an `llm_cache_not_written` audit warning — that's expected.
   The wrapper is bot-agnostic and does **not** sanitize input (see next point).
