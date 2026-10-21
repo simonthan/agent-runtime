@@ -42,9 +42,13 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, Literal, cast
 
-from agent_runtime.llm.client import AnthropicClient, assemble_history_messages
+from agent_runtime.llm.client import (
+    AnthropicClient,
+    _prefix_cache_control,
+    assemble_history_messages,
+)
 from agent_runtime.llm.compaction import estimate_tokens
 from agent_runtime.llm.errors import LLMResponseError
 from agent_runtime.llm.models import LLMImage
@@ -247,6 +251,11 @@ class ToolLoopResult:
     cache_creation_input_tokens: int
     cache_read_input_tokens: int
     pending_confirmation: PendingConfirmation | None = None
+    # v0.45.0 (TBP T-7683) -- `cache_creation_input_tokens` split by TTL, summed over the
+    # run's model calls like the other counts (see `ClaudeResponse`). 0 + 0 when the
+    # endpoint sent no breakdown.
+    cache_creation_1h_input_tokens: int = 0
+    cache_creation_5m_input_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,6 +409,7 @@ class ToolUseLoop:
         first_tool_choice: dict[str, Any] | None = None,
         stop_after_round: StopAfterRoundHook | None = None,
         on_stream: StreamListener | None = None,
+        prefix_cache_ttl: Literal["1h"] | None = None,
     ) -> ToolLoopResult:
         """Run the fenced loop. `max_rounds` caps model turns that return
         stop_reason=='tool_use'. Returns once the model stops requesting tools, the
@@ -495,9 +505,20 @@ class ToolUseLoop:
         (`tools_offered=False`). The listener must return quickly; a raising listener is
         detached and logged (`llm_stream_listener_failed`), never fatal. The returned
         ToolLoopResult is the same as without it. `resume()` takes the same listener (re-supply
-        it). Default None = byte-for-byte unchanged (regression guarantee)."""
+        it). Default None = byte-for-byte unchanged (regression guarantee).
+
+        `prefix_cache_ttl` (v0.45.0, TBP T-7683): `"1h"` makes the static-prefix breakpoint a
+        1-hour entry on EVERY model call of the run (`{"type": "ephemeral", "ttl": "1h"}`);
+        the retrieval, history and tool-round markers stay 5 minutes (a longer TTL must come
+        first, and breakpoint 1 is the first marker). A 1-hour write is billed at 2x base
+        input: `ToolLoopResult.cache_creation_1h_input_tokens` reports it. `resume()` takes
+        the same value (re-supply it, like the system args). Any other value raises
+        ValueError before any model call. Default None = byte-for-byte unchanged
+        (regression guarantee)."""
         _check_first_tool_choice(first_tool_choice, tools)
-        system_blocks = self._build_system_blocks(static_system_prefix, dynamic_system_suffix)
+        system_blocks = self._build_system_blocks(
+            static_system_prefix, dynamic_system_suffix, prefix_cache_ttl
+        )
         first_user: list[dict[str, Any]] = []
         if retrieval_block:
             first_user.append(
@@ -522,7 +543,7 @@ class ToolUseLoop:
             max_rounds=max_rounds,
             rounds=0,
             steps=[],
-            agg={"in": 0, "out": 0, "cc": 0, "cr": 0},
+            agg={"in": 0, "out": 0, "cc": 0, "cr": 0, "c1h": 0, "c5m": 0},
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -562,6 +583,7 @@ class ToolUseLoop:
         max_parallel_calls: int | None = None,
         stop_after_round: StopAfterRoundHook | None = None,
         on_stream: StreamListener | None = None,
+        prefix_cache_ttl: Literal["1h"] | None = None,
     ) -> ToolLoopResult:
         """Resume a loop suspended by a confirm-required tool. `state` is the opaque
         dict from `PendingConfirmation.state` (may have been JSON round-tripped through
@@ -599,12 +621,18 @@ class ToolUseLoop:
         is consulted once the resumed round commits, before any further model call.
 
         `on_stream` mirrors `run()` (T-316b): the continuation's model calls are reported; the
-        resolved pending call itself makes no model call."""
+        resolved pending call itself makes no model call.
+
+        `prefix_cache_ttl` mirrors `run()` (v0.45.0, TBP T-7683) and must be re-supplied: the
+        system blocks are rebuilt here, not read from `state`."""
         # cache_history: no param — the run()-time history marker rides state["messages"].
-        system_blocks = self._build_system_blocks(static_system_prefix, dynamic_system_suffix)
+        system_blocks = self._build_system_blocks(
+            static_system_prefix, dynamic_system_suffix, prefix_cache_ttl
+        )
         messages: list[dict[str, Any]] = state["messages"]
         steps: list[ToolLoopStep] = [self._step_from_dict(s) for s in state["steps"]]
-        agg: dict[str, int] = {"in": 0, "out": 0, "cc": 0, "cr": 0}  # D6: continuation-only
+        # D6: these counts are continuation-only, never read back from state
+        agg: dict[str, int] = {"in": 0, "out": 0, "cc": 0, "cr": 0, "c1h": 0, "c5m": 0}
         rounds: int = state["rounds"]
         # T-135 — the per-turn image budget SURVIVES the suspend/resume boundary. Unlike
         # `agg` (reset above: D6 continuation-only BILLING), this is a resource BOUND —
@@ -1409,7 +1437,10 @@ class ToolUseLoop:
             "v": 1,  # schema-version tag for future cross-process migration
             "messages": messages,
             "steps": [self._step_to_dict(s) for s in steps],
-            "agg": dict(agg),
+            # The four D6 counts only: the v0.45.0 TTL split is reported on the suspend
+            # ToolLoopResult, and resume() never reads state["agg"] (continuation-only), so
+            # the persisted state stays byte-for-byte as before.
+            "agg": {k: agg[k] for k in ("in", "out", "cc", "cr")},
             "rounds": rounds,
             # T-135 — per-turn image budget consumed so far. Read back with .get() so
             # pre-release suspended states still load. state["v"] intentionally stays 1.
@@ -1437,14 +1468,22 @@ class ToolUseLoop:
             cache_creation_input_tokens=agg["cc"],
             cache_read_input_tokens=agg["cr"],
             pending_confirmation=pending_confirmation,
+            cache_creation_1h_input_tokens=agg.get("c1h", 0),
+            cache_creation_5m_input_tokens=agg.get("c5m", 0),
         )
 
     @staticmethod
     def _build_system_blocks(
-        static_system_prefix: str, dynamic_system_suffix: str | None
+        static_system_prefix: str,
+        dynamic_system_suffix: str | None,
+        prefix_cache_ttl: str | None = None,
     ) -> list[dict[str, Any]]:
         blocks: list[dict[str, Any]] = [
-            {"type": "text", "text": static_system_prefix, "cache_control": {"type": "ephemeral"}}
+            {
+                "type": "text",
+                "text": static_system_prefix,
+                "cache_control": _prefix_cache_control(prefix_cache_ttl),
+            }
         ]
         if dynamic_system_suffix:
             blocks.append({"type": "text", "text": dynamic_system_suffix})
@@ -1456,6 +1495,9 @@ class ToolUseLoop:
         agg["out"] += resp.output_tokens
         agg["cc"] += resp.cache_creation_input_tokens
         agg["cr"] += resp.cache_read_input_tokens
+        # v0.45.0 -- getattr: a consumer's test double may return a response without them
+        agg["c1h"] = agg.get("c1h", 0) + getattr(resp, "cache_creation_1h_input_tokens", 0)
+        agg["c5m"] = agg.get("c5m", 0) + getattr(resp, "cache_creation_5m_input_tokens", 0)
 
     @staticmethod
     def _call_to_dict(c: ToolCall, *, include_images: bool = True) -> dict[str, Any]:
@@ -1541,4 +1583,6 @@ class ToolUseLoop:
             output_tokens=agg["out"],
             cache_creation_input_tokens=agg["cc"],
             cache_read_input_tokens=agg["cr"],
+            cache_creation_1h_input_tokens=agg.get("c1h", 0),
+            cache_creation_5m_input_tokens=agg.get("c5m", 0),
         )

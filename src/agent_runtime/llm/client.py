@@ -6,6 +6,13 @@ per-turn retrieval block, plus an OPTIONAL third on the conversation-history pre
 (``cache_history=True``). Prompt caching is GA on the Anthropic API (since SDK 0.39) —
 no ``anthropic-beta`` header is sent.
 
+Every breakpoint is a 5-minute entry unless the caller asks for a 1-hour TTL on the
+static-prefix breakpoint (``prefix_cache_ttl="1h"``, v0.45.0, TBP T-7683; ARCHITECTURE.md
+§4 #5 re-opened narrowly 2026-10-21). Only breakpoint 1 can be 1-hour: the API requires a
+longer-TTL entry to come before any shorter one, and breakpoint 1 (on ``system``) is the
+first marker in the request (tools carry none). The caller must not mark a ``tools`` entry
+with a 5-minute ``cache_control`` while asking for a 1-hour prefix.
+
 The SDK client is dependency-injected via constructor (real ``AsyncAnthropic``
 or a fake satisfying the same structural Protocol). This enables (a) shared
 ``httpx`` connection pooling across many wrapper instances and (b) deterministic
@@ -30,7 +37,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import httpx
 from anthropic import APIError, APIStatusError, RateLimitError
@@ -66,11 +73,55 @@ _CACHE_MIN_TOKENS: dict[str, int] = {
 }
 _DEFAULT_CACHE_HINT = 1024
 
+# v0.45.0 (TBP T-7683) -- the TTLs a caller may ask for on breakpoint 1. None (the default)
+# sends the bare 5-minute marker, byte-for-byte the pre-v0.45.0 request.
+_PREFIX_CACHE_TTLS = frozenset({"1h"})
+
 # T-316b -- HTTP statuses on which a STREAMING request is retried once without streaming.
 # If that retry succeeds, the endpoint takes the request but not the stream (a proxy or a
 # passthrough without SSE), so the client stops streaming for its lifetime
 # (`llm_stream_unsupported`). Never 429 / 5xx / timeouts: those are not about streaming.
 _STREAM_FALLBACK_STATUSES = frozenset({400, 404, 405, 406, 415, 501})
+
+
+def _prefix_cache_control(ttl: str | None) -> dict[str, str]:
+    """Breakpoint 1's ``cache_control`` marker (v0.45.0, TBP T-7683).
+
+    ``None`` -> ``{"type": "ephemeral"}`` (5 minutes; byte-for-byte the marker every earlier
+    version sent). ``"1h"`` -> ``{"type": "ephemeral", "ttl": "1h"}``. Anything else raises
+    ``ValueError`` before any model call.
+    """
+    if ttl is None:
+        return {"type": "ephemeral"}
+    if ttl not in _PREFIX_CACHE_TTLS:
+        raise ValueError(f"prefix_cache_ttl must be None or '1h', got {ttl!r}")
+    return {"type": "ephemeral", "ttl": ttl}
+
+
+def _creation_split(usage: Any) -> tuple[int, int]:
+    """``(1-hour, 5-minute)`` cache-write tokens from ``usage.cache_creation`` (v0.45.0).
+
+    The endpoint breaks ``cache_creation_input_tokens`` down by TTL in
+    ``usage.cache_creation.ephemeral_1h_input_tokens`` / ``ephemeral_5m_input_tokens``. An
+    endpoint (or SDK model) without the breakdown yields ``(0, 0)``: the consumer can tell
+    a missing split from a real one because the two then do not add up to
+    ``cache_creation_input_tokens``. A plain dict (an SDK too old to type the field) is
+    read the same way; a value that is not an int reads as 0.
+    """
+    split = getattr(usage, "cache_creation", None)
+    if split is None:
+        return 0, 0
+    if isinstance(split, dict):
+        one_hour = split.get("ephemeral_1h_input_tokens", 0)
+        five_min = split.get("ephemeral_5m_input_tokens", 0)
+    else:
+        one_hour = getattr(split, "ephemeral_1h_input_tokens", 0)
+        five_min = getattr(split, "ephemeral_5m_input_tokens", 0)
+    # a non-int (None, a test double's Mock) reads as 0 -- never fails the parse
+    return (
+        one_hour if isinstance(one_hour, int) else 0,
+        five_min if isinstance(five_min, int) else 0,
+    )
 
 
 def _cache_threshold_hint(model: str) -> tuple[int, bool]:
@@ -153,10 +204,13 @@ def _report_prompt_usage(event: Any, on_usage: UsageListener, audit: AuditLogger
     usage = getattr(getattr(event, "message", None), "usage", None)
     if usage is None:
         return
+    one_hour, five_min = _creation_split(usage)
     reported = PromptUsage(
         input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
         cache_creation_input_tokens=int(getattr(usage, "cache_creation_input_tokens", 0) or 0),
         cache_read_input_tokens=int(getattr(usage, "cache_read_input_tokens", 0) or 0),
+        cache_creation_1h_input_tokens=one_hour,
+        cache_creation_5m_input_tokens=five_min,
     )
     try:
         on_usage(reported)
@@ -376,6 +430,7 @@ class AnthropicClient:
             output_tokens=response.output_tokens,
             cache_creation_input_tokens=response.cache_creation_input_tokens,
             cache_read_input_tokens=response.cache_read_input_tokens,
+            cache_creation_1h_input_tokens=response.cache_creation_1h_input_tokens,
             stop_reason=response.stop_reason,
             duration_ms=duration_ms,
         )
@@ -498,6 +553,7 @@ class AnthropicClient:
         temperature: float | None = None,
         model: str | None = None,
         on_stream: StreamListener | None = None,
+        prefix_cache_ttl: Literal["1h"] | None = None,
     ) -> ClaudeResponse:
         """Send a completion request with ``cache_control`` ephemeral breakpoints.
 
@@ -526,9 +582,19 @@ class AnthropicClient:
         do NOT re-add it here or single-shot calls double-log.
 
         ``on_stream`` (v0.43.0, T-316b) is forwarded to ``complete_messages`` -- see there.
+
+        ``prefix_cache_ttl`` (v0.45.0, TBP T-7683): ``"1h"`` makes breakpoint #1 a 1-hour
+        entry (``{"type": "ephemeral", "ttl": "1h"}``; written at 2x base input instead of
+        1.25x, see ``ClaudeResponse.cache_creation_1h_input_tokens``). Every other marker
+        stays 5 minutes. ``None`` (default) is byte-for-byte unchanged; any other value
+        raises ``ValueError`` before the call.
         """
         system_blocks: list[dict[str, Any]] = [
-            {"type": "text", "text": static_system_prefix, "cache_control": {"type": "ephemeral"}}
+            {
+                "type": "text",
+                "text": static_system_prefix,
+                "cache_control": _prefix_cache_control(prefix_cache_ttl),
+            }
         ]
         if dynamic_system_suffix:
             # Truthy check (not ``is not None``) so empty string is skipped —
@@ -608,6 +674,7 @@ class AnthropicClient:
             self._audit.warning("llm_unexpected_extra_blocks", model=raw.model, count=unknown)
 
         usage = raw.usage
+        one_hour, five_min = _creation_split(usage)
         return ClaudeResponse(
             content="".join(text_parts),
             model=raw.model,
@@ -617,4 +684,6 @@ class AnthropicClient:
             cache_creation_input_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
             cache_read_input_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
             tool_use=tuple(tool_use),
+            cache_creation_1h_input_tokens=one_hour,
+            cache_creation_5m_input_tokens=five_min,
         )
