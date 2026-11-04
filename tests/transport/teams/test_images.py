@@ -515,6 +515,64 @@ async def test_corrupt_heic_container_raises_skip_error():
         await download_inline_image(att, _CREDENTIALS, client=client)
 
 
+class _DecliningFactory:
+    """Stands in for one Pillow plugin's factory: records the call, then declines the
+    bytes the way a non-matching plugin does (SyntaxError makes Image.open try the next)."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, fp, filename=None):
+        self.calls += 1
+        msg = "spy declines"
+        raise SyntaxError(msg)
+
+
+def _spy_on_every_non_heif_plugin(monkeypatch) -> dict[str, _DecliningFactory]:
+    """Replace every registered Pillow plugin factory except HEIF with a spy, keeping each
+    plugin's own magic check (the six magic-less ones -- IM, IMT, IPTC, PCD, SPIDER, TGA --
+    accept any bytes). HEIF is moved to the END of Image.ID: where it sits depends on
+    whether register_heif_opener() first ran before or after Image.init() in the process
+    (before: first; after: last), and last is the order in which the other plugins run
+    first, so the tests below do not pass vacuously on test order."""
+    pillow_heif = pytest.importorskip("pillow_heif")
+    from PIL import Image
+
+    Image.init()
+    pillow_heif.register_heif_opener()  # HEIF in Image.OPEN, as transcode leaves it
+    monkeypatch.setattr(Image, "ID", [fmt for fmt in Image.ID if fmt != "HEIF"] + ["HEIF"])
+    spies: dict[str, _DecliningFactory] = {}
+    for fmt, (_factory, accept) in list(Image.OPEN.items()):
+        if fmt == "HEIF":
+            continue
+        spies[fmt] = _DecliningFactory()
+        monkeypatch.setitem(Image.OPEN, fmt, (spies[fmt], accept))
+    return spies
+
+
+def test_transcode_runs_only_the_heif_decoder_on_heif_magic(monkeypatch):
+    """T-7796 (tbp): `ftypheic` + junk reaches the HEIF decoder and nothing else. Without
+    `formats=`, Image.open tries every plugin in Image.ID order, and register_heif_opener
+    appends HEIF after init(), so the magic-less plugins ran first on every HEIC."""
+    spies = _spy_on_every_non_heif_plugin(monkeypatch)
+    from PIL import UnidentifiedImageError
+
+    junk = b"\x00\x00\x00\x18ftypheic" + b"\x00" * 64
+    with pytest.raises(UnidentifiedImageError):
+        images.transcode_heif_to_jpeg(junk)
+    assert {fmt: spy.calls for fmt, spy in spies.items() if spy.calls} == {}
+
+
+def test_real_heic_transcodes_through_the_heif_decoder_alone(monkeypatch):
+    """A genuine HEIC still transcodes with every other plugin replaced by a spy, so the
+    `formats=` id is the one pillow-heif registers and no other decoder runs first."""
+    heic = _real_heic_bytes()
+    spies = _spy_on_every_non_heif_plugin(monkeypatch)
+    out = images.transcode_heif_to_jpeg(heic)
+    assert out.startswith(b"\xff\xd8\xff")
+    assert {fmt: spy.calls for fmt, spy in spies.items() if spy.calls} == {}
+
+
 async def test_oversize_transcode_output_raises(monkeypatch):
     """A transcode that inflates past max_bytes must not return oversize bytes."""
     heic = _real_heic_bytes()
