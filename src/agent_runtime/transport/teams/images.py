@@ -62,6 +62,17 @@ _DOWNLOAD_DEADLINE_SECONDS = 30.0
 # conventional visually-lossless point; the model does not benefit from more.
 _HEIC_JPEG_QUALITY = 85
 
+# T-7796 (tbp) -- the only Pillow decoder a HEIF transcode may reach: the plugin
+# pillow-heif registers (`HeifImageFile.format`). Without `formats=`, Image.open tries
+# every registered plugin in Image.ID order, and register_heif_opener() appends HEIF
+# AFTER init(), so the six magic-less plugins (IM, IMT, IPTC, PCD, SPIDER, TGA) ran on
+# every HEIC before HEIF did -- and every plugin after a failed open. AVIF is deliberately
+# not listed: sniff_heif refuses the `avif`/`avis` major brands, and an AVIF filed under a
+# generic `mif1`/`msf1` brand now fails in the HEIF decoder (no AV1 codec in pillow-heif's
+# libheif) and is skipped like any undecodable image, where before it decoded only when
+# Pillow's AVIF plugin happened to run first.
+_HEIF_DECODE_FORMATS: tuple[str, ...] = ("HEIF",)
+
 
 class InlineImageDownloadError(Exception):
     """An inline image could not be downloaded or failed validation.
@@ -123,7 +134,10 @@ def transcode_heif_to_jpeg(data: bytes) -> bytes:
     HEIF container, the caller degrades to the pre-T-134-b behavior — skip the
     one image. ``exif_transpose`` bakes the EXIF orientation in, since phone
     photos are routinely stored rotated; alpha/other modes are flattened to RGB
-    because JPEG cannot carry them.
+    because JPEG cannot carry them. Only the HEIF decoder runs on ``data``
+    (``_HEIF_DECODE_FORMATS``, T-7796): bytes it cannot open raise
+    ``UnidentifiedImageError`` or the HEIF decoder's own error, without any other
+    Pillow plugin being tried.
     """
     from io import BytesIO  # noqa: PLC0415 -- lazy on purpose, see docstring
 
@@ -131,7 +145,7 @@ def transcode_heif_to_jpeg(data: bytes) -> bytes:
     from pillow_heif import register_heif_opener  # noqa: PLC0415 -- optional [teams] dep
 
     register_heif_opener()
-    with Image.open(BytesIO(data)) as raw_im:
+    with Image.open(BytesIO(data), formats=_HEIF_DECODE_FORMATS) as raw_im:
         transposed = ImageOps.exif_transpose(raw_im)
         if transposed.mode not in ("RGB", "L"):
             transposed = transposed.convert("RGB")

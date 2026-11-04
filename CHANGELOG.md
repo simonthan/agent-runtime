@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.45.1 — 2026-11-04
+
+### Security
+
+- **`transcode_heif_to_jpeg` runs only the HEIF decoder.** It now opens the payload with
+  `Image.open(..., formats=("HEIF",))` (TBP T-7796, from the T-7380 dependency scan).
+  Before, Pillow tried every registered plugin in `Image.ID` order, and
+  `register_heif_opener()` appends HEIF after `Image.init()`, so the six plugins with no
+  magic check (IM, IMT, IPTC, PCD, SPIDER, TGA) ran on every HEIC before HEIF did, and every
+  plugin was tried after a failed open. It is reached after only the 12-byte `sniff_heif`
+  check, from the Teams inline-image download and from consumers' own upload gates. A real
+  HEIC transcodes exactly as before; bytes the HEIF decoder cannot open raise
+  `PIL.UnidentifiedImageError` or the decoder's own error, which callers already treat as a
+  failed transcode (skip one image). One visible change: an AVIF filed under a generic
+  `mif1`/`msf1` brand (which `sniff_heif` admits) is now skipped, where it used to decode only
+  when Pillow's AVIF plugin happened to be tried before HEIF. No API change.
+
 ## v0.45.0 — 2026-10-21
 
 ### Added
