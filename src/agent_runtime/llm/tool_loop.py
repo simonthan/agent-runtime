@@ -256,6 +256,16 @@ class ToolLoopResult:
     # endpoint sent no breakdown.
     cache_creation_1h_input_tokens: int = 0
     cache_creation_5m_input_tokens: int = 0
+    # v0.46.0 (TBP T-7250) -- the model calls this run made: one per `complete_messages` call
+    # the loop issued, i.e. each tool round, the final answer, a call that raised
+    # LLMResponseError (no content; its tokens are not in the counts above) and the T-7219
+    # recovery call. Transport retries inside the client are not counted. A recovered reply
+    # carries the retry's own stop_reason, so `len(steps) + 1` cannot see that extra call;
+    # this can. Continuation-only after `resume()`, like the token counts (a re-suspend in the
+    # same round reports 0) -- so after a resume it can be below `len(steps)`, which carries
+    # the restored rounds. None = not reported: a result built outside the loop (a consumer's
+    # own or a test double).
+    model_calls: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -543,7 +553,7 @@ class ToolUseLoop:
             max_rounds=max_rounds,
             rounds=0,
             steps=[],
-            agg={"in": 0, "out": 0, "cc": 0, "cr": 0, "c1h": 0, "c5m": 0},
+            agg={"in": 0, "out": 0, "cc": 0, "cr": 0, "c1h": 0, "c5m": 0, "calls": 0},
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -632,7 +642,7 @@ class ToolUseLoop:
         messages: list[dict[str, Any]] = state["messages"]
         steps: list[ToolLoopStep] = [self._step_from_dict(s) for s in state["steps"]]
         # D6: these counts are continuation-only, never read back from state
-        agg: dict[str, int] = {"in": 0, "out": 0, "cc": 0, "cr": 0, "c1h": 0, "c5m": 0}
+        agg: dict[str, int] = {"in": 0, "out": 0, "cc": 0, "cr": 0, "c1h": 0, "c5m": 0, "calls": 0}
         rounds: int = state["rounds"]
         # T-135 — the per-turn image budget SURVIVES the suspend/resume boundary. Unlike
         # `agg` (reset above: D6 continuation-only BILLING), this is a resource BOUND —
@@ -923,11 +933,20 @@ class ToolUseLoop:
         )
 
     async def _complete(
-        self, rounds: int, on_stream: StreamListener | None, **call_kwargs: Any
+        self,
+        rounds: int,
+        agg: dict[str, int],
+        on_stream: StreamListener | None,
+        **call_kwargs: Any,
     ) -> Any:
         """One `complete_messages` call. With a listener (T-316b): bracketed by
         ModelCallStarted / ModelCallEnded, and the listener rides the call (only when set, so
-        a client double without the keyword keeps working when streaming is off)."""
+        a client double without the keyword keeps working when streaming is off).
+
+        v0.46.0 (TBP T-7250) -- counted in `agg["calls"]` BEFORE the request, so a call that
+        raises (LLMResponseError absorbed by T-7219 recovery) still counts. The only model-call
+        site in the loop: every request goes through here."""
+        agg["calls"] = agg.get("calls", 0) + 1
         if on_stream is None:
             return await self._client.complete_messages(**call_kwargs)
         await on_stream(
@@ -954,7 +973,7 @@ class ToolUseLoop:
         nothing in it. With recovery off (or no round committed yet) both behave as before:
         the error raises and the empty reply is returned as an answer."""
         try:
-            resp = await self._complete(rounds, on_stream, **call_kwargs)
+            resp = await self._complete(rounds, agg, on_stream, **call_kwargs)
         except LLMResponseError:
             if not self._recovers_empty(rounds):
                 raise
@@ -1002,6 +1021,7 @@ class ToolUseLoop:
         try:
             retry = await self._complete(
                 rounds,
+                agg,
                 on_stream,
                 system_blocks=system_blocks,
                 messages=_with_trailing_user_text(messages, nudge),
@@ -1470,6 +1490,7 @@ class ToolUseLoop:
             pending_confirmation=pending_confirmation,
             cache_creation_1h_input_tokens=agg.get("c1h", 0),
             cache_creation_5m_input_tokens=agg.get("c5m", 0),
+            model_calls=agg.get("calls", 0),
         )
 
     @staticmethod
@@ -1585,4 +1606,5 @@ class ToolUseLoop:
             cache_read_input_tokens=agg["cr"],
             cache_creation_1h_input_tokens=agg.get("c1h", 0),
             cache_creation_5m_input_tokens=agg.get("c5m", 0),
+            model_calls=agg.get("calls", 0),
         )
