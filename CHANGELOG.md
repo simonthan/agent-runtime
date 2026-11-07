@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.46.0 — 2026-11-06
+
+### Added
+
+- **`ToolLoopResult.model_calls`: the model calls a run made** (TBP T-7250). It counts one
+  per `complete_messages` call `run()` / `resume()` issued: each tool round, the final
+  answer, a call that raised `LLMResponseError` (no content) and the T-7219 empty-reply
+  recovery call. Transport-level retries inside `AnthropicClient` (the SDK's `max_retries`,
+  the stream-to-plain retry) are not counted. A consumer that derived the count as
+  `len(steps) + 1` could not see a recovery that SUCCEEDED, because the recovered reply
+  carries the retry's own `stop_reason`; this field can. A no-content call is counted but,
+  as before, adds no tokens (it returned no usage the loop reads), so a per-call token mean
+  reads slightly low on such a run. After `resume()` it is continuation-only, like the token
+  counts (a re-suspend in the same round reports 0), so it can be below `len(steps)`, which
+  carries the restored rounds. It defaults to `None` ("not reported") for a result built
+  outside the loop, and is appended last, so positional construction is unchanged. The
+  persisted suspend `state` is byte-for-byte as before (only the four D6 counts ride it).
+  Additive; no behaviour change.
+
 ## v0.45.1 — 2026-11-04
 
 ### Security
