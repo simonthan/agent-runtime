@@ -17,7 +17,9 @@
   never runs) applies unchanged. Bounds, each off when None: `max_whitespace_run`
   (consecutive blank units between tokens or inside a string, `\n` `\r` `\t` escapes
   included), `max_key_chars`, and `string_limit(tool, key)` (the consumer's bound for a string
-  value under a key). The response carries `tool_input_report: ToolInputReport` (why it
+  value under a key; a key's escapes are decoded first, and a `string_limit` that raises or
+  returns a non-int means no bound for that value, logged once per call as
+  `llm_tool_input_limit_failed`, never failing the call). The response carries `tool_input_report: ToolInputReport` (why it
   stopped, the key being written, raw characters, the open string's length, the longest blank
   run, distinct characters in the last 256); it is also set, with `stopped=None`, when a call
   is cut at the real output cap inside a tool call, so the consumer can log what the argument

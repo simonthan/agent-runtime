@@ -132,6 +132,25 @@ def test_any_other_character_resets_the_run() -> None:
     assert s.report().max_whitespace_run == 900
 
 
+def test_escaped_characters_in_a_key_keep_their_text() -> None:
+    """iav review F2 -- an escape in a key is part of the key (a \\uXXXX escape decoded), so
+    `string_limit` sees the real key: `"\\u0069\\u0064"` is `"id"`."""
+    seen: list[str] = []
+
+    def record(_tool: str, key: str) -> int | None:
+        seen.append(key)
+        return None
+
+    _scan(
+        '{"a\\"b":"1","k\\u00e9y":"2","\\u0069\\u0064":"3","x\\u12":"4"}',
+        ToolInputLimit(string_limit=record),
+        step=1,
+    )
+    assert seen == ['a"b', "k\u00e9y", "id", "x"]
+    s = _scan('{"\\u0069\\u0064":"' + "A" * 5000)
+    assert (s.stopped, s.stopped_key) == (STRING_TOO_LONG, "id")
+
+
 def test_a_runaway_key_trips() -> None:
     s = _scan('{"message_id":"m1","' + "k" * 400)
     assert s.stopped == KEY_TOO_LONG
@@ -463,3 +482,33 @@ async def test_the_real_sdk_stream_is_closed_at_the_bound() -> None:
     assert resp.tool_input_report is not None
     assert resp.tool_input_report.stopped == STRING_TOO_LONG
     assert sent[0] < 200  # ~2,000 characters of 16-character pieces, not all 4,000 pieces
+
+
+@pytest.mark.parametrize("result", ["raise", "not-an-int"])
+async def test_a_failing_string_limit_is_unbounded_and_audited_once(result: str) -> None:
+    """iav review F1 -- a consumer bug in `string_limit` (raises, or returns a non-int) never
+    fails the call: the value is unbounded and one `llm_tool_input_limit_failed` is audited."""
+
+    def broken(_tool: str, key: str) -> Any:
+        if result == "raise":
+            raise KeyError(key)
+        return "2000"
+
+    fake, audit = FakeAsyncAnthropic(), RecordingAudit()
+    raw = json.dumps({"message_id": "m1", "attachment_id": "A" * 5000})
+    msg = FakeMessage(
+        content=[FakeToolUseBlock(id="tu_1", name="t", input=json.loads(raw), raw_json=raw)],
+        model="claude-sonnet-4-6",
+        stop_reason="tool_use",
+        usage=FakeUsage(input_tokens=10, output_tokens=1500),
+    )
+    fake.messages.responses.append(msg)
+    limit = ToolInputLimit(max_whitespace_run=1000, string_limit=broken)
+    resp = await _client(fake, audit, tool_input_limit=limit).complete_messages(
+        system_blocks=SYSTEM, messages=MSGS, tools=TOOLS
+    )
+    assert resp.stop_reason == "tool_use"
+    assert resp.tool_input_report is None
+    failed = [e for e in audit.events if e[1] == "llm_tool_input_limit_failed"]
+    assert len(failed) == 1
+    assert failed[0][2]["error_type"] == ("KeyError" if result == "raise" else "str")

@@ -57,7 +57,12 @@ from agent_runtime.llm.streaming import (
     UsageListener,
     guard_listener,
 )
-from agent_runtime.llm.tool_input import ToolInputLimit, ToolInputReport, ToolInputScanner
+from agent_runtime.llm.tool_input import (
+    StringLimit,
+    ToolInputLimit,
+    ToolInputReport,
+    ToolInputScanner,
+)
 from agent_runtime.logging import AuditLogger, NullAuditLogger
 
 __all__ = ["AnthropicClient", "assemble_history_messages"]
@@ -242,6 +247,37 @@ class _StoppedMessage:
     model: str
     stop_reason: str
     usage: _StoppedUsage
+
+
+class _GuardedStringLimit:
+    """v0.47.0 (iav review F1) -- the consumer's `string_limit`, never failing the call: a raise
+    or a non-int result means no bound for that value, logged once per call
+    (`llm_tool_input_limit_failed`, warning; audit and stdlib), as for `on_usage`."""
+
+    __slots__ = ("_audit", "_fn", "_reported")
+
+    def __init__(self, fn: StringLimit, audit: AuditLogger) -> None:
+        self._fn = fn
+        self._audit = audit
+        self._reported = False
+
+    def __call__(self, tool: str, key: str) -> int | None:
+        try:
+            cap = self._fn(tool, key)
+        except Exception as exc:  # noqa: BLE001 -- a consumer bug must never fail the call
+            self._failed(type(exc).__name__)
+            return None
+        if cap is None or (isinstance(cap, int) and not isinstance(cap, bool)):
+            return cap
+        self._failed(type(cap).__name__)
+        return None
+
+    def _failed(self, error_type: str) -> None:
+        if self._reported:
+            return
+        self._reported = True
+        self._audit.warning("llm_tool_input_limit_failed", error_type=error_type)
+        logger.warning("llm_tool_input_limit_failed error_type=%s", error_type)
 
 
 class _ToolInputWatch:
@@ -566,9 +602,13 @@ class AnthropicClient:
         self, *, streaming: bool, tools: list[dict[str, Any]] | None
     ) -> _ToolInputWatch | None:
         """v0.47.0 -- a watch for this call: only with a limit, on a streamed call with tools."""
-        if self._tool_input_limit is None or not streaming or not tools:
+        limit = self._tool_input_limit
+        if limit is None or not streaming or not tools:
             return None
-        return _ToolInputWatch(self._tool_input_limit)
+        if limit.string_limit is not None:
+            guarded = _GuardedStringLimit(limit.string_limit, self._audit)
+            limit = dataclasses.replace(limit, string_limit=guarded)
+        return _ToolInputWatch(limit)
 
     def _with_tool_input_report(
         self,

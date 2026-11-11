@@ -19,8 +19,10 @@ like); each is off when None:
   between JSON tokens, or inside a string a space, a tab, or the escapes ``\\n`` ``\\r`` ``\\t``.
 - ``max_key_chars``: the length of one object key.
 - ``string_limit(tool, key)``: the bound for a string value under ``key`` (the innermost
-  object key; an array's items take the array's key), or None for no bound. Called once when
-  each string value starts.
+  object key, escapes decoded; an array's items take the array's key), or None for no bound.
+  Called once when each string value starts. Through ``AnthropicClient``, a callback that
+  raises or returns a non-int means no bound for that value (``llm_tool_input_limit_failed``,
+  once per call); the call never fails on it.
 
 ``ToolInputScanner`` is a single pass over the characters (no regex, no re-scan of what it
 has seen), so its cost is linear in the argument's length whatever the chunking.
@@ -55,6 +57,10 @@ _KEY_KEEP = 64  # characters of a key kept (string_limit's argument and the repo
 _BLANK_OUTSIDE = frozenset(" \t\n\r")
 _BLANK_INSIDE = frozenset(" \t")
 _BLANK_ESCAPES = frozenset("nrt")
+_HEX = frozenset("0123456789abcdefABCDEF")
+_UHEX_DIGITS = 4
+# a key's escapes decoded, so string_limit sees the real key (iav review F2)
+_KEY_ESCAPES = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
 
 StringLimit = Callable[[str, str], int | None]
 
@@ -107,6 +113,7 @@ class ToolInputScanner:
         "_str_key",
         "_str_len",
         "_tail",
+        "_uhex",
         "_ws_run",
         "chars",
         "max_ws_run",
@@ -128,6 +135,7 @@ class ToolInputScanner:
         self._str_len = 0
         self._str_cap: int | None = None
         self._str_key = ""
+        self._uhex: str | None = None  # the hex digits of a \uXXXX escape in a key
         self._ws_run = 0
         self._tail = ""
         self.chars = 0
@@ -154,9 +162,26 @@ class ToolInputScanner:
         max_key = limit.max_key_chars
         for c in chunk:
             if self._in_str:
-                if self._esc:
+                hex_digit = False
+                if self._uhex is not None:  # only ever set inside a key
+                    if c in _HEX:
+                        hex_digit = True
+                        self._uhex += c
+                        if len(self._uhex) == _UHEX_DIGITS:
+                            self._key_add(chr(int(self._uhex, 16)))
+                            self._uhex = None
+                    else:
+                        self._uhex = None  # malformed: this character is read as usual
+                if hex_digit:
+                    self._ws_run = 0
+                elif self._esc:
                     self._esc = False
                     self._ws_run = self._ws_run + 1 if c in _BLANK_ESCAPES else 0
+                    if self._is_key:
+                        if c == "u":
+                            self._uhex = ""
+                        else:
+                            self._key_add(_KEY_ESCAPES.get(c, c))
                 elif c == "\\":
                     self._esc = True
                     continue  # the escape's second character decides
@@ -169,8 +194,8 @@ class ToolInputScanner:
                     continue
                 else:
                     self._ws_run = self._ws_run + 1 if c in _BLANK_INSIDE else 0
-                    if self._is_key and len(self._key_buf) < _KEY_KEEP:
-                        self._key_buf.append(c)
+                    if self._is_key:
+                        self._key_add(c)
                 self._str_len += 1
                 if self._is_key:
                     if max_key is not None and self._str_len > max_key:
@@ -210,6 +235,10 @@ class ToolInputScanner:
                 if max_ws is not None and self._ws_run > max_ws:
                     return self._trip(WHITESPACE_RUN, self._open_key())
         return None
+
+    def _key_add(self, text: str) -> None:
+        if len(self._key_buf) < _KEY_KEEP:
+            self._key_buf.append(text)
 
     def _open_key(self) -> str:
         """The key of what is being written: inside a key, that key's start (R3 F3)."""
