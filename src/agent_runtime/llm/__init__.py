@@ -35,6 +35,8 @@ Public surface:
   ``resume`` (TBP T-316b); ``AnthropicClient(stream_transport=True)`` streams every call
 - ``PromptUsage`` / ``UsageListener`` — a streamed call's prompt usage, reported when the
   response starts (``complete_messages(on_usage=...)``, TBP T-7624)
+- ``ToolInputLimit`` / ``ToolInputReport`` / ``ToolInputScanner`` — stop a streamed call whose
+  tool-call arguments run away (``AnthropicClient(tool_input_limit=...)``, TBP T-70172)
 
 See ``agent_runtime.llm.client.AnthropicClient.complete`` docstring for the
 two-breakpoint cache contract (static system prefix + per-turn retrieval block).
@@ -85,6 +87,7 @@ from agent_runtime.llm.streaming import (
     ToolUseStarted,
     UsageListener,
 )
+from agent_runtime.llm.tool_input import ToolInputLimit, ToolInputReport, ToolInputScanner
 from agent_runtime.llm.tool_loop import (
     CONSUMER_STOP_REASON,
     EMPTY_RESPONSE_STOP_REASON,
@@ -138,6 +141,9 @@ __all__ = [
     "TextDelta",
     "ToolCall",
     "ToolExecutor",
+    "ToolInputLimit",
+    "ToolInputReport",
+    "ToolInputScanner",
     "ToolLoopResult",
     "ToolLoopStep",
     "ToolResult",
