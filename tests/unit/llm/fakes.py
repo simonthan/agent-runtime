@@ -38,6 +38,9 @@ class FakeToolUseBlock:
     name: str
     input: dict
     type: str = "tool_use"
+    # v0.47.0 (T-70172): the raw JSON a stream sends for this block as input_json_delta
+    # events; None = no json deltas (the pre-v0.47.0 fake stream)
+    raw_json: str | None = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,12 @@ class FakeMessage:
 class FakeDelta:
     text: str
     type: str = "text_delta"
+
+
+@dataclass(frozen=True)
+class FakeJsonDelta:
+    partial_json: str
+    type: str = "input_json_delta"
 
 
 @dataclass(frozen=True)
@@ -75,6 +84,12 @@ def stream_events(message: FakeMessage, *, chunk: int = 4) -> list[FakeStreamEve
             events.extend(
                 FakeStreamEvent(type="content_block_delta", delta=FakeDelta(text[i : i + chunk]))
                 for i in range(0, len(text), chunk)
+            )
+        raw = getattr(block, "raw_json", None)
+        if raw:
+            events.extend(
+                FakeStreamEvent(type="content_block_delta", delta=FakeJsonDelta(raw[i : i + chunk]))
+                for i in range(0, len(raw), chunk)
             )
         events.append(FakeStreamEvent(type="content_block_stop"))
     events.append(FakeStreamEvent(type="message_stop"))
@@ -101,9 +116,51 @@ class _FakeStream:
         self._fail_after = fail_after
         self._exc = exc
         self._pause = pause
+        self.yielded = 0  # v0.47.0: events handed out (an early stop reads fewer than all)
+        self._snap: list[Any] = []  # blocks started so far (current_message_snapshot)
+        self._json = ""
 
     def __aiter__(self) -> Any:
         return self._iter()
+
+    def _accumulate(self, event: FakeStreamEvent) -> None:
+        if event.type == "content_block_start":
+            block = event.content_block
+            if getattr(block, "type", None) == "tool_use":
+                block = FakeToolUseBlock(id=block.id, name=block.name, input={})
+            elif getattr(block, "type", None) == "text":
+                block = FakeTextBlock(text="")
+            self._snap.append(block)
+            self._json = ""
+        elif event.type == "content_block_delta" and self._snap:
+            last = self._snap[-1]
+            if isinstance(event.delta, FakeJsonDelta):
+                from jiter import from_json  # the SDK's own partial parser
+
+                self._json += event.delta.partial_json
+                parsed = from_json(self._json.encode(), partial_mode=True)
+                self._snap[-1] = FakeToolUseBlock(id=last.id, name=last.name, input=parsed)
+            elif isinstance(event.delta, FakeDelta):
+                self._snap[-1] = FakeTextBlock(text=last.text + event.delta.text)
+
+    @property
+    def current_message_snapshot(self) -> FakeMessage:
+        """v0.47.0 -- like the SDK's: the blocks generated so far, tool input parsed in
+        jiter partial mode (a string still being written is dropped), no stop reason yet,
+        the usage `message_start` carried (output 1)."""
+        assert self._message is not None
+        usage = self._message.usage
+        return FakeMessage(
+            content=list(self._snap),
+            model=self._message.model,
+            stop_reason=None,  # type: ignore[arg-type]
+            usage=FakeUsage(
+                input_tokens=usage.input_tokens,
+                output_tokens=1,
+                cache_creation_input_tokens=usage.cache_creation_input_tokens,
+                cache_read_input_tokens=usage.cache_read_input_tokens,
+            ),
+        )
 
     async def _iter(self) -> Any:
         for i, event in enumerate(self._events):
@@ -112,6 +169,8 @@ class _FakeStream:
             if self._fail_after is not None and i == self._fail_after:
                 assert self._exc is not None
                 raise self._exc
+            self._accumulate(event)
+            self.yielded += 1
             yield event
 
     async def get_final_message(self) -> FakeMessage:
@@ -145,7 +204,11 @@ class _FakeStreamManager:
             owner.stream_truncated -= 1
         pause = owner.stream_pause
         owner.stream_pause = None
-        return _FakeStream(owner.responses.pop(0), fail_after, exc, truncate=truncate, pause=pause)
+        stream = _FakeStream(
+            owner.responses.pop(0), fail_after, exc, truncate=truncate, pause=pause
+        )
+        owner.streams.append(stream)
+        return stream
 
     async def __aexit__(self, *exc_info: object) -> None:
         return None
@@ -176,6 +239,7 @@ class FakeMessages:
     stream_truncated: int = 0
     stream_empty_sse: int = 0
     stream_pause: tuple[int, asyncio.Event] | None = None
+    streams: list[_FakeStream] = field(default_factory=list)  # v0.47.0: each opened stream
 
     async def create(self, **kwargs: Any) -> FakeMessage:
         self.captured_requests.append(kwargs)

@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.47.0 — 2026-11-11
+
+### Added
+
+- **`AnthropicClient(tool_input_limit=ToolInputLimit(...))`: stop a runaway tool-call argument
+  early** (TBP T-70172, for TBP T-70157). TBP saw a call write 16,000 output tokens (127 s, the
+  whole output cap) into a `get_attachment_content` call whose parsed input was 170
+  characters: the argument still being written was one endless string or a run of blank
+  space, and the call was cut at the cap and never ran. With a limit set, the client scans the
+  raw JSON of every `tool_use` block of a STREAMED call that offers tools
+  (`ToolInputScanner`, one linear pass) and, when the argument breaks a bound, stops reading
+  the stream (leaving the stream's context closes the response, which ends generation). What
+  was generated is returned as `stop_reason="max_tokens"`, exactly as if the call had hit the
+  output cap there, so every consumer path for a cut call (the loop ends the run, the call
+  never runs) applies unchanged. Bounds, each off when None: `max_whitespace_run`
+  (consecutive blank units between tokens or inside a string, `\n` `\r` `\t` escapes
+  included), `max_key_chars`, and `string_limit(tool, key)` (the consumer's bound for a string
+  value under a key; a key's escapes are decoded first, and a `string_limit` that raises or
+  returns a non-int means no bound for that value, logged once per call as
+  `llm_tool_input_limit_failed`, never failing the call). The response carries `tool_input_report: ToolInputReport` (why it
+  stopped, the key being written, raw characters, the open string's length, the longest blank
+  run, distinct characters in the last 256); it is also set, with `stopped=None`, when a call
+  is cut at the real output cap inside a tool call, so the consumer can log what the argument
+  looked like. A stopped call's `output_tokens` is an estimate (streamed characters / 4: no
+  `message_delta` came); the prompt counts are the endpoint's. One `llm_tool_input_stopped`
+  audit warning per stop. A call that is not streamed is never checked. Default None:
+  byte-for-byte unchanged.
+
 ## v0.46.0 — 2026-11-06
 
 ### Added

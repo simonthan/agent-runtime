@@ -35,6 +35,7 @@ defense is auditable.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 from typing import Any, Literal, Protocol
@@ -55,6 +56,12 @@ from agent_runtime.llm.streaming import (
     ToolUseStarted,
     UsageListener,
     guard_listener,
+)
+from agent_runtime.llm.tool_input import (
+    StringLimit,
+    ToolInputLimit,
+    ToolInputReport,
+    ToolInputScanner,
 )
 from agent_runtime.logging import AuditLogger, NullAuditLogger
 
@@ -219,6 +226,135 @@ def _report_prompt_usage(event: Any, on_usage: UsageListener, audit: AuditLogger
         logger.warning("llm_usage_listener_failed error_type=%s", type(exc).__name__)
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _StoppedUsage:
+    """v0.47.0 -- the usage of a call stopped by the tool-input limit: the prompt as the
+    endpoint reported it at `message_start`, the output estimated (no `message_delta` came)."""
+
+    input_tokens: int
+    output_tokens: int
+    cache_creation_input_tokens: int
+    cache_read_input_tokens: int
+    cache_creation: Any = None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _StoppedMessage:
+    """v0.47.0 -- what a stopped stream generated, shaped like the SDK's Message for
+    `_parse_response`; `stop_reason` is "max_tokens", as if the call hit the output cap."""
+
+    content: list[Any]
+    model: str
+    stop_reason: str
+    usage: _StoppedUsage
+
+
+class _GuardedStringLimit:
+    """v0.47.0 (iav review F1) -- the consumer's `string_limit`, never failing the call: a raise
+    or a non-int result means no bound for that value, logged once per call
+    (`llm_tool_input_limit_failed`, warning; audit and stdlib), as for `on_usage`."""
+
+    __slots__ = ("_audit", "_fn", "_reported")
+
+    def __init__(self, fn: StringLimit, audit: AuditLogger) -> None:
+        self._fn = fn
+        self._audit = audit
+        self._reported = False
+
+    def __call__(self, tool: str, key: str) -> int | None:
+        try:
+            cap = self._fn(tool, key)
+        except Exception as exc:  # noqa: BLE001 -- a consumer bug must never fail the call
+            self._failed(type(exc).__name__)
+            return None
+        if cap is None or (isinstance(cap, int) and not isinstance(cap, bool)):
+            return cap
+        self._failed(type(cap).__name__)
+        return None
+
+    def _failed(self, error_type: str) -> None:
+        if self._reported:
+            return
+        self._reported = True
+        self._audit.warning("llm_tool_input_limit_failed", error_type=error_type)
+        logger.warning("llm_tool_input_limit_failed error_type=%s", error_type)
+
+
+class _ToolInputWatch:
+    """v0.47.0 (TBP T-70172) -- one call's watch over its streamed tool-call arguments (see
+    `agent_runtime.llm.tool_input`). `observe` returns True when the block being written broke
+    the limit; the client then stops reading and returns `stopped_message(snapshot)`. Reset
+    at the start of every streaming attempt."""
+
+    def __init__(self, limit: ToolInputLimit) -> None:
+        self._limit = limit
+        self._current: ToolInputScanner | None = None
+        self._last: ToolInputScanner | None = None
+        self._last_is_tool = False
+        self._out_chars = 0
+
+    def reset(self) -> None:
+        self._current = None
+        self._last = None
+        self._last_is_tool = False
+        self._out_chars = 0
+
+    def observe(self, event: Any) -> bool:
+        etype = getattr(event, "type", None)
+        if etype == "content_block_start":
+            block = getattr(event, "content_block", None)
+            if getattr(block, "type", None) == "tool_use":
+                name = getattr(block, "name", "") or ""
+                self._current = ToolInputScanner(str(name), self._limit)
+                self._last = self._current
+                self._last_is_tool = True
+            else:
+                self._current = None
+                self._last_is_tool = False
+        elif etype == "content_block_delta":
+            delta = getattr(event, "delta", None)
+            dtype = getattr(delta, "type", None)
+            if dtype == "input_json_delta":
+                part = getattr(delta, "partial_json", "") or ""
+                self._out_chars += len(part)
+                if self._current is not None:
+                    return self._current.feed(part) is not None
+            elif dtype == "text_delta":
+                self._out_chars += len(getattr(delta, "text", "") or "")
+        elif etype == "content_block_stop":
+            self._current = None
+        return False
+
+    def stopped_message(self, snapshot: Any) -> _StoppedMessage:
+        usage = getattr(snapshot, "usage", None)
+        reported = int(getattr(usage, "output_tokens", 0) or 0)
+        return _StoppedMessage(
+            content=list(getattr(snapshot, "content", None) or []),
+            model=str(getattr(snapshot, "model", "") or ""),
+            stop_reason="max_tokens",
+            usage=_StoppedUsage(
+                input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+                # ~4 characters a token (the estimate_tokens rule): no message_delta came
+                output_tokens=max(reported, -(-self._out_chars // 4)),
+                cache_creation_input_tokens=int(
+                    getattr(usage, "cache_creation_input_tokens", 0) or 0
+                ),
+                cache_read_input_tokens=int(getattr(usage, "cache_read_input_tokens", 0) or 0),
+                cache_creation=getattr(usage, "cache_creation", None),
+            ),
+        )
+
+    def report(self, stop_reason: str) -> ToolInputReport | None:
+        """The last tool call's report when the call ended inside it: stopped by the limit,
+        or cut at the output cap with that call the last block. Else None."""
+        last = self._last
+        if last is None:
+            return None
+        if last.stopped is not None or (stop_reason == "max_tokens" and self._last_is_tool):
+            return last.report()
+        return None
+
+
 class _IncompleteStreamError(Exception):
     """T-316b -- the stream ended (cleanly, from the transport's view) before `message_stop`:
     a proxy cut it. `messages.create` can never return such a body, so neither may we."""
@@ -294,13 +430,21 @@ class AnthropicClient:
         default_temperature: float | None = 0.0,
         audit_logger: AuditLogger | None = None,
         stream_transport: bool = False,
+        tool_input_limit: ToolInputLimit | None = None,
     ) -> None:
         """`stream_transport` (v0.43.0, T-316b): send EVERY call as a streaming request and
         assemble the response from the stream, so a long output never waits on one HTTP
         read (the SDK's read timeout then bounds the gap between events, not the whole
         response). The returned `ClaudeResponse` is the same as a non-streaming call's.
         Default False = byte-for-byte unchanged (`messages.create`). A call that passes an
-        `on_stream` listener streams either way."""
+        `on_stream` listener streams either way.
+
+        `tool_input_limit` (v0.47.0, TBP T-70172): bounds on the arguments of a tool call the
+        model is writing (see `agent_runtime.llm.tool_input`). Checked on every STREAMED call
+        that offers tools; a call that breaks one is stopped there and returned with
+        `stop_reason="max_tokens"` and a `tool_input_report`, as if it had hit the output cap.
+        None (default) = byte-for-byte unchanged; a call that is not streamed is never
+        checked."""
         self._client = client
         self._default_model = default_model
         self._default_max_tokens = default_max_tokens
@@ -310,6 +454,7 @@ class AnthropicClient:
         # T-316b -- latched True when a streaming request failed and the same request then
         # succeeded without streaming: this endpoint cannot stream, stop trying.
         self._stream_unsupported = False
+        self._tool_input_limit = tool_input_limit
 
     async def complete_messages(
         self,
@@ -382,6 +527,7 @@ class AnthropicClient:
         streaming = (self._stream_transport or on_stream is not None) and (
             not self._stream_unsupported
         )
+        watch = self._tool_input_watch(streaming=streaming, tools=tools)
         try:
             if streaming:
                 raw = await self._create_streamed(
@@ -389,6 +535,7 @@ class AnthropicClient:
                     guard_listener(on_stream, self._audit),
                     chosen_model,
                     on_usage=on_usage,
+                    watch=watch,
                 )
             else:
                 raw = await self._client.messages.create(**create_kwargs)
@@ -422,7 +569,9 @@ class AnthropicClient:
             raise LLMAPIError(f"{error_type}: status=None") from exc
 
         duration_ms = int((time.monotonic() - start) * 1000)
-        response = self._parse_response(raw)
+        response = self._with_tool_input_report(
+            self._parse_response(raw), watch, chosen_model, duration_ms
+        )
         self._audit.info(
             "llm_response_success",
             model=response.model,
@@ -449,6 +598,61 @@ class AnthropicClient:
             )
         return response
 
+    def _tool_input_watch(
+        self, *, streaming: bool, tools: list[dict[str, Any]] | None
+    ) -> _ToolInputWatch | None:
+        """v0.47.0 -- a watch for this call: only with a limit, on a streamed call with tools."""
+        limit = self._tool_input_limit
+        if limit is None or not streaming or not tools:
+            return None
+        if limit.string_limit is not None:
+            guarded = _GuardedStringLimit(limit.string_limit, self._audit)
+            limit = dataclasses.replace(limit, string_limit=guarded)
+        return _ToolInputWatch(limit)
+
+    def _with_tool_input_report(
+        self,
+        response: ClaudeResponse,
+        watch: _ToolInputWatch | None,
+        model: str,
+        duration_ms: int,
+    ) -> ClaudeResponse:
+        """v0.47.0 -- `response` with the watch's report (when the call ended inside a tool
+        call's arguments) and one `llm_tool_input_stopped` audit warning for a stop."""
+        report = None if watch is None else watch.report(response.stop_reason)
+        if report is None:
+            return response
+        if report.stopped is not None:
+            self._audit.warning(
+                "llm_tool_input_stopped",
+                model=model,
+                reason=report.stopped,
+                chars=report.chars,
+                max_whitespace_run=report.max_whitespace_run,
+                duration_ms=duration_ms,
+            )
+        return dataclasses.replace(response, tool_input_report=report)
+
+    async def _read_event(
+        self,
+        event: Any,
+        stream: Any,
+        on_stream: StreamListener | None,
+        progress: dict[str, bool],
+        on_usage: UsageListener | None,
+        watch: _ToolInputWatch | None,
+    ) -> _StoppedMessage | None:
+        """One stream event past `message_stop` bookkeeping: report the prompt usage
+        (T-7624), forward it to the listener (T-316b), and let the tool-input watch judge it
+        (v0.47.0). Returns what was generated when the watch stopped the call, else None."""
+        if getattr(event, "type", None) == "message_start" and on_usage is not None:
+            _report_prompt_usage(event, on_usage, self._audit)  # T-7624
+        if on_stream is not None and await _forward_event(event, on_stream):
+            progress["forwarded"] = True
+        if watch is not None and watch.observe(event):
+            return watch.stopped_message(stream.current_message_snapshot)
+        return None
+
     async def _create_streamed(
         self,
         create_kwargs: dict[str, Any],
@@ -456,6 +660,7 @@ class AnthropicClient:
         model: str,
         *,
         on_usage: UsageListener | None = None,
+        watch: _ToolInputWatch | None = None,
     ) -> Any:
         """T-316b -- one streaming request, assembled into the SDK's final Message (the same
         object `messages.create` returns, so `_parse_response` is shared). Forwards text
@@ -475,8 +680,12 @@ class AnthropicClient:
         retry_left = (getattr(self._client, "max_retries", 0) or 0) > 0
         while True:
             progress = {"started": False, "forwarded": False}
+            if watch is not None:
+                watch.reset()  # v0.47.0: each attempt is judged on its own events
             try:
-                return await self._stream_once(create_kwargs, on_stream, progress, on_usage)
+                return await self._stream_once(
+                    create_kwargs, on_stream, progress, on_usage, watch=watch
+                )
             except _NoStreamError as exc:
                 raw = await self._client.messages.create(**create_kwargs)
                 self._stream_unsupported = True
@@ -500,6 +709,8 @@ class AnthropicClient:
         on_stream: StreamListener | None,
         progress: dict[str, bool],
         on_usage: UsageListener | None = None,
+        *,
+        watch: _ToolInputWatch | None = None,
     ) -> Any:
         """One streaming attempt (see `_create_streamed`). `progress["started"]` turns True once
         the stream is open (headers received: anything after this is read from the body, which
@@ -509,7 +720,11 @@ class AnthropicClient:
         No event at all: a body that is not an event stream (a proxy answered plain JSON)
         means this endpoint cannot stream (`_NoStreamError`, fallback + latch); an event
         stream with no event (cut before its first event, or pings only) is a transient cut
-        (`_IncompleteStreamError`), never a latch."""
+        (`_IncompleteStreamError`), never a latch.
+
+        v0.47.0 -- a tool call whose arguments break the `watch`'s limit ends the read there:
+        leaving the stream's context closes the response, which ends generation, and what
+        was generated so far is returned as a `max_tokens` stop (`_ToolInputWatch`)."""
         seen_event = False
         saw_stop = False
         try:
@@ -517,13 +732,13 @@ class AnthropicClient:
                 progress["started"] = True
                 async for event in stream:
                     seen_event = True
-                    etype = getattr(event, "type", None)
-                    if etype == "message_stop":
+                    if getattr(event, "type", None) == "message_stop":
                         saw_stop = True
-                    elif etype == "message_start" and on_usage is not None:
-                        _report_prompt_usage(event, on_usage, self._audit)  # T-7624
-                    if on_stream is not None and await _forward_event(event, on_stream):
-                        progress["forwarded"] = True
+                    stopped = await self._read_event(
+                        event, stream, on_stream, progress, on_usage, watch
+                    )
+                    if stopped is not None:  # leaving the context closes the response
+                        return stopped
                 if not seen_event:
                     if _is_event_stream(stream):
                         raise _IncompleteStreamError

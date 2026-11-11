@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
-from typing import Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
+
+if TYPE_CHECKING:
+    from agent_runtime.llm.tool_input import ToolInputReport
 
 
 class Message(TypedDict):
@@ -100,3 +103,8 @@ class ClaudeResponse:
     tool_use: tuple[ToolUseBlock, ...] = ()
     cache_creation_1h_input_tokens: int = 0
     cache_creation_5m_input_tokens: int = 0
+    # v0.47.0 (TBP T-70172) -- set only by a client built with `tool_input_limit` when a
+    # streamed call ended inside a tool call's arguments: stopped early by the limit
+    # (`stopped` set; then `stop_reason` is "max_tokens" and `output_tokens` an estimate),
+    # or cut at the output cap (`stopped` None). See `agent_runtime.llm.tool_input`.
+    tool_input_report: ToolInputReport | None = None
