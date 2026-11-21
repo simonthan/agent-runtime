@@ -281,3 +281,20 @@ async def test_a_bare_string_is_refused_not_split_into_characters() -> None:
     loop, _ = _loop(make_tool_use(tool_id="t1", name="read"), make_ok())
     with pytest.raises(TypeError, match="not a str"):
         await _run(loop, steer=lambda: "actually PO 2")  # type: ignore[arg-type,return-value]
+
+
+async def test_steering_follows_a_cut_round() -> None:
+    """T-70372's cut round is a committed round: the next request ends [tool_result, text]."""
+    from .fakes import FakeToolUseBlock, FakeUsage
+
+    cut = FakeMessage(
+        content=[FakeToolUseBlock(id="tu_cut", name="read", input={"q": "half"})],
+        model="claude-sonnet-4-6",
+        stop_reason="max_tokens",
+        usage=FakeUsage(input_tokens=300, output_tokens=4096),
+    )
+    loop, sent = _loop(cut, make_ok(text="done"))
+    await _run(loop, steer=_Steer(["actually order 2"]))
+    last = sent[1][-1]["content"]
+    assert [b["type"] for b in last] == ["tool_result", "text"]
+    assert last[0]["is_error"] is True and last[1]["text"] == "actually order 2"
