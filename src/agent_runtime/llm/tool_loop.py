@@ -45,6 +45,14 @@ Streaming (TBP T-316b): ``run(..., on_stream=listener)`` / ``resume(...)`` strea
 call and report ``ModelCallStarted`` / ``TextDelta`` / ``ToolUseStarted`` / ``ModelCallEnded``
 events (``agent_runtime.llm.streaming``). The result is unchanged. Default ``None`` =
 byte-for-byte unchanged.
+
+Steering (TBP T-70375): ``run(..., steer=hook)`` / ``resume(...)`` call ``hook()`` before each
+model call that follows a committed tool round and still offers tools. It returns the user
+messages that arrived while the round ran (the consumer's text); each non-blank one is appended
+as a text block to the trailing user turn, after that round's tool_results, so the next call
+reads it. Never called for the first call of a run, the cap's forced-final call, after a
+``pre_completion_hook`` wrap-up, or once ``stop_after_round`` ended the run: a message the hook
+was never asked for stays the consumer's. Default ``None`` = byte-for-byte unchanged.
 """
 
 from __future__ import annotations
@@ -53,7 +61,7 @@ import asyncio
 import logging
 import time
 import traceback
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -90,6 +98,7 @@ __all__ = [
     "PendingConfirmation",
     "PreCompletionHook",
     "ResumeDecision",
+    "SteerHook",
     "StopAfterRoundHook",
     "ToolCall",
     "ToolExecutor",
@@ -248,6 +257,12 @@ PreCompletionHook = Callable[[], str | None]
 # an exception propagates out of run()/resume() and the rounds' ToolLoopResult (and so the
 # consumer's token accounting for them) is lost.
 StopAfterRoundHook = Callable[[], str | None]
+# T-70375: optional hook invoked before each model call that follows a committed tool round and
+# offers tools. Returns the user messages that arrived since (consumer text, already sanitized
+# for a prompt; may be empty). Each non-blank one becomes a text block after the round's
+# tool_results. Consumer policy (which messages, how they were claimed); must not raise -- an
+# exception propagates out of run()/resume() like a StopAfterRoundHook's.
+SteerHook = Callable[[], Sequence[str]]
 
 # T-7092: a bound below 2 means serial — `1` is a legitimate "off", not an error.
 _MIN_PARALLEL_CALLS = 2
@@ -462,6 +477,27 @@ def _with_trailing_user_text(messages: list[dict[str, Any]], text: str) -> list[
     return [*messages, {"role": "user", "content": [block]}]
 
 
+def _append_user_texts(messages: list[dict[str, Any]], texts: list[str]) -> None:
+    """T-70375 -- append `texts` as text blocks to the LAST user turn of `messages`, in place.
+
+    After a committed round the last message is the user turn holding the tool_result blocks:
+    the API requires those first in that turn, and text blocks may follow them (the same place
+    `_with_trailing_user_text` puts the T-7219 nudge, but on the live list, so the text stays in
+    the conversation). A string-content user turn becomes a text block first; any other tail gets
+    a new user turn."""
+    blocks: list[dict[str, Any]] = [{"type": "text", "text": t} for t in texts]
+    last = messages[-1] if messages else None
+    if last is None or last.get("role") != "user":
+        messages.append({"role": "user", "content": blocks})
+        return
+    content = last.get("content")
+    if isinstance(content, str):
+        parts: list[dict[str, Any]] = [{"type": "text", "text": content}] if content else []
+        last["content"] = [*parts, *blocks]
+    else:
+        last["content"] = [*(content or []), *blocks]
+
+
 class ToolUseLoop:
     def __init__(
         self,
@@ -505,6 +541,7 @@ class ToolUseLoop:
         stop_after_round: StopAfterRoundHook | None = None,
         on_stream: StreamListener | None = None,
         prefix_cache_ttl: Literal["1h"] | None = None,
+        steer: SteerHook | None = None,
     ) -> ToolLoopResult:
         """Run the fenced loop. `max_rounds` caps model turns that return
         stop_reason=='tool_use'. Returns once the model stops requesting tools, the
@@ -614,7 +651,20 @@ class ToolUseLoop:
         input: `ToolLoopResult.cache_creation_1h_input_tokens` reports it. `resume()` takes
         the same value (re-supply it, like the system args). Any other value raises
         ValueError before any model call. Default None = byte-for-byte unchanged
-        (regression guarantee)."""
+        (regression guarantee).
+
+        `steer` (TBP T-70375) is called right before each model call that follows a committed
+        tool round and offers tools: after `stop_after_round` said carry on and the
+        `pre_completion_hook` did not wrap up, and only while the round cap leaves a tool round
+        (never for the run's first call nor the forced-final one). It returns the user messages
+        that arrived while the round ran, the consumer's own text and already sanitized; each
+        non-blank one is appended, in order, as a `{"type": "text"}` block to the trailing user
+        turn after that round's tool_results, in the live `messages` (so later rounds and a
+        suspend `state` keep it), and one `tool_loop_steered` info line is logged (`round_index`,
+        `max_rounds`, `messages`, `chars`; never the text). The loop does not record them in
+        `steps`: the consumer knows what it handed over. A message the hook is never asked for
+        (the run ended first) stays the consumer's to deliver another way. `resume()` takes the
+        same hook (re-supply it). Default None = byte-for-byte unchanged (regression guarantee)."""
         _check_first_tool_choice(first_tool_choice, tools)
         system_blocks = self._build_system_blocks(
             static_system_prefix, dynamic_system_suffix, prefix_cache_ttl
@@ -658,6 +708,7 @@ class ToolUseLoop:
             first_tool_choice=first_tool_choice,
             stop_after_round=stop_after_round,
             on_stream=guard_listener(on_stream, self._audit),
+            steer=steer,
         )
 
     async def resume(
@@ -684,6 +735,7 @@ class ToolUseLoop:
         stop_after_round: StopAfterRoundHook | None = None,
         on_stream: StreamListener | None = None,
         prefix_cache_ttl: Literal["1h"] | None = None,
+        steer: SteerHook | None = None,
     ) -> ToolLoopResult:
         """Resume a loop suspended by a confirm-required tool. `state` is the opaque
         dict from `PendingConfirmation.state` (may have been JSON round-tripped through
@@ -724,7 +776,11 @@ class ToolUseLoop:
         resolved pending call itself makes no model call.
 
         `prefix_cache_ttl` mirrors `run()` (v0.45.0, TBP T-7683) and must be re-supplied: the
-        system blocks are rebuilt here, not read from `state`."""
+        system blocks are rebuilt here, not read from `state`.
+
+        `steer` mirrors `run()` (TBP T-70375) and must be re-supplied: it is first asked right
+        before the model call that follows the resumed round (when the cap leaves a tool round).
+        Messages it returned before the suspend already ride `state["messages"]`."""
         # cache_history: no param — the run()-time history marker rides state["messages"].
         system_blocks = self._build_system_blocks(
             static_system_prefix, dynamic_system_suffix, prefix_cache_ttl
@@ -846,6 +902,7 @@ class ToolUseLoop:
             max_parallel_calls=max_parallel_calls,
             stop_after_round=stop_after_round,
             on_stream=guard_listener(on_stream, self._audit),
+            steer=steer,
         )
 
     async def _drive(  # noqa: C901, PLR0912 -- T-7219 empty-reply exits, T-7423a consumer stop
@@ -874,6 +931,7 @@ class ToolUseLoop:
         first_tool_choice: dict[str, Any] | None = None,
         stop_after_round: StopAfterRoundHook | None = None,
         on_stream: StreamListener | None = None,
+        steer: SteerHook | None = None,
     ) -> ToolLoopResult:
         """Shared round engine. `while rounds < max_rounds` (correct at the
         max_rounds=0 boundary — zero tool rounds, straight to the forced answer).
@@ -888,7 +946,12 @@ class ToolUseLoop:
 
         T-7423a: `stop_after_round` is consulted right after each `_commit_round` here (and
         in `resume()` after the resumed round commits), so it runs before the next loop
-        iteration's `pre_completion_hook` check and before the cap's forced-final call."""
+        iteration's `pre_completion_hook` check and before the cap's forced-final call.
+
+        T-70375: `steer` is asked inside the loop, after the `pre_completion_hook` check and
+        before the model call, only once a round has committed (`rounds > 0`; resume() enters
+        with its resumed round committed). The `while` condition already keeps it off the
+        forced-final call."""
         wrap_up_text: str | None = None
         cap_reached = False
         # T-7219 -- why a model call after a tool round came back empty ("no_content" =
@@ -901,6 +964,8 @@ class ToolUseLoop:
                 wrap_up_text = pre_completion_hook()
                 if wrap_up_text is not None:
                     break
+            if steer is not None and rounds > 0:
+                self._drain_steer(steer, messages, rounds=rounds, max_rounds=max_rounds)
             # T-7254a -- the forced choice rides the run's FIRST call only (rounds == 0 is
             # never reached again: resume() enters with rounds >= 1 and passes no choice).
             choice = (
@@ -1752,6 +1817,36 @@ class ToolUseLoop:
         return ToolLoopStep(
             assistant_text=d["assistant_text"],
             tool_calls=tuple(cls._call_from_dict(c) for c in d["tool_calls"]),
+        )
+
+    def _drain_steer(
+        self,
+        hook: SteerHook,
+        messages: list[dict[str, Any]],
+        *,
+        rounds: int,
+        max_rounds: int,
+    ) -> None:
+        """T-70375 -- ask the consumer's `steer` hook for the user messages that arrived while
+        the last round ran, and append each non-blank one as a text block to the trailing user
+        turn (the round's tool_results), in place. Nothing returned = nothing changes.
+
+        A bare `str` is a `Sequence[str]` too, so it passes a type checker: refused (TypeError)
+        instead of becoming one text block per character (R3 F1)."""
+        out = hook()
+        if isinstance(out, str):
+            msg = "SteerHook must return a sequence of strings, not a str"
+            raise TypeError(msg)
+        texts = [t for t in out if t.strip()]
+        if not texts:
+            return
+        _append_user_texts(messages, texts)
+        self._audit.info(
+            "tool_loop_steered",
+            round_index=rounds,
+            max_rounds=max_rounds,
+            messages=len(texts),
+            chars=sum(len(t) for t in texts),
         )
 
     def _consumer_stop(

@@ -27,6 +27,8 @@ Public surface:
   at ``max_tokens`` gets (none of them ran; TBP T-70372)
 - ``StopAfterRoundHook``, ``CONSUMER_STOP_REASON`` — end a run right after a committed tool
   round with no further model call (``run(..., stop_after_round=...)``, T-7423a)
+- ``SteerHook`` — hand the user messages that arrived while a tool round ran to the next model
+  call, after that round's tool results (``run(..., steer=...)``, TBP T-70375)
 - ``ToolRoundContext``, ``current_tool_round``, ``bind_tool_round`` — the executing round's
   index / remaining tool-round budget, readable by an executor with no signature change (T-115j),
   and the round's assistant text (T-7154);
@@ -101,6 +103,7 @@ from agent_runtime.llm.tool_loop import (
     PendingConfirmation,
     PreCompletionHook,
     ResumeDecision,
+    SteerHook,
     StopAfterRoundHook,
     ToolCall,
     ToolExecutor,
@@ -139,6 +142,7 @@ __all__ = [
     "PreCompletionHook",
     "PromptUsage",
     "ResumeDecision",
+    "SteerHook",
     "StopAfterRoundHook",
     "StreamEvent",
     "StreamListener",
