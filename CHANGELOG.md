@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.48.0 — 2026-11-20
+
+### Changed
+
+- **A tool that raises inside a concurrent batch becomes an `is_error` result instead of ending
+  the run** (TBP T-70373, from the 2026-11-20 pi harness review). With `parallel_safe` and
+  `max_parallel_calls >= 2` set (T-7092), a batch member whose executor raised used to make `_run_batch` re-raise the first one in `tool_use` order: its siblings'
+  results were thrown away and the turn ended. Now the member yields
+  `ToolResult(is_error=True)` whose text names the tool and the exception CLASS
+  (`_BATCH_CALL_FAILED_MARKER`, `[platform] [TOOL FAILED in agent-runtime: ...]`; never
+  `str(exc)`, which can carry a payload's SQL, paths or tokens), the siblings keep their
+  results, and the run goes on to the next model call with every `tool_result` in order. The
+  result passes through the usual text cap and image budget. This covers an `Exception`, a
+  child's own `CancelledError` (a future it awaited was cancelled) and a `BaseExceptionGroup`
+  (an anyio teardown group): cancelling the awaiting task makes `gather` itself raise, so a
+  cancellation among the per-child results is never the run's own, and re-raising it would
+  make the consumer's turn look cancelled. Outer cancellation is unchanged. Any other
+  `BaseException` that `gather` returns is re-raised as-is after every member settles. **The serial path is unchanged**: a lone call (writes included) that raises still
+  propagates out of `run()` / `resume()`, because a retried write could repeat a side effect;
+  batch members are read-only by the consumer's `parallel_safe` contract.
+- **Audit event renamed:** `tool_loop_parallel_sibling_error` (only the 2nd and later failures
+  of a batch) is replaced by `tool_loop_parallel_call_error`, one warning per member that
+  raised (`round_index`, `tool_use_id`, `tool_name`, `error` = class name). Parallelism off:
+  byte-for-byte unchanged.
+
 ## v0.47.0 — 2026-11-11
 
 ### Added

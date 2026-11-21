@@ -2780,9 +2780,28 @@ async def test_t7092_cap_one_or_none_is_serial():
     assert await _run_3reads(None, 4) == 1
 
 
+def _tool_results(request):
+    """The tool_result blocks of a request's LAST user message, as (id, is_error, text)."""
+    blocks = request["messages"][-1]["content"]
+    out = []
+    for b in blocks:
+        if b.get("type") != "tool_result":
+            continue
+        content = b["content"]
+        text = (
+            content
+            if isinstance(content, str)
+            else "".join(p.get("text", "") for p in content if p.get("type") == "text")
+        )
+        out.append((b["tool_use_id"], bool(b.get("is_error", False)), text))
+    return out
+
+
 @pytest.mark.asyncio
 async def test_t7092_first_exception_in_order_reraised_siblings_settle():
-    """T8: first exception in tool_use order is re-raised; k=3 settles (no orphan)."""
+    """T8 (inverted by T-70373): a member that raises becomes an is_error result naming the
+    tool and the exception class; siblings keep their results; the run goes on to the next
+    model call with every tool_result in tool_use order; k=3 settles (no orphan)."""
     fake_sdk = FakeAsyncAnthropic()
     loop, sdk = _make_loop(fake_sdk)
     sdk.messages.responses.append(
@@ -2792,13 +2811,94 @@ async def test_t7092_first_exception_in_order_reraised_siblings_settle():
             ("t3", "read_c", {"k": "3"}),
         )
     )
+    sdk.messages.responses.append(make_ok(text="answered anyway"))
 
     tracker = _Tracker(
         delays={"1": 0.1, "2": 0, "3": 0.2},
         raises={"1": ValueError("one"), "2": KeyError("two")},
     )
 
-    with pytest.raises(ValueError, match="one"):
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=tracker,
+        max_rounds=3,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+    )
+
+    assert result.final_text == "answered anyway"
+    assert "end:3" in tracker.events  # k=3 settled (not orphaned)
+    calls = result.steps[-1].tool_calls
+    assert [c.id for c in calls] == ["t1", "t2", "t3"]
+    assert [c.is_error for c in calls] == [True, True, False]
+    assert "read_a" in calls[0].result and "ValueError" in calls[0].result
+    assert "read_b" in calls[1].result and "KeyError" in calls[1].result
+    assert calls[2].result == "res:3"
+    sent = _tool_results(sdk.messages.captured_requests[1])
+    assert [(i, e) for i, e, _ in sent] == [("t1", True), ("t2", True), ("t3", False)]
+    assert sent[2][2] == "res:3"
+
+
+@pytest.mark.asyncio
+async def test_t70373_batch_error_text_never_carries_the_exception_message():
+    """T-70373: only the exception CLASS reaches the model; `str(exc)` may hold SQL, paths
+    or tokens from a payload, and the marker is first-party `[platform]` text."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        _round(("t1", "read_a", {"k": "1"}), ("t2", "read_b", {"k": "2"}))
+    )
+    sdk.messages.responses.append(make_ok(text="ok"))
+    tracker = _Tracker(raises={"1": RuntimeError("secret-token-42 /etc/passwd")})
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=tracker,
+        max_rounds=3,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+    )
+
+    failed = result.steps[-1].tool_calls[0]
+    assert failed.is_error is True
+    assert failed.result.startswith("[platform] [TOOL FAILED")
+    # tbp evidence_carry keys "[platform] Partial result" as a PARTIAL read -- never that.
+    assert not failed.result.startswith("[platform] Partial result")
+    assert "RuntimeError" in failed.result
+    assert "secret-token-42" not in repr(sdk.messages.captured_requests)
+    assert "/etc/passwd" not in repr(sdk.messages.captured_requests)
+
+
+@pytest.mark.asyncio
+async def test_t70373_non_exception_base_exception_still_escapes():
+    """T-70373: any BaseException `gather` returns that is not an Exception, a CancelledError
+    or a BaseExceptionGroup is re-raised after every member settles, as before; no further
+    model call is made. (KeyboardInterrupt / SystemExit never reach `gather`'s results: the
+    event loop re-raises them directly, so a custom subclass stands in.)"""
+
+    class _Fatal(BaseException):
+        pass
+
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        _round(
+            ("t1", "read_a", {"k": "1"}),
+            ("t2", "read_b", {"k": "2"}),
+            ("t3", "read_c", {"k": "3"}),
+        )
+    )
+    sdk.messages.responses.append(make_ok(text="never"))
+    tracker = _Tracker(
+        delays={"1": 0, "2": 0, "3": 0.1},
+        raises={"1": ValueError("converted"), "2": _Fatal()},
+    )
+
+    with pytest.raises(_Fatal):
         await loop.run(
             static_system_prefix="SYS",
             user_message="go",
@@ -2809,8 +2909,127 @@ async def test_t7092_first_exception_in_order_reraised_siblings_settle():
             max_parallel_calls=4,
         )
 
-    assert "end:3" in tracker.events  # k=3 settled (not orphaned)
-    # pytest.raises(ValueError) already guarantees it's not an ExceptionGroup
+    assert "end:3" in tracker.events  # siblings still settle before the raise
+    assert len(sdk.messages.captured_requests) == 1  # the run ended there
+
+
+@pytest.mark.asyncio
+async def test_t70373_child_local_cancellation_converts_not_reraised():
+    """T-70373 R3: a member whose OWN awaited future is cancelled by someone else (not this
+    run) ends with CancelledError, and a member raising an anyio-style teardown group ends with
+    a BaseExceptionGroup holding a CancelledError. Neither is the run being cancelled (that
+    makes `gather` itself raise), so both convert: re-raising them would make the consumer's
+    turn look cancelled with no reply. Siblings keep their results; the run goes on."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        _round(
+            ("t1", "read_a", {"k": "1"}),
+            ("t2", "read_b", {"k": "2"}),
+            ("t3", "read_c", {"k": "3"}),
+        )
+    )
+    sdk.messages.responses.append(make_ok(text="went on"))
+
+    async def executor(_name, inp):
+        if inp["k"] == "1":
+            fut = asyncio.get_running_loop().create_future()
+            asyncio.get_running_loop().call_soon(fut.cancel)  # a third party cancels it
+            await fut
+        if inp["k"] == "2":
+            raise BaseExceptionGroup("teardown", [asyncio.CancelledError()])
+        return ToolResult(content=f"res:{inp['k']}")
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=executor,
+        max_rounds=3,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+    )
+
+    assert result.final_text == "went on"
+    calls = result.steps[-1].tool_calls
+    assert [(c.id, c.is_error) for c in calls] == [("t1", True), ("t2", True), ("t3", False)]
+    assert "CancelledError" in calls[0].result
+    assert "BaseExceptionGroup" in calls[1].result
+    assert calls[2].result == "res:3"
+
+
+@pytest.mark.asyncio
+async def test_t70373_serial_raise_still_propagates():
+    """T-70373 is batch-only (owner decision): a serial call may be a write that raised
+    after a side effect, so it is never turned into a retryable is_error. An isolated
+    parallel-safe block also runs inline (A7c) and so still raises."""
+    for parallel_safe, rounds in (
+        (None, (("t1", "read_a", {"k": "1"}), ("t2", "read_b", {"k": "2"}))),
+        (_READS, (("t1", "read_a", {"k": "1"}), ("t2", "send_x", {"k": "2"}))),
+    ):
+        fake_sdk = FakeAsyncAnthropic()
+        loop, sdk = _make_loop(fake_sdk)
+        sdk.messages.responses.append(_round(*rounds))
+        sdk.messages.responses.append(make_ok(text="never"))
+        tracker = _Tracker(raises={"1": ValueError("serial")})
+        kwargs = {} if parallel_safe is None else {"parallel_safe": parallel_safe}
+        with pytest.raises(ValueError, match="serial"):
+            await loop.run(
+                static_system_prefix="SYS",
+                user_message="go",
+                tools=[],
+                executor=tracker,
+                max_rounds=3,
+                max_parallel_calls=4,
+                **kwargs,
+            )
+
+
+@pytest.mark.asyncio
+async def test_t70373_resume_batch_converts_too():
+    """T-70373: the reads AFTER an approved write run as a batch inside resume(); a raise
+    there converts exactly as in run()."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        _round(
+            ("t1", "send_email", {"k": "c"}),
+            ("t2", "read_c", {"k": "3"}),
+            ("t3", "read_d", {"k": "4"}),
+        )
+    )
+    tracker = _Tracker(raises={"3": OSError("boom")})
+    suspended = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=tracker,
+        max_rounds=3,
+        confirm=_CONFIRM_WRITES,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+    )
+    pc = suspended.pending_confirmation
+    assert pc is not None
+
+    sdk.messages.responses.append(make_ok(text="resumed"))
+    result = await loop.resume(
+        state=pc.state,
+        decision=ExecuteDecision(),
+        tools=[],
+        executor=tracker,
+        confirm=_CONFIRM_WRITES,
+        static_system_prefix="SYS",
+        max_rounds=3,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+    )
+
+    assert result.final_text == "resumed"
+    calls = result.steps[-1].tool_calls
+    assert [(c.id, c.is_error) for c in calls] == [("t1", False), ("t2", True), ("t3", False)]
+    assert "OSError" in calls[1].result
+    assert calls[2].result == "res:4"
 
 
 @pytest.mark.asyncio
@@ -3166,9 +3385,9 @@ async def test_t7092_confirm_cached_when_confirm_ends_a_parallel_run():
 
 
 async def test_t7092_extra_sibling_failures_are_logged_not_dropped():
-    """Opus review MEDIUM: only the first failure (tool_use order) is raised; every
-    later failing sibling is logged as `tool_loop_parallel_sibling_error` so the
-    evidence of a multi-failure batch is not silently lost."""
+    """Opus review MEDIUM, widened by T-70373: EVERY member that raises is logged as
+    `tool_loop_parallel_call_error` (the first one too, now that none is re-raised), so the
+    evidence of each converted failure is in the audit trail."""
     from agent_runtime.logging import NullAuditLogger
 
     class _RecLogger(NullAuditLogger):
@@ -3188,20 +3407,22 @@ async def test_t7092_extra_sibling_failures_are_logged_not_dropped():
             ("t3", "read_c", {"k": "3"}),
         )
     )
+    fake_sdk.messages.responses.append(make_ok(text="done"))
     tracker = _Tracker(raises={"1": ValueError("one"), "3": KeyError("three")})
 
-    with pytest.raises(ValueError, match="one"):
-        await loop.run(
-            static_system_prefix="SYS",
-            user_message="go",
-            tools=[],
-            executor=tracker,
-            max_rounds=3,
-            parallel_safe=_READS,
-            max_parallel_calls=4,
-        )
+    await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=[],
+        executor=tracker,
+        max_rounds=3,
+        parallel_safe=_READS,
+        max_parallel_calls=4,
+    )
 
-    sibling = [kw for msg, kw in rec.warnings if msg == "tool_loop_parallel_sibling_error"]
-    assert sibling == [
-        {"round_index": 1, "tool_use_id": "t3", "tool_name": "read_c", "error": "KeyError"}
+    logged = [kw for msg, kw in rec.warnings if msg == "tool_loop_parallel_call_error"]
+    assert logged == [
+        {"round_index": 1, "tool_use_id": "t1", "tool_name": "read_a", "error": "ValueError"},
+        {"round_index": 1, "tool_use_id": "t3", "tool_name": "read_c", "error": "KeyError"},
     ]
+    assert not [m for m, _ in rec.warnings if m == "tool_loop_parallel_sibling_error"]
