@@ -2959,6 +2959,84 @@ async def test_t70373_child_local_cancellation_converts_not_reraised():
 
 
 @pytest.mark.asyncio
+async def test_t70373_group_wrapping_a_process_exit_still_escapes():
+    """T-70373 (iav review F2): a BaseExceptionGroup that wraps a SystemExit or
+    KeyboardInterrupt (an anyio task group inside an executor puts a subtask's exit request
+    in a group, and the group DOES reach `gather`'s results) is re-raised after every member
+    settles, never converted: a process-exit request is not a tool failure."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        _round(
+            ("t1", "read_a", {"k": "1"}),
+            ("t2", "read_b", {"k": "2"}),
+            ("t3", "read_c", {"k": "3"}),
+        )
+    )
+    sdk.messages.responses.append(make_ok(text="never"))
+    tracker = _Tracker(
+        delays={"1": 0, "2": 0, "3": 0.1},
+        raises={
+            "1": ValueError("converted"),
+            "2": BaseExceptionGroup("teardown", [ValueError("x"), SystemExit(3)]),
+        },
+    )
+
+    with pytest.raises(BaseExceptionGroup) as excinfo:
+        await loop.run(
+            static_system_prefix="SYS",
+            user_message="go",
+            tools=[],
+            executor=tracker,
+            max_rounds=3,
+            parallel_safe=_READS,
+            max_parallel_calls=4,
+        )
+
+    assert excinfo.value.subgroup(SystemExit) is not None
+    assert "end:3" in tracker.events  # siblings still settle before the raise
+    assert len(sdk.messages.captured_requests) == 1  # the run ended there
+
+
+@pytest.mark.asyncio
+async def test_t70373_converted_call_is_logged_masked_with_its_raise_site(caplog):
+    """T-70373 (iav review F1): before v0.48.0 the raise reached the consumer's backstop,
+    which logged it. Now the library catches it, so it writes one stdlib warning per raising
+    member: tool, tool_use_id, exception class, the message through `mask_telemetry` (the
+    T-021a library rule, never raw `exc_info`) and the raise site (file:line)."""
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        _round(("t1", "read_a", {"k": "1"}), ("t2", "read_b", {"k": "2"}))
+    )
+    sdk.messages.responses.append(make_ok(text="went on"))
+    oid = "0f8fad5b-d9cb-469f-a165-70867728950e"
+    tracker = _Tracker(delays={"1": 0}, raises={"1": RuntimeError(f"graph 404 for user {oid}")})
+
+    with caplog.at_level("WARNING", logger="agent_runtime.llm.tool_loop"):
+        result = await loop.run(
+            static_system_prefix="SYS",
+            user_message="go",
+            tools=[],
+            executor=tracker,
+            max_rounds=3,
+            parallel_safe=_READS,
+            max_parallel_calls=4,
+        )
+
+    assert result.final_text == "went on"
+    records = [r for r in caplog.records if r.name == "agent_runtime.llm.tool_loop"]
+    assert len(records) == 1
+    msg = records[0].getMessage()
+    assert records[0].levelname == "WARNING"
+    assert records[0].exc_info is None  # masked text, not a raw traceback
+    assert msg.startswith("tool_loop_parallel_call_error")
+    assert "tool=read_a" in msg and "tool_use_id=t1" in msg and "RuntimeError" in msg
+    assert "graph 404 for user" in msg and oid not in msg
+    assert "test_tool_loop.py:" in msg  # the raise site: _Tracker's raise line
+
+
+@pytest.mark.asyncio
 async def test_t70373_serial_raise_still_propagates():
     """T-70373 is batch-only (owner decision): a serial call may be a write that raised
     after a side effect, so it is never turned into a retryable is_error. An isolated

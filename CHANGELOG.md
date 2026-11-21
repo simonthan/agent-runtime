@@ -17,13 +17,19 @@
   (an anyio teardown group): cancelling the awaiting task makes `gather` itself raise, so a
   cancellation among the per-child results is never the run's own, and re-raising it would
   make the consumer's turn look cancelled. Outer cancellation is unchanged. Any other
-  `BaseException` that `gather` returns is re-raised as-is after every member settles. **The serial path is unchanged**: a lone call (writes included) that raises still
+  `BaseException` that `gather` returns is re-raised as-is after every member settles, and so
+is a `BaseExceptionGroup` that wraps a `SystemExit` / `KeyboardInterrupt` (a process-exit
+request, not a tool failure). **The serial path is unchanged**: a lone call (writes included) that raises still
   propagates out of `run()` / `resume()`, because a retried write could repeat a side effect;
   batch members are read-only by the consumer's `parallel_safe` contract.
 - **Audit event renamed:** `tool_loop_parallel_sibling_error` (only the 2nd and later failures
   of a batch) is replaced by `tool_loop_parallel_call_error`, one warning per member that
   raised (`round_index`, `tool_use_id`, `tool_name`, `error` = class name). Parallelism off:
   byte-for-byte unchanged.
+- **The raise is logged in the library:** it no longer reaches the consumer's own error log,
+  so each converted member also writes one stdlib warning on `agent_runtime.llm.tool_loop`
+  (`tool_loop_parallel_call_error tool=... tool_use_id=... error=<class> at=<file:line>:
+  <message>`), with the message through `mask_telemetry` and no raw traceback (T-021a rule).
 
 ## v0.47.0 — 2026-11-11
 

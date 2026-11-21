@@ -39,7 +39,9 @@ byte-for-byte unchanged.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
+import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal, cast
@@ -60,7 +62,10 @@ from agent_runtime.llm.streaming import (
     guard_listener,
 )
 from agent_runtime.logging import AuditLogger, NullAuditLogger
+from agent_runtime.safety.data_masker import mask_telemetry
 from agent_runtime.safety.prompt_sanitizer import repair_clipped_tool_result
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "CONSUMER_STOP_REASON",
@@ -122,6 +127,15 @@ _BATCH_CALL_FAILED_MARKER = (
     "unaffected; retry this call or answer without it, and say so if that leaves the answer "
     "incomplete.]"
 )
+
+
+def _wraps_process_exit(item: BaseException) -> bool:
+    """T-70373: a BaseExceptionGroup holding a SystemExit / KeyboardInterrupt (at any depth)
+    is a process-exit request, not a tool failure: `_run_batch` re-raises it."""
+    return (
+        isinstance(item, BaseExceptionGroup)
+        and item.subgroup((KeyboardInterrupt, SystemExit)) is not None
+    )
 
 
 def _decoded_b64_len(data_b64: str) -> int:
@@ -1242,8 +1256,9 @@ class ToolUseLoop:
         raise and never returns per-child results. Re-raising a child's CancelledError would
         make the consumer's turn look cancelled while nothing cancels it (a silent turn).
         Any other BaseException that `gather` returns is re-raised as-is, the first in batch
-        order, never an ExceptionGroup (KeyboardInterrupt / SystemExit never get here: the
-        event loop re-raises them directly)."""
+        order, never an ExceptionGroup (a bare KeyboardInterrupt / SystemExit never gets here:
+        the event loop re-raises it directly; a BaseExceptionGroup that wraps one, e.g. from an
+        anyio task group inside the executor, is re-raised, not converted)."""
         sem = asyncio.Semaphore(limit)
 
         async def one(tu: dict[str, Any]) -> ToolResult:
@@ -1266,9 +1281,22 @@ class ToolUseLoop:
         for tu, item in zip(batch, settled, strict=True):
             if not isinstance(item, BaseException):
                 results.append(item)
-            elif isinstance(item, (Exception, asyncio.CancelledError, BaseExceptionGroup)):
+            elif isinstance(
+                item, (Exception, asyncio.CancelledError, BaseExceptionGroup)
+            ) and not _wraps_process_exit(item):
                 # The child's own failure or cancellation (see docstring): never this task's.
                 error = type(item).__name__
+                # The raise no longer reaches the consumer's backstop log, so log it here:
+                # masked text + raise site, never raw exc_info (T-021a library rule).
+                frames = traceback.extract_tb(item.__traceback__)
+                logger.warning(
+                    "tool_loop_parallel_call_error tool=%s tool_use_id=%s error=%s at=%s: %s",
+                    tu["name"],
+                    tu["id"],
+                    error,
+                    f"{frames[-1].filename}:{frames[-1].lineno}" if frames else "?",
+                    mask_telemetry(str(item)),
+                )
                 self._audit.warning(
                     "tool_loop_parallel_call_error",
                     round_index=round_index,
