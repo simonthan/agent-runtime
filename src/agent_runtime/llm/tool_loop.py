@@ -129,6 +129,11 @@ _BATCH_CALL_FAILED_MARKER = (
 )
 
 
+# Exception text in the batch log line is cut to this many characters before masking (it can
+# hold a whole HTTP response body).
+_BATCH_LOG_MESSAGE_MAX = 1000
+
+
 def _wraps_process_exit(item: BaseException) -> bool:
     """T-70373: a BaseExceptionGroup holding a SystemExit / KeyboardInterrupt (at any depth)
     is a process-exit request, not a tool failure: `_run_batch` re-raises it."""
@@ -1289,13 +1294,17 @@ class ToolUseLoop:
                 # The raise no longer reaches the consumer's backstop log, so log it here:
                 # masked text + raise site, never raw exc_info (T-021a library rule).
                 frames = traceback.extract_tb(item.__traceback__)
+                try:  # this log line must never break the batch it reports on
+                    detail = mask_telemetry(str(item)[:_BATCH_LOG_MESSAGE_MAX])
+                except Exception:  # noqa: BLE001 - an exception whose __str__ raises
+                    detail = "<unprintable>"
                 logger.warning(
                     "tool_loop_parallel_call_error tool=%s tool_use_id=%s error=%s at=%s: %s",
                     tu["name"],
                     tu["id"],
                     error,
                     f"{frames[-1].filename}:{frames[-1].lineno}" if frames else "?",
-                    mask_telemetry(str(item)),
+                    detail,
                 )
                 self._audit.warning(
                     "tool_loop_parallel_call_error",

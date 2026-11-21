@@ -3037,6 +3037,43 @@ async def test_t70373_converted_call_is_logged_masked_with_its_raise_site(caplog
 
 
 @pytest.mark.asyncio
+async def test_t70373_unprintable_exception_still_converts(caplog):
+    """T-70373 (iav re-review): the library's log line must never break the batch. An
+    exception whose `__str__` raises still converts (and logs `<unprintable>`); siblings keep
+    their results and the run goes on."""
+
+    class _UnprintableError(Exception):
+        def __str__(self):
+            raise RuntimeError("no str")
+
+    fake_sdk = FakeAsyncAnthropic()
+    loop, sdk = _make_loop(fake_sdk)
+    sdk.messages.responses.append(
+        _round(("t1", "read_a", {"k": "1"}), ("t2", "read_b", {"k": "2"}))
+    )
+    sdk.messages.responses.append(make_ok(text="went on"))
+    tracker = _Tracker(delays={"1": 0}, raises={"1": _UnprintableError()})
+
+    with caplog.at_level("WARNING", logger="agent_runtime.llm.tool_loop"):
+        result = await loop.run(
+            static_system_prefix="SYS",
+            user_message="go",
+            tools=[],
+            executor=tracker,
+            max_rounds=3,
+            parallel_safe=_READS,
+            max_parallel_calls=4,
+        )
+
+    assert result.final_text == "went on"
+    calls = result.steps[-1].tool_calls
+    assert [(c.id, c.is_error) for c in calls] == [("t1", True), ("t2", False)]
+    assert "_UnprintableError" in calls[0].result
+    msgs = [r.getMessage() for r in caplog.records if r.name == "agent_runtime.llm.tool_loop"]
+    assert len(msgs) == 1 and msgs[0].endswith("<unprintable>")
+
+
+@pytest.mark.asyncio
 async def test_t70373_serial_raise_still_propagates():
     """T-70373 is batch-only (owner decision): a serial call may be a write that raised
     after a side effect, so it is never turned into a retryable is_error. An isolated
