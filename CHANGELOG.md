@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.50.0 — 2026-11-21
+
+### Added
+
+- **`ToolUseLoop.run(steer=...)` / `resume(steer=...)`: hand the user messages that arrived
+  while a tool round ran to the next model call** (TBP T-70375, from the 2026-11-20 pi harness
+  review). A consumer that runs one turn at a time had no way to put a correction typed
+  mid-turn into the running run: it could only queue it behind the turn. With
+  `steer: SteerHook` (`Callable[[], Sequence[str]]`, exported from `agent_runtime.llm`) the
+  loop calls the hook right before each model call that follows a committed tool round and
+  still offers tools, and appends each non-blank string it returns as a text block to the
+  trailing user turn, after that round's tool_results, in the live messages (later rounds and a
+  suspend `state` keep it). One `tool_loop_steered` info line per non-empty drain
+  (`round_index`, `max_rounds`, `messages`, `chars`; never the text). The hook is never asked
+  for the run's first call, the round cap's forced-final call, a call after a
+  `pre_completion_hook` wrap-up, or once `stop_after_round` ended the run, so a message it was
+  never asked for stays the consumer's. A v0.49.0 cut round (a reply cut at `max_tokens` with
+  tool calls) is a committed round, so steering follows it too. The loop adds no framing; the
+  consumer's text is used as given (sanitize it like the first message). A raising hook
+  propagates; a hook that returns a bare `str` raises `TypeError` instead of being split into
+  one block per character. Nothing is added to `ToolLoopResult`, `ToolLoopStep` or the suspend
+  state. Default None: byte-for-byte unchanged.
+
 ## v0.49.0 — 2026-11-21
 
 ### Changed
