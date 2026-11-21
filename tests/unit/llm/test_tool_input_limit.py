@@ -374,11 +374,14 @@ async def test_the_watch_starts_over_on_the_stream_retry() -> None:
     assert resp.tool_input_report is None
 
 
-async def test_the_loop_ends_on_a_stopped_call_and_runs_no_tool() -> None:
+async def test_the_loop_fails_a_stopped_call_back_and_runs_no_tool() -> None:
+    """TBP T-70372: the stopped call is a failed round (it used to end the run); its result
+    names why the call was stopped, and the model's next reply is the answer."""
     fake = FakeAsyncAnthropic()
     fake.messages.responses.append(
         _runaway('{"message_id":"m1","attachment_id":"' + "A" * 60_000, text="On it.")
     )
+    fake.messages.responses.append(make_ok(text="I could not read that attachment id."))
     ran: list[str] = []
 
     async def executor(name: str, _input: dict[str, Any]) -> ToolResult:
@@ -393,9 +396,16 @@ async def test_the_loop_ends_on_a_stopped_call_and_runs_no_tool() -> None:
         executor=executor,
         max_rounds=4,
     )
-    assert result.stop_reason == "max_tokens"
     assert ran == []
-    assert result.final_text == "On it."
+    assert result.stop_reason == "end_turn"
+    assert result.final_text == "I could not read that attachment id."
+    (step,) = result.steps
+    assert step.assistant_text == "On it."
+    (call,) = step.tool_calls
+    assert call.is_error is True
+    assert call.input == {"message_id": "m1"}  # the open string is dropped
+    assert "a string argument of its last call ran past the length limit" in call.result
+    assert "output token limit" not in call.result
 
 
 # -- the real SDK stream --------------------------------------------------------------------

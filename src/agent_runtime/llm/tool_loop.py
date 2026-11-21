@@ -30,6 +30,17 @@ work is done, so the loop returns AT ONCE with that string as ``final_text`` and
 ``stop_reason == CONSUMER_STOP_REASON`` -- no further model call, not even the no-tools
 forced-final one. Default ``None`` = byte-for-byte unchanged.
 
+Cut reply (TBP T-70372): a model call that stops at ``max_tokens`` while it carries tool calls
+does NOT end the run. The arguments of its last call may be incomplete (the SDK's partial JSON
+parse can still validate), so no call of that reply runs: the assistant turn is appended as it
+was generated and every call gets an ``is_error`` tool_result that says so and asks the model to
+re-issue the calls it still needs, shorter. The round counts against ``max_rounds`` like any
+other (the cap bounds the retries), the executor and ``confirm`` are never called for it, and
+one ``tool_loop_cut_tool_calls`` audit warning is logged. A call that ``AnthropicClient``'s
+``ToolInputLimit`` stopped early comes back the same way, its reason in the result. A
+``max_tokens`` reply with no tool call still ends the run (``stop_reason == "max_tokens"``).
+Always on: there is no switch.
+
 Streaming (TBP T-316b): ``run(..., on_stream=listener)`` / ``resume(...)`` stream every model
 call and report ``ModelCallStarted`` / ``TextDelta`` / ``ToolUseStarted`` / ``ModelCallEnded``
 events (``agent_runtime.llm.streaming``). The result is unchanged. Default ``None`` =
@@ -61,6 +72,7 @@ from agent_runtime.llm.streaming import (
     StreamListener,
     guard_listener,
 )
+from agent_runtime.llm.tool_input import KEY_TOO_LONG, STRING_TOO_LONG, WHITESPACE_RUN
 from agent_runtime.logging import AuditLogger, NullAuditLogger
 from agent_runtime.safety.data_masker import mask_telemetry
 from agent_runtime.safety.prompt_sanitizer import repair_clipped_tool_result
@@ -69,6 +81,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "CONSUMER_STOP_REASON",
+    "CUT_REPLY_RESULT_PREFIX",
     "EMPTY_RESPONSE_STOP_REASON",
     "ConfirmPredicate",
     "ExecuteDecision",
@@ -101,6 +114,42 @@ _TRUNCATION_MARKER = (
     "characters were removed from the end. This is a PARTIAL result — do not assume "
     "it is complete, and do not treat the omitted content as unimportant.]"
 )
+
+# TBP T-70372 -- the tool_result of EVERY call in a reply cut at `max_tokens`: none of them ran.
+# `[platform]` provenance, exactly like _TRUNCATION_MARKER: first-party text that never passes
+# the sanitizer. `{why}` is _CUT_AT_CAP, or the ToolInputLimit reason (_CUT_EARLY) when the
+# client stopped the reply early. States the true outcome (nothing ran) and how to fix the call;
+# never "shorten the content" (R3 F2: a long deliverable trimmed to fit would ship cut).
+# CUT_REPLY_RESULT_PREFIX is public so a consumer can tell such a call from one that ran and
+# failed (a first-party marker, the way it already reads its own not-run notes).
+CUT_REPLY_RESULT_PREFIX = "[platform] [NOT RUN BY agent-runtime:"
+_CUT_REPLY_RESULT = (
+    CUT_REPLY_RESULT_PREFIX + " your reply was cut off before it was complete ({why}), so none "
+    "of the tool calls in it was run and nothing happened. The arguments of its last call may be "
+    "incomplete. Re-issue each call you still need: write less text before it, make fewer calls "
+    "in one reply, or split a long argument across several calls. Do not shorten content the "
+    "user asked for; if it cannot fit, say so.]"
+)
+_CUT_AT_CAP = "it reached the output token limit"
+_CUT_EARLY = {
+    WHITESPACE_RUN: "the arguments of its last call filled with blank space",
+    STRING_TOO_LONG: "a string argument of its last call ran past the length limit",
+    KEY_TOO_LONG: "an argument name of its last call never ended",
+}
+_MAX_TOKENS_STOP_REASON = "max_tokens"
+
+
+def _stopped_early(resp: Any) -> str | None:
+    """T-70372 -- the ToolInputLimit reason a cut reply was stopped for, else None."""
+    stopped = getattr(getattr(resp, "tool_input_report", None), "stopped", None)
+    return stopped if isinstance(stopped, str) else None
+
+
+def _cut_reply_result(stopped: str | None) -> str:
+    """T-70372 -- the tool_result text for the calls of a reply cut at `max_tokens`."""
+    why = _CUT_AT_CAP if stopped is None else _CUT_EARLY.get(stopped, _CUT_AT_CAP)
+    return _CUT_REPLY_RESULT.format(why=why)
+
 
 # Appended to a tool result whose images were dropped by the per-turn image budget.
 # EXPLICIT by design, exactly like _TRUNCATION_MARKER: a model told nothing will answer
@@ -277,7 +326,8 @@ class ToolLoopResult:
 
     final_text: str
     # last stop_reason, "cap_exhausted", "pending_confirmation", (T-7219, opt-in)
-    # EMPTY_RESPONSE_STOP_REASON, or (T-7423a, opt-in) CONSUMER_STOP_REASON
+    # EMPTY_RESPONSE_STOP_REASON, or (T-7423a, opt-in) CONSUMER_STOP_REASON. Since TBP T-70372
+    # "max_tokens" means a reply cut in its TEXT: a reply cut with tool calls is a failed round.
     stop_reason: str
     cap_exhausted: bool
     steps: tuple[ToolLoopStep, ...]
@@ -469,6 +519,11 @@ class ToolUseLoop:
         call), plus at most ONE empty-reply recovery call when the loop was built with
         `empty_final_nudge` (T-7219). With `confirm=None` (default) behaviour is
         byte-for-byte unchanged.
+
+        CONTRACT (TBP T-70372): a reply that stops at `max_tokens` with tool calls is a ROUND
+        whose calls all fail (`is_error`, nothing runs, `confirm` is not asked) and the run goes
+        on; it counts against `max_rounds`. So `stop_reason == "max_tokens"` now always means a
+        reply cut in its text, and `steps` may hold a round whose every call is that failure.
 
         CONTRACT (T-7219): with `empty_final_nudge` set, `final_text` MAY be empty with
         `stop_reason == EMPTY_RESPONSE_STOP_REASON` (`cap_exhausted` False): a model call
@@ -867,6 +922,21 @@ class ToolUseLoop:
             )
             if empty_cause is not None:
                 break
+            if resp.stop_reason == _MAX_TOKENS_STOP_REASON and resp.tool_use:
+                # T-70372 -- a reply cut with tool calls: a round whose every call fails.
+                rounds += 1
+                self._fail_cut_round(
+                    resp,
+                    rounds=rounds,
+                    max_rounds=max_rounds,
+                    messages=messages,
+                    steps=steps,
+                    cache_tool_rounds=cache_tool_rounds,
+                )
+                stopped = self._consumer_stop(stop_after_round, rounds, max_rounds, steps, agg)
+                if stopped is not None:
+                    return stopped
+                continue
             if resp.stop_reason != "tool_use" or not resp.tool_use:
                 return self._result(
                     resp.content, resp.stop_reason, cap_exhausted=False, steps=steps, agg=agg
@@ -965,6 +1035,52 @@ class ToolUseLoop:
             max_tokens=max_tokens,
             temperature=temperature,
             on_stream=on_stream,
+        )
+
+    def _fail_cut_round(
+        self,
+        resp: Any,
+        *,
+        rounds: int,
+        max_rounds: int,
+        messages: list[dict[str, Any]],
+        steps: list[ToolLoopStep],
+        cache_tool_rounds: bool,
+    ) -> None:
+        """T-70372 -- commit a reply cut at `max_tokens` with tool calls as a round in which no
+        call ran: the assistant turn as generated, and an `is_error` tool_result per call
+        (`_cut_reply_result`). The executor and `confirm` are never called: the last call's
+        arguments may be incomplete and still parse. A non-dict input (never seen; the API
+        requires an object) is echoed as `{}`."""
+        stopped = _stopped_early(resp)
+        text = _cut_reply_result(stopped)
+        calls = [
+            ToolCall(
+                id=tu.id,
+                name=tu.name,
+                input=tu.input if isinstance(tu.input, dict) else {},
+                result=text,
+                is_error=True,
+            )
+            for tu in resp.tool_use
+        ]
+        tool_uses = [{"id": c.id, "name": c.name, "input": c.input} for c in calls]
+        self._commit_round(
+            messages=messages,
+            steps=steps,
+            assistant_text=resp.content,
+            tool_uses=tool_uses,
+            calls=calls,
+            cache_tool_rounds=cache_tool_rounds,
+        )
+        self._audit.warning(
+            "tool_loop_cut_tool_calls",
+            round_index=rounds,
+            max_rounds=max_rounds,
+            calls=len(calls),
+            tool_names=[c.name for c in calls],
+            stopped_early=stopped,
+            output_tokens=resp.output_tokens,
         )
 
     async def _complete(
@@ -1471,7 +1587,9 @@ class ToolUseLoop:
         record the step. Anthropic requires a tool_result for every tool_use; `calls`
         is complete + in tool_use order here."""
         assistant_blocks: list[dict[str, Any]] = []
-        if assistant_text:
+        # A whitespace-only text block 400s the next call ("text content blocks must
+        # contain non-whitespace text"); the step below still keeps the text as generated.
+        if assistant_text.strip():
             assistant_blocks.append({"type": "text", "text": assistant_text})
         assistant_blocks.extend(
             {"type": "tool_use", "id": tu["id"], "name": tu["name"], "input": tu["input"]}

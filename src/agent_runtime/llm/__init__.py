@@ -23,6 +23,8 @@ Public surface:
 - ``ParallelSafePredicate`` — opt-in concurrent tool calls (T-7092)
 - ``EMPTY_RESPONSE_STOP_REASON`` — stop_reason of a turn whose model call came back empty
   after a tool round, twice (``ToolUseLoop(empty_final_nudge=...)``, T-7219)
+- ``CUT_REPLY_RESULT_PREFIX`` -- the start of the ``is_error`` result every call of a reply cut
+  at ``max_tokens`` gets (none of them ran; TBP T-70372)
 - ``StopAfterRoundHook``, ``CONSUMER_STOP_REASON`` — end a run right after a committed tool
   round with no further model call (``run(..., stop_after_round=...)``, T-7423a)
 - ``ToolRoundContext``, ``current_tool_round``, ``bind_tool_round`` — the executing round's
@@ -90,6 +92,7 @@ from agent_runtime.llm.streaming import (
 from agent_runtime.llm.tool_input import ToolInputLimit, ToolInputReport, ToolInputScanner
 from agent_runtime.llm.tool_loop import (
     CONSUMER_STOP_REASON,
+    CUT_REPLY_RESULT_PREFIX,
     EMPTY_RESPONSE_STOP_REASON,
     ConfirmPredicate,
     ExecuteDecision,
@@ -111,6 +114,7 @@ __all__ = [
     "ANTHROPIC_IMAGE_MEDIA_TYPES",
     "ANTI_RETRACTION_INSTRUCTIONS",
     "CONSUMER_STOP_REASON",
+    "CUT_REPLY_RESULT_PREFIX",
     "EMPTY_RESPONSE_STOP_REASON",
     "GROUNDED_DELIVERY_INSTRUCTIONS",
     "AnthropicClient",
