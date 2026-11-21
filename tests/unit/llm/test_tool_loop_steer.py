@@ -44,7 +44,7 @@ async def _execute(name: str, _inp: dict[str, Any]) -> ToolResult:
 
 
 def _loop(
-    *responses: FakeMessage, audit: RecordingAudit | None = None
+    *responses: FakeMessage, audit: RecordingAudit | None = None, nudge: str | None = None
 ) -> tuple[ToolUseLoop, list[list[dict[str, Any]]]]:
     """The loop, plus each request's `messages` AS SENT (the loop mutates the live list later)."""
     sdk = FakeAsyncAnthropic()
@@ -57,7 +57,8 @@ def _loop(
         return await create(**kwargs)
 
     sdk.messages.create = snapshot_create  # type: ignore[method-assign]
-    return ToolUseLoop(client=AnthropicClient(client=sdk), audit_logger=audit), sent  # type: ignore[arg-type]
+    client = AnthropicClient(client=sdk)  # type: ignore[arg-type]
+    return ToolUseLoop(client=client, audit_logger=audit, empty_final_nudge=nudge), sent
 
 
 async def _run(loop: ToolUseLoop, *, max_rounds: int = 5, **kw: Any) -> Any:
@@ -298,3 +299,27 @@ async def test_steering_follows_a_cut_round() -> None:
     last = sent[1][-1]["content"]
     assert [b["type"] for b in last] == ["tool_result", "text"]
     assert last[0]["is_error"] is True and last[1]["text"] == "actually order 2"
+
+
+async def test_empty_reply_recovery_after_a_drain_puts_the_nudge_after_the_steered_text() -> None:
+    """iav review -- T-7219: the call after a drain comes back empty; the one recovery call ends
+    [tool_result, steered text, nudge], and the drained request itself carries no nudge."""
+    from .fakes import FakeUsage
+
+    empty = FakeMessage(
+        content=[], model="claude-sonnet-4-6", stop_reason="end_turn", usage=FakeUsage(7, 2)
+    )
+    loop, sent = _loop(
+        make_tool_use(tool_id="t1", name="read"),
+        empty,
+        make_ok(text="ok"),
+        nudge="[platform] answer now",
+    )
+    result = await _run(loop, steer=_Steer(["actually order 2"]))
+    assert result.final_text == "ok"
+    assert len(sent) == 3
+    drained, recovery = sent[1][-1]["content"], sent[2][-1]["content"]
+    assert [b["type"] for b in drained] == ["tool_result", "text"]
+    assert drained[1]["text"] == "actually order 2"
+    assert [b.get("text") for b in recovery[1:]] == ["actually order 2", "[platform] answer now"]
+    assert recovery[0]["type"] == "tool_result"
