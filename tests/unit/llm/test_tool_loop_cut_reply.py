@@ -369,6 +369,24 @@ async def test_a_cut_reply_with_no_text_echoes_only_its_tool_calls() -> None:
     assert result.steps[0].assistant_text == ""
 
 
+async def test_a_cut_reply_with_only_blank_text_echoes_no_text_block() -> None:
+    # The API rejects a text block that holds only whitespace, which would 400 the
+    # follow-up call; the step still records the text as generated (iav review).
+    loop, sdk = _loop(_cut(_block(q="x"), text="\n\n"), make_ok(text="ok"))
+
+    result = await loop.run(
+        static_system_prefix="SYS",
+        user_message="go",
+        tools=TOOLS,
+        executor=_Executor(),
+        max_rounds=4,
+    )
+
+    assistant = sdk.messages.captured_requests[1]["messages"][-2]
+    assert [b["type"] for b in assistant["content"]] == ["tool_use"]
+    assert result.steps[0].assistant_text == "\n\n"
+
+
 async def test_the_cache_marker_moves_onto_the_cut_round() -> None:
     loop, sdk = _loop(
         make_tool_use(tool_id="tu_1", tool_input={"q": "a"}),

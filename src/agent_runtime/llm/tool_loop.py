@@ -1587,7 +1587,9 @@ class ToolUseLoop:
         record the step. Anthropic requires a tool_result for every tool_use; `calls`
         is complete + in tool_use order here."""
         assistant_blocks: list[dict[str, Any]] = []
-        if assistant_text:
+        # A whitespace-only text block 400s the next call ("text content blocks must
+        # contain non-whitespace text"); the step below still keeps the text as generated.
+        if assistant_text.strip():
             assistant_blocks.append({"type": "text", "text": assistant_text})
         assistant_blocks.extend(
             {"type": "tool_use", "id": tu["id"], "name": tu["name"], "input": tu["input"]}
