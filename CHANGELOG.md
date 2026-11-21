@@ -21,6 +21,13 @@
   `tool_names`, `stopped_early`, `output_tokens`). `stop_reason == "max_tokens"` now always
   means a reply cut in its text, which still ends the run as before. Always on: no switch.
 
+### Fixed
+
+- **A round whose text is only whitespace no longer sends that text back as a block.** The API
+  rejects a whitespace-only text block, so the next model call would fail with a 400; a cut reply
+  is the likeliest way to reach it. `ToolLoopStep.assistant_text` still holds the text as
+  generated (TBP T-70372 iav review).
+
 ## v0.48.0 — 2026-11-20
 
 ### Changed
