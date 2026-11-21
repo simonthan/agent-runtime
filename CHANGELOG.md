@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.49.0 — 2026-11-21
+
+### Changed
+
+- **A reply cut at `max_tokens` with tool calls fails its calls back to the model instead of
+  ending the run** (TBP T-70372, from the 2026-11-20 pi harness review). `ToolUseLoop` used to
+  end the run on any stop reason but `tool_use`, so a reply that hit the output cap (or was
+  stopped early by `ToolInputLimit`, v0.47.0) while writing a tool call came back as the answer,
+  cut off, and its calls were dropped. Now that reply is a round in which no call runs: the
+  assistant turn is appended as generated and EVERY call gets an `is_error` tool_result
+  (`[platform] [NOT RUN BY agent-runtime: ...]`, naming the `ToolInputLimit` bound when one
+  stopped it) that asks the model to re-issue what it still needs (less text before it, fewer
+  calls, a long argument split up; never shortening content the user asked for). The marker's
+  start is public as `CUT_REPLY_RESULT_PREFIX`, so a consumer can tell a call that never ran
+  from one that ran and failed. The executor and
+  `confirm` are never called for it (the last call's arguments may be incomplete and still
+  parse). The round counts against `max_rounds`, `stop_after_round` is asked after it, and one
+  `tool_loop_cut_tool_calls` audit warning is logged (`round_index`, `max_rounds`, `calls`,
+  `tool_names`, `stopped_early`, `output_tokens`). `stop_reason == "max_tokens"` now always
+  means a reply cut in its text, which still ends the run as before. Always on: no switch.
+
 ## v0.48.0 — 2026-11-20
 
 ### Changed
