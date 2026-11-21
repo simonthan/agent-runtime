@@ -39,7 +39,9 @@ byte-for-byte unchanged.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
+import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal, cast
@@ -60,7 +62,10 @@ from agent_runtime.llm.streaming import (
     guard_listener,
 )
 from agent_runtime.logging import AuditLogger, NullAuditLogger
+from agent_runtime.safety.data_masker import mask_telemetry
 from agent_runtime.safety.prompt_sanitizer import repair_clipped_tool_result
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "CONSUMER_STOP_REASON",
@@ -110,6 +115,34 @@ _IMAGES_DROPPED_MARKER = (
 )
 
 
+# T-70373: the result of a concurrent-batch member whose executor RAISED. pi's
+# rule (every tool call gets a result): the siblings keep their real results and the run goes
+# on, instead of the first raise discarding the whole round and ending the turn. Names the tool
+# and the exception CLASS only -- never `str(exc)`, which can carry a payload's SQL, paths or
+# tokens under this first-party `[platform]` prefix. Must not start with "[platform] Partial
+# result" (TBP evidence_carry reads that prefix as a partial read).
+_BATCH_CALL_FAILED_MARKER = (
+    "[platform] [TOOL FAILED in agent-runtime: the call to {tool} raised {error} and returned "
+    "no result. Do not guess what it would have returned. The other calls in this round are "
+    "unaffected; retry this call or answer without it, and say so if that leaves the answer "
+    "incomplete.]"
+)
+
+
+# Exception text in the batch log line is cut to this many characters before masking (it can
+# hold a whole HTTP response body).
+_BATCH_LOG_MESSAGE_MAX = 1000
+
+
+def _wraps_process_exit(item: BaseException) -> bool:
+    """T-70373: a BaseExceptionGroup holding a SystemExit / KeyboardInterrupt (at any depth)
+    is a process-exit request, not a tool failure: `_run_batch` re-raises it."""
+    return (
+        isinstance(item, BaseExceptionGroup)
+        and item.subgroup((KeyboardInterrupt, SystemExit)) is not None
+    )
+
+
 def _decoded_b64_len(data_b64: str) -> int:
     """Decoded byte length of standard base64, computed WITHOUT decoding.
 
@@ -143,7 +176,9 @@ class ToolResult:
     images: tuple[LLMImage, ...] = ()
 
 
-# (tool_name, tool_input) -> ToolResult. Must not raise for expected failures.
+# (tool_name, tool_input) -> ToolResult. Must not raise for expected failures. An unexpected
+# raise from a member of a concurrent batch (T-7092) is returned to the model as an is_error
+# result (T-70373); a serial call's raise propagates out of run()/resume().
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[ToolResult]]
 # (tool_name, tool_input) -> True if this call must be confirmed before dispatch.
 ConfirmPredicate = Callable[[str, dict[str, Any]], bool]
@@ -1212,9 +1247,23 @@ class ToolUseLoop:
     ) -> list[ToolResult]:
         """Execute `batch` concurrently, at most `limit` in flight; return outcomes in
         `batch` order (T-7092). Every member settles before this returns or raises — no
-        orphaned tasks. The FIRST exception in batch order is re-raised as-is (the same
-        type the serial loop would raise; never an ExceptionGroup). Outer cancellation
-        propagates into every member via `gather`."""
+        orphaned tasks. Outer cancellation propagates into every member via `gather`.
+
+        T-70373: a member that raised an `Exception`, a `CancelledError` or a
+        `BaseExceptionGroup` yields an is_error `ToolResult` (`_BATCH_CALL_FAILED_MARKER`:
+        tool name + exception class, never the message) and one
+        `tool_loop_parallel_call_error` warning; its siblings keep their results. Batch
+        members are read-only by the consumer's `parallel_safe` contract, so a model retry
+        is harmless — which is why the SERIAL path (writes included) still propagates.
+
+        A cancellation in `settled` is always the CHILD's own (a future it awaited was
+        cancelled, an anyio teardown group): cancelling THIS task makes `gather` itself
+        raise and never returns per-child results. Re-raising a child's CancelledError would
+        make the consumer's turn look cancelled while nothing cancels it (a silent turn).
+        Any other BaseException that `gather` returns is re-raised as-is, the first in batch
+        order, never an ExceptionGroup (a bare KeyboardInterrupt / SystemExit never gets here:
+        the event loop re-raises it directly; a BaseExceptionGroup that wraps one, e.g. from an
+        anyio task group inside the executor, is re-raised, not converted)."""
         sem = asyncio.Semaphore(limit)
 
         async def one(tu: dict[str, Any]) -> ToolResult:
@@ -1232,25 +1281,44 @@ class ToolUseLoop:
             tool_names=[tu["name"] for tu in batch],
             elapsed_ms=round((time.monotonic() - started) * 1000),
         )
-        first_error: BaseException | None = None
+        first_fatal: BaseException | None = None
         results: list[ToolResult] = []
         for tu, item in zip(batch, settled, strict=True):
             if not isinstance(item, BaseException):
                 results.append(item)
-            elif first_error is None:
-                first_error = item
-            elif not isinstance(item, asyncio.CancelledError):
-                # Only the first failure (tool_use order) is raised; keep the evidence
-                # of every later one instead of dropping it silently.
+            elif isinstance(
+                item, (Exception, asyncio.CancelledError, BaseExceptionGroup)
+            ) and not _wraps_process_exit(item):
+                # The child's own failure or cancellation (see docstring): never this task's.
+                error = type(item).__name__
+                # The raise no longer reaches the consumer's backstop log, so log it here:
+                # masked text + raise site, never raw exc_info (T-021a library rule).
+                frames = traceback.extract_tb(item.__traceback__)
+                try:  # this log line must never break the batch it reports on
+                    detail = mask_telemetry(str(item)[:_BATCH_LOG_MESSAGE_MAX])
+                except Exception:  # noqa: BLE001 - an exception whose __str__ raises
+                    detail = "<unprintable>"
+                logger.warning(
+                    "tool_loop_parallel_call_error tool=%s tool_use_id=%s error=%s at=%s: %s",
+                    tu["name"],
+                    tu["id"],
+                    error,
+                    f"{frames[-1].filename}:{frames[-1].lineno}" if frames else "?",
+                    detail,
+                )
                 self._audit.warning(
-                    "tool_loop_parallel_sibling_error",
+                    "tool_loop_parallel_call_error",
                     round_index=round_index,
                     tool_use_id=tu["id"],
                     tool_name=tu["name"],
-                    error=type(item).__name__,
+                    error=error,
                 )
-        if first_error is not None:
-            raise first_error
+                content = _BATCH_CALL_FAILED_MARKER.format(tool=tu["name"], error=error)
+                results.append(ToolResult(content=content, is_error=True))
+            elif first_fatal is None:
+                first_fatal = item
+        if first_fatal is not None:
+            raise first_fatal
         return results
 
     def _cap_images(
